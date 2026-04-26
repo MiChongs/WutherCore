@@ -117,8 +117,8 @@ impl Runtime {
         // 注入 outbound fwmark：对齐 mihomo `dialer.DefaultRoutingMark`。
         // 默认值必须是 0（禁用），否则普通 Mixed/Direct 在无 CAP_NET_ADMIN 的
         // Linux 环境会因 SO_MARK=EPERM 直接无法出站。只有显式配置
-        // auto_redirect_output_mark，或启用 auto_redirect 时，才使用 mark 绕过
-        // redirect chain。
+        // auto_redirect_output_mark、启用 TUN auto_redirect、或 TPROXY iptables
+        // 接管时，才使用 mark 绕过 redirect/tproxy chain。
         let out_mark = outbound_fwmark_for_plan(&plan);
         core_outbound::set_outbound_fwmark(out_mark);
         let smart = if let Some(store) = store.clone() {
@@ -576,8 +576,20 @@ fn outbound_fwmark_for_plan(plan: &RuntimePlan) -> u32 {
     }
     if plan.capture.on && plan.capture.tun.auto_redirect {
         0x2024
+    } else if plan.capture.on && capture_uses_tproxy(&plan.capture) {
+        0x2d0
     } else {
         0
+    }
+}
+
+fn capture_uses_tproxy(capture: &core_config::model::Capture) -> bool {
+    match capture.method {
+        core_config::model::CaptureMethod::Tproxy => true,
+        core_config::model::CaptureMethod::Auto => {
+            cfg!(any(target_os = "linux", target_os = "android"))
+        }
+        _ => false,
     }
 }
 
@@ -655,5 +667,27 @@ route:
         let _runtime = Runtime::build(plan);
 
         assert_eq!(core_outbound::outbound_fwmark(), 0x2024);
+    }
+
+    #[test]
+    fn runtime_uses_mihomo_tproxy_mark_when_tproxy_capture_enabled() {
+        let _guard = FWMARK_TEST_LOCK.lock().unwrap();
+        core_outbound::set_outbound_fwmark(0);
+        let mut plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  preset: direct
+"#,
+        );
+        plan.capture.on = true;
+        plan.capture.method = core_config::model::CaptureMethod::Tproxy;
+
+        let _runtime = Runtime::build(plan);
+
+        assert_eq!(core_outbound::outbound_fwmark(), 0x2d0);
     }
 }

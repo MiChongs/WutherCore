@@ -18,6 +18,7 @@ use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, Engi
 use crate::packet::{parse_ip_packet, L4};
 use crate::platform::linux_tun_io;
 use crate::route_table::{ManagedRoute, RouteTable};
+use crate::tproxy_rules;
 use crate::tun_io::TunIo;
 
 pub fn list_interfaces() -> Vec<String> {
@@ -940,40 +941,56 @@ impl LinuxTproxy {
         }
     }
 
-    fn install_rules() -> Result<(), CaptureError> {
-        // 试探使用 nft；失败则回退 iptables。
-        let nft = std::process::Command::new("nft")
-            .args(["add", "table", "inet", "rpkernel"])
-            .status();
-        if let Ok(st) = nft {
-            if st.success() {
-                info!(target: "capture", "nftables table rpkernel created");
-                return Ok(());
+    fn install_rules(plan: &CapturePlan, outbound_mark: u32) -> Result<(), CaptureError> {
+        if !has_tool("iptables") {
+            return Err(CaptureError::Doctor(
+                "TPROXY 需要 iptables mangle/TPROXY 支持；当前找不到 iptables".into(),
+            ));
+        }
+        if !ip_rule_supported() {
+            return Err(CaptureError::Doctor(
+                "TPROXY 需要 ip rule 支持，用于 fwmark local route".into(),
+            ));
+        }
+
+        let mut failed = Vec::new();
+        for cmd in tproxy_rules::setup_commands(plan, outbound_mark) {
+            if !matches!(run_tproxy_command(&cmd), Some(s) if s.success()) {
+                failed.push(cmd.render());
             }
         }
-        let ipt = std::process::Command::new("iptables")
-            .args(["-t", "mangle", "-N", "RPKERNEL"])
-            .status();
-        if ipt.map(|s| s.success()).unwrap_or(false) {
-            info!(target: "capture", "iptables chain RPKERNEL created");
-            return Ok(());
+        if !failed.is_empty() {
+            warn!(
+                target: "capture::tproxy::rules",
+                failed = failed.len(),
+                first = %failed[0],
+                "some TPROXY rule commands failed (continuing like mihomo iptables setup)"
+            );
         }
-        Err(CaptureError::Doctor(
-            "nft 与 iptables 都不可用 —— 请安装 nftables / iptables".into(),
-        ))
+        info!(
+            target: "capture::tproxy::rules",
+            proxy_mark = format_args!("{:#x}", tproxy_rules::TPROXY_FWMARK),
+            outbound_mark = format_args!("{outbound_mark:#x}"),
+            "iptables TPROXY rules installed"
+        );
+        Ok(())
     }
 
-    fn revert_rules() {
-        let _ = std::process::Command::new("nft")
-            .args(["delete", "table", "inet", "rpkernel"])
-            .status();
-        let _ = std::process::Command::new("iptables")
-            .args(["-t", "mangle", "-F", "RPKERNEL"])
-            .status();
-        let _ = std::process::Command::new("iptables")
-            .args(["-t", "mangle", "-X", "RPKERNEL"])
-            .status();
+    fn revert_rules(plan: &CapturePlan) {
+        for cmd in tproxy_rules::cleanup_commands(plan) {
+            let _ = run_tproxy_command(&cmd);
+        }
     }
+}
+
+fn run_tproxy_command(cmd: &tproxy_rules::TproxyCommand) -> Option<std::process::ExitStatus> {
+    debug!(target: "capture::tproxy::rules", cmd = %cmd.render(), "exec");
+    std::process::Command::new(cmd.program)
+        .args(&cmd.args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
 }
 
 #[async_trait]
@@ -993,11 +1010,20 @@ impl CaptureEngine for LinuxTproxy {
         if g.on {
             return Ok(());
         }
-        Self::install_rules()?;
+        let outbound_mark = self
+            .plan
+            .auto_redirect_marks
+            .output
+            .unwrap_or(tproxy_rules::TPROXY_FWMARK);
+        Self::install_rules(&self.plan, outbound_mark)?;
 
         // 启动 TCP TPROXY 监听 :7894（默认；与 nft 规则中的端口一致）。
-        let bind_tcp: std::net::SocketAddr = "127.0.0.1:7894".parse().unwrap();
-        let bind_udp: std::net::SocketAddr = "127.0.0.1:7894".parse().unwrap();
+        let bind_tcp: std::net::SocketAddr = format!("127.0.0.1:{}", tproxy_rules::TPROXY_PORT)
+            .parse()
+            .unwrap();
+        let bind_udp: std::net::SocketAddr = format!("127.0.0.1:{}", tproxy_rules::TPROXY_PORT)
+            .parse()
+            .unwrap();
         let (stop_tcp_tx, mut stop_tcp_rx) = oneshot::channel::<()>();
         let (stop_udp_tx, mut stop_udp_rx) = oneshot::channel::<()>();
 
@@ -1052,7 +1078,7 @@ impl CaptureEngine for LinuxTproxy {
         if let Some(h) = g.udp_handle.take() {
             h.abort();
         }
-        Self::revert_rules();
+        Self::revert_rules(&self.plan);
         g.on = false;
         info!(target: "capture", "linux tproxy stopped");
         Ok(())
