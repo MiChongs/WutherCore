@@ -34,3 +34,27 @@ webpki-roots      = { workspace = true }
 tokio-tungstenite = { workspace = true }
 uuid              = { workspace = true }
 rand              = { workspace = true }
+aes               = { workspace = true }
+ctr               = { workspace = true }
+cfb-mode          = { workspace = true }
+crc32fast         = { workspace = true }
+fnv               = { workspace = true }
+hmac              = { workspace = true }
+zeroize           = { workspace = true }
+sha3              = { workspace = true }
+rc4               = { workspace = true }
+chacha20          = { workspace = true }
+chrono            = { version = "0.4", default-features = false, features = ["clock"] }
+russh             = { workspace = true }
+russh-keys        = { workspace = true }
+quinn             = { workspace = true }
+quinn-proto       = { workspace = true }
+h3                = "0.0.8"
+h3-quinn          = "0.0.10"
+http              = "1"
+blake2            = "0.10"
+# boringtun 0.6 锁定老 dalek 版本与 russh 冲突；改为手工实现 WireGuard
+# 用 chacha20poly1305 + blake2 + curve25519-dalek（与 russh 同版）
+curve25519-dalek  = "4.1"
+pbkdf2            = "0.12"
+smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }

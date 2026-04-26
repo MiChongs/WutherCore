@@ -81,6 +81,28 @@ rustls-pki-types  = "1"
 webpki-roots      = "0.26"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 uuid              = { version = "1", features = ["v4"] }
+aes               = "0.8"
+ctr               = "0.9"
+cfb-mode          = "0.8"
+crc32fast         = "1"
+fnv               = "1"
+zeroize           = "1"
+sha3              = "0.10"
+sha1              = "0.10"
+rc4               = "0.1"
+chacha20          = "0.9"
+
+# QUIC + UDP 协议（Hysteria / TUIC）
+quinn             = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
+quinn-proto       = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
+
+# SSH 客户端
+russh             = "0.46"
+russh-keys        = "0.46"
+
+# WireGuard 用户态
+boringtun         = { version = "0.6", default-features = false }
+x25519-dalek      = { version = "=2.0.0-rc.3", features = ["static_secrets"] }
 
 # 工具
 once_cell = "1"
