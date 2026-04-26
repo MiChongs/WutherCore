@@ -62,3 +62,11 @@ hyper-util        = { version = "0.1", features = ["client", "client-legacy", "t
 http-body-util    = "0.1"
 rand_chacha       = "0.3"
 smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
+# socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合
+# `ip rule fwmark X lookup main` 让代理出站绕开 TUN 自身路由表，
+# 避免"resolve 出 IP 后 connect 又被 TUN 截走"的死循环。
+# `all` feature 才会启用 `Socket::set_mark` 等平台特定方法。
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"

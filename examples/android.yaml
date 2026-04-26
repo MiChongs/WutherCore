@@ -1,0 +1,410 @@
+# =============================================================================
+# RPKernel —— Android 完整可用配置（开箱即用）
+#
+# 设计原则：
+#   * **DNS 零依赖启动**：upstream 全部 IP 字面 DoH/DoT，避免 "解析 DNS server
+#     hostname → 又需要 DNS" 的鸡生蛋问题；TUN 启动后即生效。
+#   * **节点 / 订阅缺失时仍能上网**：route preset 走 cn_smart，国内流量直连，
+#     国外流量退到 main → smart 自动择优；找不到节点时自动 DIRECT，绝不死锁。
+#   * **TUN 自动排除 DNS 服务器 IP / 自身 IP / 私网**：DNS 不会回环 TUN。
+#
+# 只需改 3 处即可投产：
+#   1. feeds.primary.url      — 你的订阅链接（必改）
+#   2. ui.secret              — Dashboard 鉴权 token（必改）
+#   3. nodes[]                — 可选：手工补几个固定节点
+#
+# 启动：rpkernel run examples/android.yaml
+# 在宿主 App：System.loadLibrary("rpkernel") + setVpnFd(fd) + nativeStart()
+# =============================================================================
+
+version: 1
+profile: mobile          # mobile = Android / iOS（与 desktop / router / server 区分）
+name: "android-daily"
+
+# ---------------------------------------------------------------------------
+# 1. listen —— 本地监听
+# ---------------------------------------------------------------------------
+listen:
+  local:
+    host: 127.0.0.1
+    port: 7890           # Mixed (HTTP + SOCKS5 + UDP)
+    udp: true
+  panel: 9090            # /v1 + Clash 兼容 API（dashboard 连这个端口）
+  share: false           # 禁止局域网分享（手机基本不需要）
+  auth: []               # 仅本地，不开认证
+
+# ---------------------------------------------------------------------------
+# 2. feeds —— 订阅源（机场）
+#    URL **必须**替换为你自己的订阅；example.com 拉不到任何节点。
+#    via: "direct" 让订阅请求绕过自己的 TUN，避免循环。
+# ---------------------------------------------------------------------------
+feeds:
+  primary:
+    url: "https://REPLACE-WITH-YOUR-AIRPORT.example.com/api/v1/clients/sub?token=YOUR_TOKEN&format=clash"
+    every: 6h
+    via: "direct"
+    keep:
+      name_has: ["香港", "台湾", "日本", "新加坡", "美国"]
+    drop:
+      name_has: ["官网", "剩余", "过期", "回国", "网址"]
+    rename:
+      add_prefix: "[A] "
+      remove: ["[Ⓜ]", "↓", "↑", "倍率"]
+
+# ---------------------------------------------------------------------------
+# 3. nodes —— 手动节点（与订阅并存）
+#    没有订阅时这是兜底；填一个真实可用节点保证 main 组不会空。
+#    示例都是占位，请替换为真实可用 URI。
+# ---------------------------------------------------------------------------
+nodes: []
+# 示例（取消注释 + 替换）：
+# - "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#自建-备用"
+# - "trojan://password@example.com:443?sni=example.com#Trojan-1"
+# - "vmess://eyJ2IjoiMiIsInBzIjoiVk1lc3MtMSIsImFkZCI6ImV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiYWFhYS1iYmJiLWNjY2MtZGRkZC1lZWVlZmZmZmdnZ2giLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJob3N0IjoiZXhhbXBsZS5jb20iLCJwYXRoIjoiL3dzIiwidGxzIjoidGxzIn0="
+
+# ---------------------------------------------------------------------------
+# 4. groups —— 分组
+#    main 选 smart：订阅一拉到节点立即自动选最优，无需手动 PUT /proxies/main。
+# ---------------------------------------------------------------------------
+groups:
+  # 主出口 —— smart 自动择优（按 URLTest 延迟 + 历史成功率）
+  main:
+    choose: smart
+    use: ["primary", "nodes"]
+    sticky: "site"             # 同 eTLD+1 粘节点
+    check: "https://www.gstatic.com/generate_204"
+
+  # 强制低延迟（流媒体 / 实时通信）
+  streaming-fast:
+    choose: fast
+    use: ["primary", "nodes"]
+    prefer: ["[A] 香港", "[A] 日本", "[A] 新加坡"]
+    check: "https://www.gstatic.com/generate_204"
+
+  # 故障转移（AI / 长连接，稳定性优先）
+  ai-stable:
+    choose: stable
+    use: ["primary", "nodes"]
+    prefer: ["[A] 美国", "[A] 日本"]
+    avoid: ["GFW", "封锁", "免费", "试用"]
+    check: "https://chatgpt.com/"
+
+  # 负载均衡（大流量下载）
+  bulk-spread:
+    choose: spread
+    use: ["primary", "nodes"]
+    prefer: ["[A] 香港", "[A] 日本"]
+
+# ---------------------------------------------------------------------------
+# 5. resolver —— DNS（防泄漏 + Fake-IP）
+#
+#    ⚠️ 关键设计：所有 upstream 都用 IP 字面，避免"解析 DNS server hostname →
+#    又需要 DNS"的鸡生蛋。TUN 一启动就能查询，不卡 bootstrap。
+#
+#    mode 含义：
+#      system  : 走 Android 系统 DNS（最稳；适合首次试运行）
+#      secure  : 全部 DoH/DoT，强制加密（生产推荐）
+#      smart   : 国内域名走 mainland，海外走 overseas（需 geosite-cn 拉完才生效）
+#      fake    : Fake-IP 模式（capture 启用 hijack 时由 fake-DNS 接管）
+# ---------------------------------------------------------------------------
+resolver:
+  mode: secure                 # 推荐 secure（DoH 加密，IP 直连不走系统 DNS）
+  fake: auto                   # capture 启用时用 Fake-IP；否则真 IP
+  cache: 1h
+  mainland: ali                # 别名 → 命中 servers 表
+  overseas: cloudflare
+  servers:
+    # 国内（IP 直连 DoH —— 不需要再解析 dns.alidns.com）
+    ali:        "https://223.5.5.5/dns-query"
+    alidns2:    "https://223.6.6.6/dns-query"
+    tencent:    "https://119.29.29.29/dns-query"
+    dnspod:     "https://1.12.12.12/dns-query"
+    # 国外（IP 直连）
+    cloudflare:  "https://1.1.1.1/dns-query"
+    cloudflare2: "https://1.0.0.1/dns-query"
+    google:      "https://8.8.8.8/dns-query"
+    google2:     "https://8.8.4.4/dns-query"
+    quad9:      "tls://9.9.9.9:853"
+
+# ---------------------------------------------------------------------------
+# 6. capture —— TUN / VpnService 透明接管
+#
+#    A. 未 root + 宿主 App（VpnService）—— 默认配置；JNI setVpnFd(fd) 注入
+#    B. root + KernelSU —— 见下方 6.B 注释模板
+# ---------------------------------------------------------------------------
+capture:
+  on: true
+  method: virtual_nic          # virtual_nic = TUN
+  traffic: system              # 接管全机
+  resolver: hijack             # 把 53 端口 DNS 劫持到本机 fake-dns（防泄漏）
+  stack: mixed                 # mixed = TCP gvisor (兼容性最好) + UDP system
+  mtu: 1500
+  offload: true
+  exclude:
+    cidr:
+      - "100.64.0.0/10"        # CGNAT / Tailscale
+      - "fd7a:115c:a1e0::/48"  # Tailscale ULA
+    process: ["tailscaled"]    # 进程级排除（root 模式生效）
+
+  tun:
+    # ---- 接口与寻址 ----
+    interface_name: "rpktun0"
+    address:
+      - "172.19.0.1/30"
+      - "fdfe:dcba:9876::1/126"
+
+    # ---- 路由接管 ----
+    auto_route: true
+    iproute2_table_index: 2024
+    iproute2_rule_index:  9100
+    auto_redirect: false        # 默认关；root 设备 + nft/iptables 才打开（见 6.B）
+    strict_route: false         # 严格防泄漏会切断 LAN，移动端关
+    route_address: []           # 空 = 全部走 TUN
+
+    # ⚠️ 关键：把 DNS 服务器 IP 排除出 TUN，否则 DNS 自循环
+    route_exclude_address:
+      # 本机 / 私网
+      - "127.0.0.0/8"
+      - "::1/128"
+      - "192.168.0.0/16"
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "169.254.0.0/16"        # link-local
+      - "fc00::/7"
+      - "fe80::/10"
+      # DNS upstream IP（与 resolver.servers 完全一致 —— 这些 IP 不能走 TUN）
+      - "223.5.5.5/32"
+      - "223.6.6.6/32"
+      - "119.29.29.29/32"
+      - "1.12.12.12/32"
+      - "1.1.1.1/32"
+      - "1.0.0.1/32"
+      - "8.8.8.8/32"
+      - "8.8.4.4/32"
+      - "9.9.9.9/32"
+      # Android Captive Portal（避免连不上 WiFi 时被 TUN 截）
+      - "203.0.113.0/24"
+
+    route_address_set: []                     # 引用 route.sets 的动态 IP 集
+    route_exclude_address_set:
+      - "geoip-cn"                            # ruleset 拉完后国内 IP 不再走 TUN
+
+    # ---- NAT / 性能 ----
+    endpoint_independent_nat: true            # QUIC / WebRTC / 游戏强烈建议开
+    udp_timeout: 5m
+    exclude_mptcp: false
+    loopback_address:
+      - "127.0.0.1"
+      - "::1"
+
+    # ---- 接口过滤 ----
+    include_interface: []
+    exclude_interface: []
+
+    # ---- UID 过滤（Linux/Android）----
+    # 仅接管"主用户"普通 app（10000–19999），并排除 system / Tailscale：
+    # include_uid_range: ["10000:99999"]
+    # exclude_uid: [1000]                      # 1000=system；root 模式可加 0
+    include_uid: []
+    include_uid_range: []
+    exclude_uid: []
+    exclude_uid_range: []
+
+    # ---- GID 过滤（Linux/Android）----
+    # Android 常见 GID：3003=INET / 3004=NET_RAW / 3005=NET_ADMIN
+    include_gid: []
+    include_gid_range: []
+    exclude_gid: []
+    exclude_gid_range: []
+
+    # ---- Android 专属 ----
+    include_android_user: [0]                 # 仅主用户（10/11=工作资料/分身）
+    include_package: []                       # 白名单包名（空 = 全部）
+    exclude_package:
+      - "com.android.captiveportallogin"      # WiFi 强制登录页
+      - "com.google.android.gms"              # Google Play 服务（DRM/支付）
+      - "com.google.android.gsf"              # Google 服务框架
+      - "com.android.vending"                 # Google Play 商店
+      # 需要更多排除？常见：网银、运营商充值、打车、外卖
+
+    # ---- LAN MAC 过滤（路由器场景，手机一般空）----
+    include_mac_address: []
+    exclude_mac_address: []
+
+    # ---- 平台桥：把系统 HTTP proxy 也指到 7890 ----
+    # 少数 app 不读 TUN 路由表但读系统 proxy 设置，覆盖到这种 corner case。
+    platform:
+      http_proxy:
+        enabled: true
+        server: "127.0.0.1"
+        server_port: 7890
+        bypass_domain:
+          - "localhost"
+          - "*.lan"
+          - "*.local"
+
+# -----------------------------------------------------------------------------
+# 6.B 【可选】root + KernelSU 高性能模板
+#     条件：手机已 root + 装了 magisk-iptables 或 nftables 模块。
+#     取消注释 + 把上方 6 节的 capture 整段删掉。
+# -----------------------------------------------------------------------------
+# capture:
+#   on: true
+#   method: tproxy            # 真透明代理；纯 nftables/iptables，零用户态栈
+#   traffic: system
+#   resolver: hijack
+#   stack: native
+#   exclude:
+#     cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+#   tun:
+#     interface_name: "rpktun0"
+#     auto_route: true
+#     auto_redirect: true
+#     auto_redirect_input_mark:  "0x2023"
+#     auto_redirect_output_mark: "0x2024"
+#     auto_redirect_reset_mark:  "0x2025"
+#     iproute2_table_index: 2024
+#     iproute2_rule_index:  9100
+#     include_uid_range: ["10000:99999"]    # 仅普通 app
+#     exclude_uid: [1000, 0]                # 排除 system + root
+#     loopback_address: ["127.0.0.1", "::1"]
+#     route_exclude_address_set: ["geoip-cn", "geoip-private"]
+
+# ---------------------------------------------------------------------------
+# 7. route —— 分流规则
+#    步骤自上而下匹配；命中后按 -> 后的目标决策（分组名 / direct / block）。
+#    sets: 引用外部规则集（mihomo / sing-box / 自定义 payload）。
+#    ⚠️ 首启动 ruleset 还在下载（10s 内），未生效的 set 规则全部 fall through 到下一条。
+# ---------------------------------------------------------------------------
+route:
+  preset: "cn_smart"          # 内置预设：自动添加常见直连
+  final: "main"               # 兜底出口
+
+  steps:
+    # --- 1. 必须直连 ---
+    - "process: rpkernel,proxy-core -> direct"   # 自身流量
+    - "ip: 100.64.0.0/10 -> direct"              # Tailscale CGNAT
+    - "ip: 192.168.0.0/16 -> direct"             # 家庭 LAN
+    - "ip: 10.0.0.0/8 -> direct"
+    - "ip: 172.16.0.0/12 -> direct"
+    - "ip: 169.254.0.0/16 -> direct"             # link-local
+    - "ip: fc00::/7 -> direct"
+    - "ip: fe80::/10 -> direct"
+    - "domain-suffix: lan,local,arpa -> direct"
+
+    # --- 2. 国内（IP + 域名双重命中，先到先得）---
+    - "set:geoip-cn -> direct"
+    - "set:cn-domain -> direct"
+    - "set:geoip-private -> direct"
+
+    # --- 3. 广告 / 隐私拦截 ---
+    - "set:adblock -> block"
+    - "set:privacy-tracker -> block"
+
+    # --- 4. 流媒体 / AI ---
+    - "set:netflix -> streaming-fast"
+    - "set:youtube -> streaming-fast"
+    - "set:openai  -> ai-stable"
+    - "set:claude  -> ai-stable"
+
+    # --- 5. 默认：海外走 main（smart 自动择优）---
+    - "default -> main"
+
+  sets:
+    # —— 必备：geoip-cn 决定国内/海外的最大分流权重
+    geoip-cn:
+      type: ipcidr
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-cn.mrs"
+      every: 24h
+      via: "direct"
+
+    geoip-private:
+      type: ipcidr
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-private.mrs"
+      every: 7d
+      via: "direct"
+
+    cn-domain:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-cn.mrs"
+      every: 24h
+      via: "direct"
+
+    # —— 可选：流媒体（首启动慢一些没节点也无害）
+    netflix:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-netflix.mrs"
+      every: 24h
+      via: "direct"
+
+    youtube:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-youtube.mrs"
+      every: 24h
+      via: "direct"
+
+    openai:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-openai.mrs"
+      every: 24h
+      via: "direct"
+
+    claude:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-anthropic.mrs"
+      every: 24h
+      via: "direct"
+
+    adblock:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-category-ads-all.mrs"
+      every: 24h
+      via: "direct"
+
+    privacy-tracker:
+      type: domain
+      format: mrs
+      url: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite-tracker.mrs"
+      every: 24h
+      via: "direct"
+
+# ---------------------------------------------------------------------------
+# 8. smart —— 智能择优学习
+# ---------------------------------------------------------------------------
+smart:
+  on: true
+  goal: balanced            # balanced / speed / stability / low_cost / privacy
+  learn: 14d                # 学习窗口；移动端建议 7-14d
+  sticky: site              # off / site / session
+  explain: true             # /v1/smart/why 返回选择原因
+
+# ---------------------------------------------------------------------------
+# 9. ui —— Dashboard / API
+#    ⚠️ secret 必填，否则任何能访问 9090 的进程都能改配置。
+# ---------------------------------------------------------------------------
+ui:
+  on: true
+  secret: "REPLACE_ME_DASHBOARD_TOKEN"
+  dashboard: "auto"
+  api:
+    native: true            # /v1/* 原生 API（含 /v1/capture/state）
+    clash_compat: true      # Yacd / metacubexd / Razord 直接连
+  cors: []                  # CORS 在 server.rs 里已开 AllowAny + PNA，不需重复
+
+# ---------------------------------------------------------------------------
+# 10. mesh —— Tailscale 协同（Android 非必需，可整段删掉）
+# ---------------------------------------------------------------------------
+mesh:
+  tailscale:
+    on: true
+    mode: auto              # auto / localapi / userspace / tsnet / off
+    keep_tailnet_direct: true
+    expose_as_node: false

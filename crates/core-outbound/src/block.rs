@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
+use crate::adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter};
 
 #[derive(Debug, Default)]
 pub struct BlockOutbound;
@@ -33,6 +33,12 @@ impl OutboundAdapter for BlockOutbound {
         Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             "blocked by route",
+        ))
+    }
+    async fn dial_udp(&self, _ctx: DialContext) -> std::io::Result<BoxedUdp> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "blocked by route (udp)",
         ))
     }
 }

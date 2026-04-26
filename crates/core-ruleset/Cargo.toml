@@ -22,3 +22,6 @@ tokio       = { workspace = true }
 reqwest     = { workspace = true }
 humantime-serde = { workspace = true }
 crc32fast   = "1"
+# 纯 Rust zstd 解码器 —— mihomo MRS v1 整体经 zstd 流压缩。
+# 选 ruzstd 而非 zstd-rs 是为了避免 C 依赖（zstd-sys）在 Android NDK 交叉编译时的麻烦。
+ruzstd      = "0.8"

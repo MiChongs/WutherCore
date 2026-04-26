@@ -19,5 +19,10 @@ pub mod stub;
 pub mod transport;
 pub mod proto;
 
-pub use adapter::{Capabilities, DialContext, OutboundAdapter, ProxyStream};
+pub use adapter::{
+    apply_outbound_mark, apply_outbound_mark_for_addr, global_dial_resolver, next_dial_id,
+    outbound_fwmark, resolve_host, set_global_dial_resolver, set_outbound_fwmark, BoxedStream,
+    BoxedUdp, Capabilities, DialContext, DialResolver, OutboundAdapter, ProxyStream,
+    UdpSocketLike,
+};
 pub use registry::{OutboundRegistry, ResolveFn};

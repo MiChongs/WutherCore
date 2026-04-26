@@ -91,6 +91,29 @@ pub fn parse_first_question(pkt: &[u8]) -> Option<(String, u16)> {
     Some((name, qtype))
 }
 
+/// 同步处理一个 DNS 查询包；返回响应字节。
+///
+/// 与 [`run_fake_dns`] 共享解析与应答构造逻辑，但不走 UDP socket —— 给
+/// `tun_dispatch::handle_udp` 在 TUN 内部直接拦截 53 端口流量用，避免
+/// "TUN 把 DNS 包发到 127.0.0.1:5454"中转的不可达问题。
+pub fn synthesize(req: &[u8], pool: &FakeIpPool) -> Vec<u8> {
+    if req.len() < 12 {
+        return Vec::new();
+    }
+    let Some((qname, qtype)) = parse_first_question(req) else {
+        return build_empty_response(req);
+    };
+    let family = match qtype {
+        1 => AddressFamily::V4,
+        28 => AddressFamily::V6,
+        _ => return build_empty_response(req),
+    };
+    let Some(ip) = pool.alloc(&qname, family) else {
+        return build_empty_response(req);
+    };
+    build_answer(req, ip)
+}
+
 fn build_empty_response(req: &[u8]) -> Vec<u8> {
     let mut resp = req.to_vec();
     if resp.len() < 4 {

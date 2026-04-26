@@ -120,6 +120,47 @@ impl Resolver {
     pub fn mode(&self) -> ResolverMode { self.cfg.mode }
     pub fn groups(&self) -> Arc<HashMap<String, Arc<DnsGroup>>> { self.groups.clone() }
     pub fn fake_pool(&self) -> Option<Arc<FakeIpPool>> { self.fake_pool.clone() }
+
+    /// Clash dashboard `/cache/fakeip/flush` —— 清空 fake-ip 池；返回被清条数。
+    pub fn flush_fakeip(&self) -> usize {
+        self.fake_pool.as_ref().map(|p| p.clear()).unwrap_or(0)
+    }
+
+    /// Clash dashboard `/dns/query?name=...&type=A|AAAA|CNAME|TXT|MX|NS`
+    /// —— 调用 `resolve()` 拿到 v4/v6，按 qtype 包成 `[{name,type,TTL,data}]`。
+    pub async fn resolve_compat(&self, name: &str, qtype: &str) -> serde_json::Value {
+        let qtype_u = qtype.to_uppercase();
+        let qtype_num: u16 = match qtype_u.as_str() {
+            "A" => 1,
+            "AAAA" => 28,
+            "CNAME" => 5,
+            "TXT" => 16,
+            "MX" => 15,
+            "NS" => 2,
+            _ => 1,
+        };
+        let answers = match self.resolve(name).await {
+            Ok(ips) => ips,
+            Err(_) => return serde_json::Value::Array(Vec::new()),
+        };
+        let arr: Vec<serde_json::Value> = answers
+            .into_iter()
+            .filter(|ip| match qtype_u.as_str() {
+                "A" => ip.is_ipv4(),
+                "AAAA" => ip.is_ipv6(),
+                _ => true,
+            })
+            .map(|ip| {
+                serde_json::json!({
+                    "name": name,
+                    "type": qtype_num,
+                    "TTL": 60,
+                    "data": ip.to_string(),
+                })
+            })
+            .collect();
+        serde_json::Value::Array(arr)
+    }
     pub fn policy(&self) -> Arc<PolicyEngine> { self.policy.clone() }
     pub fn global_client_subnet(&self) -> Option<ipnet::IpNet> { self.global_client_subnet }
 

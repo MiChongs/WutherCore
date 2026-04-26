@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use base64::Engine;
-use core_observe::{ConnectionEntry, Metrics};
+use core_observe::{copy_bidirectional_counted, ConnectionMeta};
 use core_route::NetworkKind;
 use core_runtime::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -71,7 +71,7 @@ async fn handle(
 
 async fn handle_socks5(
     mut sock: TcpStream,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
 ) -> io::Result<()> {
@@ -156,7 +156,7 @@ async fn handle_socks5(
     match runtime.dial(&host, port, NetworkKind::Tcp).await {
         Ok(res) => {
             sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-            relay(sock, res, &host, port, "socks5", &runtime).await
+            relay(sock, res, &host, port, "socks5", "Socks5", peer, &runtime).await
         }
         Err(e) => {
             sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
@@ -169,7 +169,7 @@ async fn handle_socks5(
 
 async fn handle_http(
     sock: TcpStream,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
 ) -> io::Result<()> {
@@ -237,7 +237,7 @@ async fn handle_http(
         match res {
             Ok(r) => {
                 sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-                relay(sock, r, &host, port, "http-connect", &runtime).await
+                relay(sock, r, &host, port, "http-connect", "HTTP", peer, &runtime).await
             }
             Err(e) => {
                 let _ = sock
@@ -279,7 +279,7 @@ async fn handle_http(
         match res {
             Ok(mut r) => {
                 r.stream.write_all(new_head.as_bytes()).await?;
-                relay(sock, r, &host, port, "http", &runtime).await
+                relay(sock, r, &host, port, "http", "HTTP", peer, &runtime).await
             }
             Err(e) => {
                 let _ = sock
@@ -321,66 +321,92 @@ fn other(s: &str) -> io::Error {
 }
 
 async fn relay(
-    inbound: TcpStream,
+    mut inbound: TcpStream,
     mut out: core_runtime::engine::DialResult,
     host: &str,
     port: u16,
     inbound_label: &'static str,
+    metadata_kind: &'static str,
+    peer: SocketAddr,
     runtime: &Arc<Runtime>,
 ) -> io::Result<()> {
+    let started = std::time::Instant::now();
     runtime.metrics.inc_connection();
-    let id = runtime.connections.open(ConnectionEntry {
-        id: 0,
-        inbound: inbound_label.to_string(),
-        host: host.to_string(),
-        port,
+
+    // 构造 mihomo Metadata 兼容信息：source = 浏览器 / curl 端 socket；
+    // destination = 解析后的目标 host:port；inbound = 监听器名 + 类型 + ip:port。
+    let inbound_addr = inbound.local_addr().ok();
+    let meta = ConnectionMeta {
         network: "tcp".into(),
+        kind: metadata_kind.into(),
+        source_ip: peer.ip().to_string(),
+        source_port: peer.port().to_string(),
+        destination_ip: host.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).unwrap_or_default(),
+        destination_port: port.to_string(),
+        inbound_ip: inbound_addr.map(|a| a.ip().to_string()).unwrap_or_default(),
+        inbound_port: inbound_addr.map(|a| a.port().to_string()).unwrap_or_default(),
+        inbound_name: inbound_label.into(),
+        host: host.to_string(),
+        dns_mode: "normal".into(),
+        chains: out.chain.clone(),
         rule: format!("{:?}", out.decision),
-        outbound: out.outbound.clone(),
-        started_at: now_secs(),
-        bytes_up: 0,
-        bytes_down: 0,
-    });
+        ..ConnectionMeta::default()
+    };
+    let guard = runtime.connections.open(meta);
+    let id = guard.id;
+    let (up_counter, down_counter) = guard.counters();
+    let cancel = guard.cancel_token();
+    tracing::info!(
+        target: "relay",
+        conn_id = id,
+        inbound = inbound_label,
+        host, port,
+        outbound = %out.outbound,
+        decision = ?out.decision,
+        dial_ms = out.elapsed.as_millis() as u64,
+        "session begin",
+    );
+
     let metrics = runtime.metrics.clone();
-    let table = runtime.connections.clone();
-
-    let result = bidirectional(inbound, &mut out.stream, &metrics).await;
-
+    let result = copy_bidirectional_counted(
+        &mut inbound,
+        &mut out.stream,
+        up_counter.clone(),
+        down_counter.clone(),
+        cancel,
+        Some(metrics.clone()),
+    )
+    .await;
     metrics.dec_connection();
-    table.close(id);
-    if let Err(e) = &result {
-        warn!(target: "relay", error = %e, host, port, outbound = %out.outbound, "relay error");
+    // guard drop 时自动从 ConnectionTable 移除；无需显式 close
+
+    let up = up_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let down = down_counter.load(std::sync::atomic::Ordering::Relaxed);
+    let total_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::info!(
+            target: "relay",
+            conn_id = id,
+            inbound = inbound_label,
+            host, port,
+            outbound = %out.outbound,
+            bytes_up = up,
+            bytes_down = down,
+            duration_ms = total_ms,
+            "session end (ok)",
+        ),
+        Err(e) => tracing::warn!(
+            target: "relay",
+            conn_id = id,
+            inbound = inbound_label,
+            host, port,
+            outbound = %out.outbound,
+            bytes_up = up,
+            bytes_down = down,
+            duration_ms = total_ms,
+            error = %e,
+            "session end (error)",
+        ),
     }
-    result
-}
-
-async fn bidirectional(
-    mut inbound: TcpStream,
-    outbound: &mut core_outbound::adapter::BoxedStream,
-    metrics: &Arc<Metrics>,
-) -> io::Result<()> {
-    let (mut ri, mut wi) = inbound.split();
-    let (mut ro, mut wo) = tokio::io::split(outbound);
-
-    let m1 = metrics.clone();
-    let up = async {
-        let n = tokio::io::copy(&mut ri, &mut wo).await?;
-        m1.add_up(n);
-        wo.shutdown().await
-    };
-    let m2 = metrics.clone();
-    let down = async {
-        let n = tokio::io::copy(&mut ro, &mut wi).await?;
-        m2.add_down(n);
-        wi.shutdown().await
-    };
-    tokio::try_join!(up, down)?;
-    Ok(())
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    result.map(|_| ())
 }

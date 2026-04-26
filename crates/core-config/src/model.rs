@@ -362,6 +362,9 @@ pub enum FakeMode {
 
 /* ---------------- capture ---------------- */
 
+/// Capture / TUN 入站 —— 与 mihomo / sing-box `inbounds[type=tun]` 字段全量对齐。
+///
+/// Friendly 字段（顶层）保留 RPKernel 简洁语义；`tun` 子字段对齐 sing-box JSON。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capture {
@@ -381,6 +384,9 @@ pub struct Capture {
     pub offload: bool,
     #[serde(default)]
     pub exclude: CaptureExclude,
+    /// sing-box 兼容子配置（详见 https://sing-box.sagernet.org/configuration/inbound/tun/）。
+    #[serde(default)]
+    pub tun: TunInboundOptions,
 }
 
 impl Default for Capture {
@@ -394,6 +400,7 @@ impl Default for Capture {
             mtu: None,
             offload: true,
             exclude: CaptureExclude::default(),
+            tun: TunInboundOptions::default(),
         }
     }
 }
@@ -423,12 +430,20 @@ pub enum CaptureResolver {
     Hijack,
 }
 
+/// 用户态/系统态 TCP 栈选择 —— 完整对齐 sing-box `stack`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureStack {
+    /// 系统栈（Linux native + ip route 接管），最低延迟。
     Native,
+    /// gVisor 用户态栈（跨平台、强隔离）。
     Gvisor,
+    /// smoltcp 用户态栈（嵌入式 / 低资源）。
     Smoltcp,
+    /// sing-box `system` 栈：等价 native，明确语义。
+    System,
+    /// sing-box `mixed` 栈：TCP gvisor + UDP system 透明转发。
+    Mixed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -438,6 +453,152 @@ pub struct CaptureExclude {
     pub cidr: Vec<String>,
     #[serde(default)]
     pub process: Vec<String>,
+}
+
+/* ---------------- sing-box 完整 TUN 字段 ---------------- */
+
+/// sing-box `inbounds[type=tun]` 全字段映射 —— 见
+/// https://sing-box.sagernet.org/configuration/inbound/tun/
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunInboundOptions {
+    /// `interface_name` —— 优先级高于 RPKernel 默认 `rpktun0/utun7/RPKernelTun`。
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    /// `address` —— TUN 接口 v4 / v6 CIDR 列表（首条 v4 / 首条 v6 生效）。
+    #[serde(default)]
+    pub address: Vec<String>,
+
+    /* ---- 路由接管 ---- */
+    /// `auto_route` —— 自动写默认路由（0.0.0.0/0 + ::/0 → tun）。
+    #[serde(default = "default_true")]
+    pub auto_route: bool,
+    /// `iproute2_table_index` —— Linux 自定义路由表 id（默认 2022）。
+    #[serde(default = "default_iproute2_table")]
+    pub iproute2_table_index: u32,
+    /// `iproute2_rule_index` —— `ip rule` 优先级起始 id。
+    #[serde(default = "default_iproute2_rule")]
+    pub iproute2_rule_index: u32,
+    /// `auto_redirect` —— 自动注入 nftables redirect 规则（更优于 `auto_route`）。
+    #[serde(default)]
+    pub auto_redirect: bool,
+    /// `auto_redirect_input_mark` —— 进入 redirect chain 的 fwmark（hex 字串如 `"0x2023"`）。
+    #[serde(default)]
+    pub auto_redirect_input_mark: Option<String>,
+    /// `auto_redirect_output_mark` —— 跳过 redirect chain 的 fwmark。
+    #[serde(default)]
+    pub auto_redirect_output_mark: Option<String>,
+    /// `auto_redirect_reset_mark` —— RST 包 fwmark（用于 conntrack reset）。
+    #[serde(default)]
+    pub auto_redirect_reset_mark: Option<String>,
+    /// `auto_redirect_nfqueue` —— nfqueue 编号（用户态 fast-fail）。
+    #[serde(default)]
+    pub auto_redirect_nfqueue: Option<u16>,
+    /// `auto_redirect_iproute2_fallback_rule_index` —— fallback ip rule 优先级。
+    #[serde(default)]
+    pub auto_redirect_iproute2_fallback_rule_index: Option<u32>,
+    /// `strict_route` —— 严格防泄漏；任何未接管流量被 drop。
+    #[serde(default)]
+    pub strict_route: bool,
+    /// `route_address` —— 仅这些 CIDR 走 TUN（白名单）。空 = 全部。
+    #[serde(default)]
+    pub route_address: Vec<String>,
+    /// `route_exclude_address` —— 这些 CIDR 不走 TUN（黑名单）。
+    #[serde(default)]
+    pub route_exclude_address: Vec<String>,
+    /// `route_address_set` —— 白名单引用 ruleset（动态 IP 集）。
+    #[serde(default)]
+    pub route_address_set: Vec<String>,
+    /// `route_exclude_address_set` —— 黑名单引用 ruleset。
+    #[serde(default)]
+    pub route_exclude_address_set: Vec<String>,
+
+    /* ---- NAT / 性能 ---- */
+    /// `endpoint_independent_nat` —— 全锥 NAT；UDP 打洞场景需开。
+    #[serde(default)]
+    pub endpoint_independent_nat: bool,
+    /// `udp_timeout` —— UDP NAT 老化（默认 5m）。
+    #[serde(default = "default_udp_timeout", with = "humantime_serde")]
+    pub udp_timeout: Duration,
+    /// `exclude_mptcp` —— 透传 MPTCP 不接管。
+    #[serde(default)]
+    pub exclude_mptcp: bool,
+    /// `loopback_address` —— 哪些 IP 视为 loopback 不接管（如保留地址）。
+    #[serde(default)]
+    pub loopback_address: Vec<String>,
+
+    /* ---- 接口过滤 ---- */
+    /// `include_interface` —— 仅接管这些上行接口的流量。
+    #[serde(default)]
+    pub include_interface: Vec<String>,
+    /// `exclude_interface` —— 排除这些接口。
+    #[serde(default)]
+    pub exclude_interface: Vec<String>,
+
+    /* ---- UID 过滤（Linux/Android）---- */
+    #[serde(default)]
+    pub include_uid: Vec<u32>,
+    /// 形如 `"1000:99999"`，闭区间。
+    #[serde(default)]
+    pub include_uid_range: Vec<String>,
+    #[serde(default)]
+    pub exclude_uid: Vec<u32>,
+    #[serde(default)]
+    pub exclude_uid_range: Vec<String>,
+
+    /* ---- GID 过滤（Linux/Android）—— 与 UID 同语义，作用于 `meta skgid` ---- */
+    #[serde(default)]
+    pub include_gid: Vec<u32>,
+    #[serde(default)]
+    pub include_gid_range: Vec<String>,
+    #[serde(default)]
+    pub exclude_gid: Vec<u32>,
+    #[serde(default)]
+    pub exclude_gid_range: Vec<String>,
+
+    /* ---- Android 专属 ---- */
+    /// `include_android_user` —— 仅接管这些 Android user id 的流量（双开 / 工作资料）。
+    #[serde(default)]
+    pub include_android_user: Vec<u32>,
+    /// `include_package` —— Android 包名白名单。
+    #[serde(default)]
+    pub include_package: Vec<String>,
+    /// `exclude_package` —— Android 包名黑名单。
+    #[serde(default)]
+    pub exclude_package: Vec<String>,
+
+    /* ---- LAN MAC 过滤（路由器场景）---- */
+    #[serde(default)]
+    pub include_mac_address: Vec<String>,
+    #[serde(default)]
+    pub exclude_mac_address: Vec<String>,
+
+    /* ---- 平台桥 ---- */
+    /// `platform.http_proxy` —— iOS/Android 系统代理透传。
+    #[serde(default)]
+    pub platform: Option<TunPlatformOptions>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunPlatformOptions {
+    #[serde(default)]
+    pub http_proxy: Option<TunHttpProxyOptions>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TunHttpProxyOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server: String,
+    #[serde(default)]
+    pub server_port: u16,
+    #[serde(default)]
+    pub bypass_domain: Vec<String>,
+    #[serde(default)]
+    pub match_domain: Vec<String>,
 }
 
 /* ---------------- smart ---------------- */
@@ -634,6 +795,15 @@ fn default_capture_resolver() -> CaptureResolver {
 }
 fn default_capture_stack() -> CaptureStack {
     CaptureStack::Native
+}
+fn default_iproute2_table() -> u32 {
+    2022
+}
+fn default_iproute2_rule() -> u32 {
+    9000
+}
+fn default_udp_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 fn default_smart_goal() -> SmartGoal {
     SmartGoal::Balanced

@@ -1,0 +1,357 @@
+//! Linux 完整 TPROXY socket —— 真正接管被 nftables / iptables `TPROXY` 标记
+//! 重定向到本地端口的连接。
+//!
+//! ## 工作流
+//!
+//! 1. nftables / iptables 已经在 prerouting 链插入 `tproxy ... to :7894 mark 1`；
+//! 2. 路由表把 fwmark 1 的流量送到 lo；
+//! 3. 本模块创建带 `IP_TRANSPARENT` 的 listening socket，监听 `:7894`；
+//! 4. accept TCP / recv UDP；用 `getsockopt(SOL_IP, SO_ORIGINAL_DST)`
+//!    （TCP redirect 模式）或 `IP_RECVORIGDSTADDR`（UDP TPROXY 模式）拿到
+//!    *原始目标地址*；
+//! 5. 把 (5-tuple, payload) 通过 [`CaptureEvent`] 推给 supervisor。
+//!
+//! ## unsafe 政策
+//!
+//! 仅 `unsafe_set_ip_transparent` / `unsafe_get_orig_dst` 用 `#[allow(unsafe_code)]`，
+//! 平凡 `setsockopt` / `getsockopt` 调用 + `sockaddr_in` 字段读取。
+
+#![cfg(any(target_os = "linux", target_os = "android"))]
+
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
+
+use core_observe::{copy_bidirectional_counted, ConnectionMeta};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+use crate::engine::{CaptureError, CaptureEvent};
+
+const SO_ORIGINAL_DST: libc::c_int = 80;
+
+/// 启动一个 TPROXY TCP listener；accept 后立即 dial 出站并双向 splice，
+/// 同时推一条事件给 supervisor 用于 NAT / 调试日志。
+///
+/// 之前的实现 `drop(stream)` 是 bug：客户端跟我们建了 TCP，但我们从未把
+/// 对应的入站字节流接到代理出站上 —— 表现为"拨号成功但应用收不到任何数据"。
+pub async fn run_tcp_tproxy(
+    bind: SocketAddr,
+    events: mpsc::Sender<CaptureEvent>,
+    runtime: Arc<core_runtime::Runtime>,
+) -> Result<(), CaptureError> {
+    let std_listener = std::net::TcpListener::bind(bind)
+        .map_err(|e| CaptureError::DeviceFailed(format!("bind {bind}: {e}")))?;
+    set_ip_transparent(std_listener.as_raw_fd())
+        .map_err(|e| CaptureError::Doctor(format!("IP_TRANSPARENT: {e}")))?;
+    std_listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(std_listener)?;
+    info!(target: "capture::tproxy", addr = %bind, "tcp tproxy listening (dial+splice inline)");
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(target: "capture::tproxy", error = %e, "accept failed");
+                continue;
+            }
+        };
+        let fd = stream.as_raw_fd();
+        let original_dst = match get_orig_dst_v4(fd) {
+            Ok(addr) => SocketAddr::V4(addr),
+            Err(e) => {
+                debug!(target: "capture::tproxy", error = %e, "SO_ORIGINAL_DST failed; using local_addr");
+                stream.local_addr()?
+            }
+        };
+        let evt = CaptureEvent {
+            original_dst,
+            source: peer,
+            network: "tcp",
+            fake_host: None,
+        };
+        let _ = events.try_send(evt);
+
+        let runtime = runtime.clone();
+        let bind_local = bind;
+        tokio::spawn(async move {
+            let host = original_dst.ip().to_string();
+            let port = original_dst.port();
+            match runtime
+                .dial(&host, port, core_route::NetworkKind::Tcp)
+                .await
+            {
+                Ok(mut res) => {
+                    // 注册 ConnectionTable —— 让 dashboard 看见 TPROXY 连接，
+                    // 并把 DELETE /connections/:id 路由到 cancel.notify_waiters()。
+                    let meta = ConnectionMeta {
+                        network: "tcp".into(),
+                        kind: "TPROXY".into(),
+                        source_ip: peer.ip().to_string(),
+                        source_port: peer.port().to_string(),
+                        destination_ip: original_dst.ip().to_string(),
+                        destination_port: original_dst.port().to_string(),
+                        inbound_ip: bind_local.ip().to_string(),
+                        inbound_port: bind_local.port().to_string(),
+                        inbound_name: "tproxy".into(),
+                        host: original_dst.ip().to_string(),
+                        dns_mode: "normal".into(),
+                        chains: res.chain.clone(),
+                        rule: format!("{:?}", res.decision),
+                        ..ConnectionMeta::default()
+                    };
+                    let guard = runtime.connections.open(meta);
+                    let conn_id = guard.id;
+                    let (up, down) = guard.counters();
+                    let cancel = guard.cancel_token();
+                    let metrics = runtime.metrics.clone();
+                    metrics.inc_connection();
+                    let mut inbound = stream;
+                    let result = copy_bidirectional_counted(
+                        &mut inbound,
+                        &mut res.stream,
+                        up,
+                        down,
+                        cancel,
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                    metrics.dec_connection();
+                    if let Err(e) = result {
+                        debug!(
+                            target: "capture::tproxy",
+                            conn_id,
+                            %host, port, outbound = %res.outbound,
+                            error = %e,
+                            "splice ended (inbound/outbound EOF or error)"
+                        );
+                    }
+                    drop(guard); // 显式 drop，确保 ConnectionTable 立刻清理
+                }
+                Err(e) => {
+                    warn!(
+                        target: "capture::tproxy",
+                        %host, port,
+                        error = %e,
+                        "tproxy dial failed; closing inbound"
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// UDP TPROXY —— `IP_TRANSPARENT` + `IP_RECVORIGDSTADDR`，`recvmsg` 解析 cmsg
+/// 拿到原始目标地址（`IP_ORIGDSTADDR` / `IPV6_ORIGDSTADDR`）。
+pub async fn run_udp_tproxy(
+    bind: SocketAddr,
+    events: mpsc::Sender<CaptureEvent>,
+) -> Result<(), CaptureError> {
+    let std_sock = std::net::UdpSocket::bind(bind)
+        .map_err(|e| CaptureError::DeviceFailed(format!("bind udp {bind}: {e}")))?;
+    set_ip_transparent(std_sock.as_raw_fd())
+        .map_err(|e| CaptureError::Doctor(format!("IP_TRANSPARENT: {e}")))?;
+    set_ip_recvorigdstaddr(std_sock.as_raw_fd())
+        .map_err(|e| CaptureError::Doctor(format!("IP_RECVORIGDSTADDR: {e}")))?;
+    if bind.is_ipv6() {
+        set_ipv6_recvorigdstaddr(std_sock.as_raw_fd())
+            .map_err(|e| CaptureError::Doctor(format!("IPV6_RECVORIGDSTADDR: {e}")))?;
+    }
+    std_sock.set_nonblocking(true)?;
+    let sock = Arc::new(UdpSocket::from_std(std_sock)?);
+    info!(target: "capture::tproxy", addr = %bind, "udp tproxy listening");
+
+    let mut buf = vec![0u8; 65535];
+    loop {
+        // 异步等可读，然后调原始 recvmsg 把 cmsg 一并拿出来。
+        sock.readable().await?;
+        let r = sock.try_io(tokio::io::Interest::READABLE, || {
+            recvmsg_with_origdst(sock.as_raw_fd(), &mut buf)
+        });
+        let (n, peer, original_dst) = match r {
+            Ok((n, peer, dst)) => (n, peer, dst),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                warn!(target: "capture::tproxy", error = %e, "recvmsg failed");
+                continue;
+            }
+        };
+        let _ = &buf[..n]; // payload —— 由 supervisor.dial 之外的 forwarder 处理
+        let evt = CaptureEvent {
+            original_dst: original_dst.unwrap_or(peer),
+            source: peer,
+            network: "udp",
+            fake_host: None,
+        };
+        if events.send(evt).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/* ---------------- unsafe 区 ---------------- */
+
+#[allow(unsafe_code)]
+fn set_ip_transparent(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt 平凡；指针指向栈上 c_int。
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::IP_TRANSPARENT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_ipv6_recvorigdstaddr(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt 平凡；指针指向栈上 c_int。
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVORIGDSTADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_ip_recvorigdstaddr(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: 同上。
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::IP_RECVORIGDSTADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `recvmsg` + `IP_ORIGDSTADDR` / `IPV6_ORIGDSTADDR` cmsg 解析。
+#[allow(unsafe_code)]
+fn recvmsg_with_origdst(
+    fd: RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
+    let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    // 控制缓冲：足够装一个 IPv6 cmsg（IPv4 cmsg 更小）。
+    let mut control = [0u8; 128];
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_name = &mut name as *mut _ as *mut libc::c_void;
+    hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    hdr.msg_iov = &mut iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = control.len();
+
+    // SAFETY: msghdr 字段全部初始化；recvmsg 写入 name/iov/control 不超过提供长度。
+    let n = unsafe { libc::recvmsg(fd, &mut hdr, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let peer = sockaddr_storage_to_socket_addr(&name)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad peer addr"))?;
+
+    // 遍历 cmsg 找 IP_ORIGDSTADDR / IPV6_ORIGDSTADDR
+    let original_dst = unsafe { extract_origdst(&hdr) };
+
+    Ok((n as usize, peer, original_dst))
+}
+
+#[allow(unsafe_code)]
+unsafe fn extract_origdst(hdr: &libc::msghdr) -> Option<SocketAddr> {
+    let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+    while !cmsg.is_null() {
+        let level = (*cmsg).cmsg_level;
+        let typ = (*cmsg).cmsg_type;
+        if level == libc::SOL_IP && typ == libc::IP_ORIGDSTADDR {
+            let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
+            let sa = std::ptr::read_unaligned(data);
+            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            let port = u16::from_be(sa.sin_port);
+            return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+        }
+        if level == libc::IPPROTO_IPV6 && typ == libc::IPV6_ORIGDSTADDR {
+            let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
+            let sa = std::ptr::read_unaligned(data);
+            let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
+            let port = u16::from_be(sa.sin6_port);
+            return Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
+        }
+        cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+    }
+    None
+}
+
+#[allow(unsafe_code)]
+fn sockaddr_storage_to_socket_addr(s: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    let family = s.ss_family as i32;
+    if family == libc::AF_INET {
+        // SAFETY: 当 ss_family=AF_INET 时 layout 是 sockaddr_in。
+        let v4: &libc::sockaddr_in = unsafe { &*(s as *const _ as *const libc::sockaddr_in) };
+        let ip = Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
+        Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(v4.sin_port))))
+    } else if family == libc::AF_INET6 {
+        // SAFETY: 同理。
+        let v6: &libc::sockaddr_in6 = unsafe { &*(s as *const _ as *const libc::sockaddr_in6) };
+        let ip = Ipv6Addr::from(v6.sin6_addr.s6_addr);
+        Some(SocketAddr::V6(SocketAddrV6::new(
+            ip,
+            u16::from_be(v6.sin6_port),
+            0,
+            0,
+        )))
+    } else {
+        None
+    }
+}
+
+#[allow(unsafe_code)]
+fn get_orig_dst_v4(fd: RawFd) -> std::io::Result<SocketAddrV4> {
+    // SAFETY: getsockopt 写入 sockaddr_in；len 初始化为结构体大小，调用后被内核更新。
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_IP,
+            SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ip = u32::from_be(addr.sin_addr.s_addr);
+    let port = u16::from_be(addr.sin_port);
+    Ok(SocketAddrV4::new(Ipv4Addr::from(ip), port))
+}

@@ -9,6 +9,7 @@ core-config       = { workspace = true }
 core-ruleset      = { workspace = true }
 core-store        = { workspace = true }
 serde             = { workspace = true }
+serde_json        = { workspace = true }
 serde_yaml        = { workspace = true }
 tokio             = { workspace = true }
 async-trait       = { workspace = true }

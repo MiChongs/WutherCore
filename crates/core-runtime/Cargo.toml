@@ -19,7 +19,16 @@ anyhow        = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 parking_lot   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
 dashmap       = { workspace = true }
+ahash         = { workspace = true }
+regex         = { workspace = true }
 once_cell     = { workspace = true }
 bytes         = { workspace = true }
 futures       = { workspace = true }
+# URLTest 终结 HTTPS：与 mihomo 一致默认 HEAD https://www.gstatic.com/generate_204。
+tokio-rustls     = { workspace = true }
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots     = { workspace = true }

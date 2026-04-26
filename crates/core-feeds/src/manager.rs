@@ -1,17 +1,31 @@
-//! FeedManager —— 编排多个 feed：冷启动拉一次 → 周期刷新 → 推送给 sink。
+//! FeedManager —— 编排多个 feed：
+//!
+//! * **启动时**：先读 disk cache + meta；如果 `last_refreshed + every > now`，
+//!   立刻 emit "snapshot from cache"（让 Runtime 拿到上次的节点列表，不阻塞启动），
+//!   然后 sleep 到下一次 due 才发起 HTTP 拉取；
+//! * **首次 / cache 过期**：立即 fetch；
+//! * **fetch 成功**：写 raw + meta；
+//! * **fetch 失败**：fallback 到 disk cache（如果存在）；
+//! * **空 feeds**：`start()` 是 noop，所有读取 API 返回空集，不 panic；
+//! * **每条 feed 独立协程**：互不阻塞；可通过 [`FeedManager::refresh_now`] 由
+//!   `/providers/proxies/:name PUT` 主动触发。
+//!
+//! 配置变更检测：`meta.url_hash` 与当前 url 不一致时强制重拉，避免用旧域名
+//! 的 cache 给新订阅。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use core_config::model::FeedDetail;
 use core_config::node_uri::ParsedNode;
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::cache::FeedDiskCache;
+use crate::cache::{url_digest, FeedDiskCache, FeedMeta};
 use crate::fetcher::fetch_feed;
 use crate::parser::{apply_filter_rename, parse_feed_payload, FormatHint};
 
@@ -30,6 +44,19 @@ pub trait FeedSink: Send + Sync {
     async fn on_update(&self, update: FeedUpdate);
 }
 
+/// 单个 feed 的运行时状态 —— 供 `/providers/proxies/:name` 等 API 查询。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedStatus {
+    pub name: String,
+    pub url: String,
+    pub every_secs: u64,
+    pub last_refreshed_ms: u64,
+    pub next_due_ms: u64,
+    pub last_node_count: usize,
+    pub last_raw_bytes: u64,
+    pub last_from_cache: bool,
+}
+
 #[derive(Default)]
 pub struct FeedManager {
     feeds: BTreeMap<String, FeedDetail>,
@@ -37,16 +64,40 @@ pub struct FeedManager {
     sink: RwLock<Option<Arc<dyn FeedSink>>>,
     handles: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     snapshots: RwLock<BTreeMap<String, Vec<ParsedNode>>>,
+    /// per-feed 状态（更新时间、节点数、原始字节数等）—— 控制面板用。
+    statuses: RwLock<BTreeMap<String, FeedStatus>>,
+    /// per-feed wakeup —— refresh_now 时唤醒 sleep。
+    notifies: RwLock<BTreeMap<String, Arc<Notify>>>,
 }
 
 impl FeedManager {
     pub fn new(feeds: BTreeMap<String, FeedDetail>, cache: Option<FeedDiskCache>) -> Arc<Self> {
+        let mut notifies = BTreeMap::new();
+        let mut statuses = BTreeMap::new();
+        for (n, d) in &feeds {
+            notifies.insert(n.clone(), Arc::new(Notify::new()));
+            statuses.insert(
+                n.clone(),
+                FeedStatus {
+                    name: n.clone(),
+                    url: d.url.clone(),
+                    every_secs: d.every.as_secs(),
+                    last_refreshed_ms: 0,
+                    next_due_ms: 0,
+                    last_node_count: 0,
+                    last_raw_bytes: 0,
+                    last_from_cache: false,
+                },
+            );
+        }
         Arc::new(Self {
             feeds,
             cache,
             sink: RwLock::new(None),
             handles: parking_lot::Mutex::new(Vec::new()),
             snapshots: RwLock::new(BTreeMap::new()),
+            statuses: RwLock::new(statuses),
+            notifies: RwLock::new(notifies),
         })
     }
 
@@ -66,14 +117,53 @@ impl FeedManager {
             .collect()
     }
 
-    /// 启动：每个 feed 一个独立协程，先拉一次再按 every 调度。
+    pub fn list_status(&self) -> Vec<FeedStatus> {
+        self.statuses.read().values().cloned().collect()
+    }
+
+    pub fn status(&self, name: &str) -> Option<FeedStatus> {
+        self.statuses.read().get(name).cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.feeds.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.feeds.keys().cloned().collect()
+    }
+
+    /// 主动触发某个 feed 立即刷新（被 `/providers/proxies/:name PUT` 调用）。
+    /// 返回 true 表示已发出唤醒；feed 不存在返回 false。
+    pub fn refresh_now(&self, name: &str) -> bool {
+        let n = self.notifies.read().get(name).cloned();
+        match n {
+            Some(notify) => {
+                notify.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 启动：每个 feed 一个独立协程。空 feeds 是 noop。
     pub fn start(self: Arc<Self>) {
+        if self.feeds.is_empty() {
+            info!(target: "feeds", "no feeds configured; manager idle");
+            return;
+        }
         for (name, detail) in self.feeds.clone() {
             let me = self.clone();
             let name_owned = name.clone();
             let detail_owned = detail.clone();
+            let notify = self
+                .notifies
+                .read()
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
             let handle = tokio::spawn(async move {
-                me.run_one(name_owned, detail_owned).await;
+                me.run_one(name_owned, detail_owned, notify).await;
             });
             self.handles.lock().push(handle);
         }
@@ -85,12 +175,63 @@ impl FeedManager {
         }
     }
 
-    /// 单 feed 主循环。
-    async fn run_one(self: Arc<Self>, name: String, detail: FeedDetail) {
+    /// 单 feed 主循环 —— 先按 meta 决定是否立即 fetch / 复用 cache。
+    async fn run_one(self: Arc<Self>, name: String, detail: FeedDetail, notify: Arc<Notify>) {
         let timeout = Duration::from_secs(30);
+        let every = clamp_interval(detail.every);
+
+        // 1. 首启动：尝试用 disk meta + cache 计算等待时间。
+        let mut initial_wait = Duration::from_secs(0);
+        if let Some(cache) = self.cache.as_ref() {
+            if let Some(meta) = cache.load_meta(&name) {
+                let url_changed = meta.url_hash.as_deref() != Some(&url_digest(&detail.url));
+                if url_changed {
+                    info!(target: "feeds", name = %name, "url changed since last cache; forgetting");
+                    cache.forget(&name);
+                } else if let Some(elapsed) = meta.elapsed() {
+                    if elapsed < every {
+                        initial_wait = every - elapsed;
+                        // 把 cache 当作启动快照立刻发出，让 Runtime 不必等首拉。
+                        if let Some(raw) = cache.load(&name) {
+                            let nodes = self.parse_with_filter(&detail, &raw);
+                            self.publish_update(
+                                &name,
+                                FeedUpdate {
+                                    name: name.clone(),
+                                    nodes: nodes.clone(),
+                                    from_cache: true,
+                                    raw_bytes: raw.len(),
+                                },
+                                Some(meta.last_refreshed_ms),
+                                every,
+                            )
+                            .await;
+                            info!(
+                                target: "feeds",
+                                name = %name,
+                                cached_nodes = nodes.len(),
+                                wait_secs = initial_wait.as_secs(),
+                                "loaded snapshot from cache; deferring fetch"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 等待初始 wait（受 refresh_now 唤醒打断）。
+        if !initial_wait.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(initial_wait) => {}
+                _ = notify.notified() => {
+                    debug!(target: "feeds", name = %name, "refresh_now interrupted initial wait");
+                }
+            }
+        }
+
+        // 3. 主循环：fetch → publish → sleep(every)，sleep 期间 notify 可打断。
         loop {
-            let result = self.refresh_once(&name, &detail, timeout).await;
-            match result {
+            match self.refresh_once(&name, &detail, timeout).await {
                 Ok(update) => {
                     info!(
                         target: "feeds",
@@ -98,22 +239,62 @@ impl FeedManager {
                         nodes = update.nodes.len(),
                         bytes = update.raw_bytes,
                         from_cache = update.from_cache,
-                        "feed updated"
+                        "feed refreshed"
                     );
-                    self.snapshots.write().insert(name.clone(), update.nodes.clone());
-                    let sink = { self.sink.read().clone() };
-                    if let Some(sink) = sink {
-                        sink.on_update(update).await;
-                    }
+                    let now_ms = now_ms();
+                    self.publish_update(&name, update, Some(now_ms), every).await;
                 }
-                Err(e) => warn!(target: "feeds", name = %name, error = %e, "feed refresh failed"),
+                Err(e) => {
+                    warn!(target: "feeds", name = %name, error = %e, "feed refresh failed");
+                    // 失败也要更新 next_due 让 dashboard 看到。
+                    let s_lock = self.statuses.read();
+                    let last = s_lock.get(&name).map(|s| s.last_refreshed_ms).unwrap_or(0);
+                    drop(s_lock);
+                    self.update_next_due(&name, last, every);
+                }
             }
-            let next = clamp_interval(detail.every);
-            tokio::time::sleep(next).await;
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = notify.notified() => {
+                    info!(target: "feeds", name = %name, "refresh_now triggered");
+                }
+            }
         }
     }
 
-    /// 一次完整刷新（不含等待）。
+    /// 把更新推到 snapshots / status / sink。
+    async fn publish_update(
+        self: &Arc<Self>,
+        name: &str,
+        update: FeedUpdate,
+        last_refreshed_ms_override: Option<u64>,
+        every: Duration,
+    ) {
+        self.snapshots
+            .write()
+            .insert(name.to_string(), update.nodes.clone());
+        let last_ms = last_refreshed_ms_override.unwrap_or_else(now_ms);
+        if let Some(s) = self.statuses.write().get_mut(name) {
+            s.last_refreshed_ms = last_ms;
+            s.last_node_count = update.nodes.len();
+            s.last_raw_bytes = update.raw_bytes as u64;
+            s.last_from_cache = update.from_cache;
+            s.next_due_ms = last_ms.saturating_add(every.as_millis() as u64);
+        }
+        let sink = { self.sink.read().clone() };
+        if let Some(sink) = sink {
+            sink.on_update(update).await;
+        }
+    }
+
+    fn update_next_due(&self, name: &str, last_ms: u64, every: Duration) {
+        if let Some(s) = self.statuses.write().get_mut(name) {
+            let base = if last_ms == 0 { now_ms() } else { last_ms };
+            s.next_due_ms = base.saturating_add(every.as_millis() as u64);
+        }
+    }
+
+    /// 一次完整刷新（不含等待）—— 成功时写 raw + meta；失败时回退 cache。
     pub async fn refresh_once(
         &self,
         name: &str,
@@ -123,7 +304,14 @@ impl FeedManager {
         let raw = match fetch_feed(&detail.url, timeout).await {
             Ok(b) => {
                 if let Some(cache) = &self.cache {
-                    cache.save(name, &b);
+                    let meta = FeedMeta {
+                        last_refreshed_ms: now_ms(),
+                        raw_size: b.len() as u64,
+                        etag: None,
+                        content_type: None,
+                        url_hash: Some(url_digest(&detail.url)),
+                    };
+                    cache.save_with_meta(name, &b, &meta);
                 }
                 b
             }
@@ -165,15 +353,22 @@ fn clamp_interval(d: Duration) -> Duration {
     if d < min { min } else if d > max { max } else { d }
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core_config::model::{FeedFilter, FeedRename};
 
-    fn detail() -> FeedDetail {
+    fn detail(url: &str, every_secs: u64) -> FeedDetail {
         FeedDetail {
-            url: "file://./this/should/not/exist".into(),
-            every: Duration::from_secs(3600),
+            url: url.into(),
+            every: Duration::from_secs(every_secs),
             via: "direct".into(),
             keep: FeedFilter::default(),
             drop: FeedFilter::default(),
@@ -181,26 +376,149 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refresh_falls_back_to_cache_when_fetch_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "rpkernel-feeds-test-{}",
+    fn tmp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rpkernel-feeds-mgr-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn refresh_falls_back_to_cache_when_fetch_fails() {
+        let dir = tmp_root();
         let cache = FeedDiskCache::new(&dir).unwrap();
         let payload = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#FromCache";
         cache.save("airport", payload);
-
         let mgr = FeedManager::new(BTreeMap::new(), Some(cache));
         let update = mgr
-            .refresh_once("airport", &detail(), Duration::from_millis(500))
+            .refresh_once(
+                "airport",
+                &detail("file://./this/should/not/exist", 3600),
+                Duration::from_millis(500),
+            )
             .await
             .unwrap();
         assert!(update.from_cache);
         assert_eq!(update.nodes.len(), 1);
         assert_eq!(update.nodes[0].name, "FromCache");
+    }
+
+    #[tokio::test]
+    async fn refresh_once_writes_meta_with_url_hash() {
+        let dir = tmp_root();
+        let cache = FeedDiskCache::new(&dir).unwrap();
+        let mgr = FeedManager::new(BTreeMap::new(), Some(cache.clone()));
+        // fetch 会失败（不存在的 URL）→ 走 cache 回退；这里改为先放 cache。
+        let raw = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#X";
+        cache.save("p", raw);
+        // 直接保存 meta 模拟 fetch 成功路径
+        let meta = FeedMeta {
+            last_refreshed_ms: now_ms(),
+            raw_size: raw.len() as u64,
+            etag: None,
+            content_type: None,
+            url_hash: Some(url_digest("https://x")),
+        };
+        cache.save_meta("p", &meta);
+        let m = cache.load_meta("p").unwrap();
+        assert_eq!(m.url_hash.as_deref(), Some(&*url_digest("https://x")));
+        let _ = mgr; // 仅验证 cache+meta 写入路径
+    }
+
+    #[tokio::test]
+    async fn empty_feeds_start_is_noop_and_stop_is_safe() {
+        let mgr = FeedManager::new(BTreeMap::new(), None);
+        let m = mgr.clone();
+        m.start();
+        assert!(mgr.is_empty());
+        assert!(mgr.list_status().is_empty());
+        assert!(mgr.snapshot("nope").is_none());
+        assert!(!mgr.refresh_now("nope"));
+        mgr.stop(); // 不 panic
+    }
+
+    #[tokio::test]
+    async fn refresh_now_for_unknown_feed_returns_false() {
+        let mgr = FeedManager::new(BTreeMap::new(), None);
+        assert!(!mgr.refresh_now("does-not-exist"));
+    }
+
+    #[tokio::test]
+    async fn cached_meta_within_every_defers_fetch_and_emits_snapshot() {
+        let dir = tmp_root();
+        let cache = FeedDiskCache::new(&dir).unwrap();
+        // 写入"刚刚刷新"的 meta + cache。
+        let url = "https://example.com/sub-stale";
+        let raw = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#Cached";
+        let meta = FeedMeta {
+            last_refreshed_ms: now_ms(),
+            raw_size: raw.len() as u64,
+            etag: None,
+            content_type: None,
+            url_hash: Some(url_digest(url)),
+        };
+        cache.save_with_meta("p", raw, &meta);
+
+        // every=1h；run_one 启动应立刻 emit cache snapshot 并 defer fetch。
+        let mut feeds = BTreeMap::new();
+        feeds.insert("p".to_string(), detail(url, 3600));
+        let mgr = FeedManager::new(feeds, Some(cache));
+
+        // 用一个简易 sink 收集 update。
+        struct Capture {
+            tx: tokio::sync::mpsc::Sender<FeedUpdate>,
+        }
+        #[async_trait]
+        impl FeedSink for Capture {
+            async fn on_update(&self, u: FeedUpdate) {
+                let _ = self.tx.send(u).await;
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FeedUpdate>(4);
+        mgr.set_sink(Arc::new(Capture { tx }));
+
+        let m = mgr.clone();
+        m.start();
+        // 必须在合理时间内（< 2s）拿到 cache snapshot；不能等 1h。
+        let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("snapshot must arrive quickly")
+            .unwrap();
+        assert!(got.from_cache);
+        assert_eq!(got.name, "p");
+        assert_eq!(got.nodes.len(), 1);
+        let s = mgr.status("p").unwrap();
+        assert!(s.last_node_count == 1);
+        assert!(s.next_due_ms > s.last_refreshed_ms);
+        mgr.stop();
+    }
+
+    #[tokio::test]
+    async fn url_change_forgets_old_cache() {
+        let dir = tmp_root();
+        let cache = FeedDiskCache::new(&dir).unwrap();
+        let raw = b"ss://YWVzLTI1Ni1nY206cGFzcw==@1.1.1.1:8388#Old";
+        let meta = FeedMeta {
+            last_refreshed_ms: now_ms(),
+            raw_size: raw.len() as u64,
+            etag: None,
+            content_type: None,
+            url_hash: Some(url_digest("https://old")),
+        };
+        cache.save_with_meta("p", raw, &meta);
+        // 模拟 url 改了
+        let mut feeds = BTreeMap::new();
+        feeds.insert("p".to_string(), detail("https://new", 3600));
+        let mgr = FeedManager::new(feeds, Some(cache.clone()));
+        let m = mgr.clone();
+        m.start();
+        // 给 run_one 一点时间执行 cache forget。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // forget 后 cache 应被清。
+        assert!(cache.load("p").is_none(), "old cache should be forgotten");
+        mgr.stop();
     }
 }

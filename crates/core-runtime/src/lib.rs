@@ -8,7 +8,12 @@
 pub mod engine;
 pub mod group_selector;
 pub mod health;
+pub mod int_ranges;
 
 pub use engine::{Runtime, RuntimeError};
-pub use group_selector::GroupSelector;
-pub use health::{spawn_periodic, DelayError, UrlTestConfig, UrlTester};
+pub use group_selector::{FlowMeta, GroupOptions, GroupSelector, LbStrategy};
+pub use health::{
+    spawn_periodic, DelayError, HistoryEntry, NodeUrlStats, UrlTestConfig, UrlTestOpts, UrlTester,
+    DEAD_DELAY, FAST_PICK_TTL,
+};
+pub use int_ranges::{IntRanges, Range};

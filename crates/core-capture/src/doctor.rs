@@ -61,6 +61,43 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
         }
     }
 
+    // sing-box 字段一致性检查
+    if plan.auto_redirect && !cfg!(any(target_os = "linux", target_os = "android")) {
+        warnings.push(format!(
+            "auto_redirect 仅在 Linux/Android 生效（当前 {}）",
+            std::env::consts::OS
+        ));
+    }
+    if plan.strict_route && !plan.auto_route {
+        warnings.push("strict_route=true 但 auto_route=false：可能切断所有流量".into());
+    }
+    let marks = &plan.auto_redirect_marks;
+    if let (Some(i), Some(o)) = (marks.input, marks.output) {
+        if i == o {
+            blockers.push(format!(
+                "auto_redirect_input_mark 与 output_mark 重叠 ({i:#x})"
+            ));
+        }
+    }
+    if !plan.route_addresses.is_empty() && plan.strict_route {
+        warnings.push(
+            "route_address 白名单 + strict_route 同时启用：白名单外的目标全部被 drop".into(),
+        );
+    }
+    if !c.tun.include_uid.is_empty() && !cfg!(any(target_os = "linux", target_os = "android")) {
+        warnings.push("include_uid / exclude_uid 仅在 Linux/Android 生效".into());
+    }
+    let has_gid_filter = !c.tun.include_gid.is_empty()
+        || !c.tun.exclude_gid.is_empty()
+        || !c.tun.include_gid_range.is_empty()
+        || !c.tun.exclude_gid_range.is_empty();
+    if has_gid_filter && !cfg!(any(target_os = "linux", target_os = "android")) {
+        warnings.push("include_gid / exclude_gid 仅在 Linux/Android 生效".into());
+    }
+    if !c.tun.include_package.is_empty() && !cfg!(target_os = "android") {
+        warnings.push("include_package / exclude_package 仅在 Android 生效".into());
+    }
+
     // 平台特定 doctor
     match plan.kind {
         EngineKind::Tproxy | EngineKind::Redirect => {
@@ -126,13 +163,12 @@ mod tests {
     use super::*;
     use core_config::model::{
         Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
-        Mesh,
+        Mesh, TunInboundOptions,
     };
 
-    #[test]
-    fn off_returns_kind_none() {
-        let c = Capture {
-            on: false,
+    fn capture(on: bool) -> Capture {
+        Capture {
+            on,
             method: CaptureMethod::Auto,
             traffic: CaptureTraffic::System,
             resolver: CaptureResolver::Hijack,
@@ -140,9 +176,51 @@ mod tests {
             mtu: None,
             offload: true,
             exclude: CaptureExclude::default(),
-        };
-        let r = diagnose(&c, &Mesh::default()).unwrap();
+            tun: TunInboundOptions::default(),
+        }
+    }
+
+    #[test]
+    fn off_returns_kind_none() {
+        let r = diagnose(&capture(false), &Mesh::default()).unwrap();
         assert_eq!(r.kind, "none");
         assert!(r.ok());
+    }
+
+    #[test]
+    fn detects_overlapping_redirect_marks() {
+        let mut c = capture(true);
+        c.method = CaptureMethod::VirtualNic;
+        c.tun.auto_redirect = true;
+        c.tun.auto_redirect_input_mark = Some("0x1".into());
+        c.tun.auto_redirect_output_mark = Some("0x1".into());
+        let r = diagnose(&c, &Mesh::default()).unwrap();
+        assert!(r.blockers.iter().any(|b| b.contains("重叠")));
+    }
+
+    #[test]
+    fn warns_strict_route_without_auto_route() {
+        let mut c = capture(true);
+        c.method = CaptureMethod::VirtualNic;
+        c.tun.strict_route = true;
+        c.tun.auto_route = false;
+        let r = diagnose(&c, &Mesh::default()).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("strict_route")));
+    }
+
+    #[test]
+    fn diagnose_accepts_gid_filters() {
+        // 在 Linux/Android 上不该有 GID 警告；其它平台应有警告。
+        let mut c = capture(true);
+        c.method = CaptureMethod::VirtualNic;
+        c.tun.exclude_gid = vec![1000];
+        c.tun.include_gid_range = vec!["3000:3999".into()];
+        let r = diagnose(&c, &Mesh::default()).unwrap();
+        let has_gid_warn = r.warnings.iter().any(|w| w.contains("gid"));
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert!(!has_gid_warn, "Linux/Android 应直接接受 gid 字段");
+        } else {
+            assert!(has_gid_warn, "其它平台应提示 gid 不生效");
+        }
     }
 }

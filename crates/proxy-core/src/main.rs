@@ -126,6 +126,16 @@ enum FeedsCmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // 进程级 rustls 加密提供者注册 —— **必须在任何 ClientConfig::builder() 调用之前**。
+    // rustls 0.23 在多个依赖（quinn / hickory-resolver / reqwest）同时启用时，
+    // 全局默认 CryptoProvider 会变得"模糊"：未显式安装时 builder() 会 panic
+    // ("no process-level CryptoProvider available")，所有 TLS 出站直接死锁，
+    // URLTest 的现象就是 30 个节点全 5005ms 超时。
+    // 使用 ring 作为唯一安装的提供者；已安装时返回 Err，忽略即可。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 早期初始化（无 LogBus）—— 让 CLI 子命令也能打日志；
+    // run 子命令在 Runtime 构造后会再 init_with_bus 接到 /logs WS。
     core_observe::init_tracing();
     let cli = Cli::parse();
     match cli.cmd {
@@ -180,31 +190,7 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
                 println!("配置中未声明 route.sets");
                 return Ok(());
             }
-            let specs: std::collections::BTreeMap<String, RulesetSpec> = plan
-                .route
-                .sets
-                .iter()
-                .map(|(name, s)| {
-                    let typ = match s.r#type.to_ascii_lowercase().as_str() {
-                        "ipcidr" | "ip" => RulesetType::Ipcidr,
-                        "classical" => RulesetType::Classical,
-                        "mixed" => RulesetType::Mixed,
-                        _ => RulesetType::Domain,
-                    };
-                    (
-                        name.clone(),
-                        RulesetSpec {
-                            url: s.url.clone(),
-                            path: s.path.clone(),
-                            payload: s.payload.clone(),
-                            r#type: typ,
-                            format: s.format.clone(),
-                            every: s.every,
-                            via: s.via.clone(),
-                        },
-                    )
-                })
-                .collect();
+            let specs = build_ruleset_specs(&plan.route.sets);
             let idx = core_ruleset::RulesetIndex::new();
             let mgr = RulesetManager::new(specs.clone(), Some(cache_dir), idx.clone());
             for (name, spec) in &specs {
@@ -264,6 +250,36 @@ async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// 把 [`core_config::model::RuleSetSpec`]（YAML 反序列化产物）翻译成
+/// [`core_ruleset::RulesetSpec`] —— `cmd_ruleset` Refresh 子命令与 `cmd_run`
+/// 启动路径共用此函数，避免字段对应散落两份。
+fn build_ruleset_specs(
+    sets: &std::collections::BTreeMap<String, core_config::model::RuleSetSpec>,
+) -> std::collections::BTreeMap<String, RulesetSpec> {
+    sets.iter()
+        .map(|(name, s)| {
+            let typ = match s.r#type.to_ascii_lowercase().as_str() {
+                "ipcidr" | "ip" => RulesetType::Ipcidr,
+                "classical" => RulesetType::Classical,
+                "mixed" => RulesetType::Mixed,
+                _ => RulesetType::Domain,
+            };
+            (
+                name.clone(),
+                RulesetSpec {
+                    url: s.url.clone(),
+                    path: s.path.clone(),
+                    payload: s.payload.clone(),
+                    r#type: typ,
+                    format: s.format.clone(),
+                    every: s.every,
+                    via: s.via.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 fn format_label(f: core_ruleset::RulesetFormat) -> &'static str {
@@ -415,33 +431,78 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         }
     };
 
-    let runtime = Arc::new(Runtime::build_with_store(plan.clone(), store));
+    // 先建好共享的 RulesetIndex —— 让 RouteEngine（runtime 内）与 capture
+    // supervisor 共用同一份索引；下方的 RulesetManager 会往里灌编译好的
+    // RulesetMatcher。
+    let ruleset_index = core_ruleset::RulesetIndex::new();
+
+    let runtime = Arc::new(Runtime::build_with(
+        plan.clone(),
+        store,
+        Some(ruleset_index.clone()),
+    ));
+
+    // 用 LogBus 重新初始化 tracing layer —— 让 /v1/logs 与 Clash 兼容 /logs WS 流式输出。
+    // try_init 内部对重复初始化是 no-op，所以早期 fmt layer 仍生效，
+    // 我们这里再追加 BusLayer。
+    core_observe::init_tracing_with_bus(Some(runtime.logs.clone()));
+
+    // RulesetManager —— 把配置 route.sets 翻成 core-ruleset 的 RulesetSpec
+    // 并启动后台轮询拉取。这一步必须在 runtime / capture 之间，确保启动 INFO
+    // 日志能看到全部规则集。之前缺少这步会导致 set:geoip-cn 等规则永远不命中。
+    let _ruleset_mgr_handle = {
+        let specs = build_ruleset_specs(&plan.route.sets);
+        let count = specs.len();
+        let cache_dir = std::path::PathBuf::from("data/ruleset");
+        let mgr =
+            RulesetManager::new(specs, Some(cache_dir.clone()), ruleset_index.clone());
+        mgr.clone().start();
+        if count == 0 {
+            info!(target: "ruleset", "no route.sets configured; manager idle");
+        } else {
+            info!(
+                target: "ruleset",
+                count,
+                cache_dir = %cache_dir.display(),
+                "ruleset manager started (initial fetch + periodic refresh in background)"
+            );
+        }
+        mgr
+    };
 
     // URLTest：默认每分钟周期探测全部出站（DIRECT/BLOCK 跳过）。
     let urltest = UrlTester::new(UrlTestConfig::default());
+    runtime.set_urltest(urltest.clone());
     let _urltest_handle = core_runtime::spawn_periodic(
         urltest.clone(),
         runtime.clone(),
         std::time::Duration::from_secs(60),
     );
 
-    // 启动订阅管理器（如果配置了 feeds）
-    let feed_mgr_handle = if !plan.feeds.is_empty() {
+    // 始终创建 FeedManager —— 即便 feeds 为空，dashboard 的 /providers/proxies
+    // 仍能拿到一致的（空）provider 列表；start() 在空配置下是 noop，不 spawn 任何 task。
+    let feed_mgr_handle = {
         let cache = FeedDiskCache::new("data/feeds").ok();
         let mgr = FeedManager::new(plan.feeds.clone(), cache);
         mgr.set_sink(Arc::new(RuntimeFeedSink { runtime: runtime.clone() }));
         let m = mgr.clone();
         m.start();
-        info!(target: "feeds", count = plan.feeds.len(), "feed manager started");
-        Some(mgr)
-    } else {
-        None
+        if plan.feeds.is_empty() {
+            info!(target: "feeds", "no feeds configured; manager idle");
+        } else {
+            info!(target: "feeds", count = plan.feeds.len(), "feed manager started (auto-fetch on schedule)");
+        }
+        mgr
     };
 
-    // 启动 capture supervisor（如果配置开启）
+    // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
     match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh) {
         Ok(Some(sup)) => {
+            // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
+            sup.set_ip_set_provider(Arc::new(RulesetIpSetProvider {
+                index: ruleset_index.clone(),
+            }));
             if let Err(e) = sup.start(runtime.clone()).await {
                 warn!(target: "capture", error = %e, "capture supervisor start failed");
             } else {
@@ -484,6 +545,8 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 secret: plan.ui.secret.clone(),
                 clash_compat: plan.ui.api.clash_compat,
                 urltest: urltest.clone(),
+                capture: capture_handle.clone(),
+                feeds: Some(feed_mgr_handle.clone()),
             };
             handles.push(tokio::spawn(async move {
                 if let Err(e) = server.run().await {
@@ -502,14 +565,33 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             warn!(target: "capture", error = %e, "capture stop failed");
         }
     }
-    if let Some(mgr) = feed_mgr_handle {
-        mgr.stop();
-    }
+    feed_mgr_handle.stop();
     runtime.shutdown().await;
     for h in handles {
         h.abort();
     }
     Ok(())
+}
+
+/// 把 [`core_ruleset::RulesetIndex`] 适配为 [`core_capture::IpSetProvider`]。
+///
+/// `route_address_set: ["geoip-cn"]` → 查 ruleset_index 的 `geoip-cn`，
+/// 命中 cidr_v4 / cidr_v6 即视为白/黑名单元素。
+#[derive(Debug)]
+struct RulesetIpSetProvider {
+    index: Arc<core_ruleset::RulesetIndex>,
+}
+
+impl core_capture::IpSetProvider for RulesetIpSetProvider {
+    fn contains(&self, name: &str, ip: std::net::IpAddr) -> bool {
+        let Some(matcher) = self.index.get(name) else {
+            return false;
+        };
+        matcher.matches("", Some(ip), None, None)
+    }
+    fn names(&self) -> Vec<String> {
+        self.index.names()
+    }
 }
 
 /// FeedSink 实现：把订阅刷新结果直接交给 Runtime 注册。

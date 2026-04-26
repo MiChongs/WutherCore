@@ -39,6 +39,9 @@ pub fn list_interfaces() -> Vec<String> {
 
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
     match plan.kind {
+        // Tun → 走 Linux engine 拿真实 TunIo（VpnService fd 优先；root /dev/net/tun fallback）。
+        #[cfg(target_os = "android")]
+        EngineKind::Tun => crate::platform::linux::build_engine(plan),
         EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
             Ok(Arc::new(AndroidCapture::new(plan)))
         }
@@ -105,7 +108,11 @@ impl CaptureEngine for AndroidCapture {
     fn kind(&self) -> EngineKind { self.plan.kind }
     fn plan(&self) -> &CapturePlan { &self.plan }
 
-    async fn start(self: Arc<Self>, _events: mpsc::Sender<CaptureEvent>) -> Result<(), CaptureError> {
+    async fn start(
+        self: Arc<Self>,
+        _events: mpsc::Sender<CaptureEvent>,
+        _runtime: Arc<core_runtime::Runtime>,
+    ) -> Result<(), CaptureError> {
         let mut g = self.state.lock().await;
         if *g {
             return Ok(());

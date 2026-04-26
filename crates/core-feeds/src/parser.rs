@@ -160,7 +160,118 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     if let Some(udp) = g("udp").and_then(|v| v.as_bool()) {
         node.udp = udp;
     }
+
+    /* ============================================================
+       关键：把全部顶层标量字段 + 嵌套 transport-opts 平铺到 node.params。
+       下游 registry::build_outbound 通过 params.get() 读 skip-cert-verify /
+       alpn / ws-path / grpc-service-name / reality public-key 等。
+       否则 Clash YAML 订阅的"假 SNI + skip-cert-verify"无法生效，
+       证书校验会用真实服务端 cert 失败（用户实际遭遇）。
+       ============================================================ */
+
+    // 1. 全部顶层标量
+    for (k, v) in m.iter() {
+        let Some(key) = k.as_str() else { continue };
+        if matches!(
+            key,
+            // 已经映射到 ParsedNode 字段的，避免重复
+            "name" | "type" | "server" | "port" | "password" | "uuid" | "cipher" | "method"
+            | "tls" | "sni" | "servername" | "network" | "udp"
+        ) {
+            continue;
+        }
+        if let Some(s) = scalar_to_string(v) {
+            node.params.insert(key.to_string(), s);
+        }
+    }
+
+    // 2. allowInsecure 别名归一 —— 让下游 registry 只看一个键。
+    for alias in [
+        "skip-cert-verify",
+        "skipCertVerify",
+        "allow-insecure",
+        "insecure",
+    ] {
+        if let Some(v) = g(alias).and_then(|v| scalar_to_string(&v)) {
+            // 任一变种命中 → 同时设 allowInsecure（registry 当前主键）
+            if v == "1" || v.eq_ignore_ascii_case("true") {
+                node.params.insert("allowInsecure".into(), "1".into());
+            }
+        }
+    }
+
+    // 3. alpn：YAML list → 逗号字符串
+    if let Some(seq) = g("alpn").and_then(|v| v.as_sequence().cloned()) {
+        let joined = seq
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !joined.is_empty() {
+            node.params.insert("alpn".into(), joined);
+        }
+    }
+
+    // 4. transport-opts 平铺
+    flatten_transport_opts(m, "ws-opts", &["path", "headers"], &mut node.params, "ws-");
+    flatten_transport_opts(m, "grpc-opts", &["grpc-service-name"], &mut node.params, "");
+    flatten_transport_opts(m, "h2-opts", &["host", "path"], &mut node.params, "h2-");
+    flatten_transport_opts(m, "reality-opts", &["public-key", "short-id"], &mut node.params, "reality-");
+    flatten_transport_opts(m, "ech-opts", &["enable", "config"], &mut node.params, "ech-");
+
+    // 5. ws-opts 嵌套 path / headers（headers 是 map）
+    if let Some(ws_opts) = g("ws-opts").and_then(|v| v.as_mapping().cloned()) {
+        if let Some(path) = ws_opts.get(&serde_yaml::Value::String("path".into())).and_then(|v| v.as_str()) {
+            node.params.insert("path".into(), path.to_string());
+        }
+        if let Some(headers) = ws_opts.get(&serde_yaml::Value::String("headers".into())).and_then(|v| v.as_mapping().cloned()) {
+            if let Some(host) = headers.get(&serde_yaml::Value::String("Host".into())).or_else(|| headers.get(&serde_yaml::Value::String("host".into()))) {
+                if let Some(s) = host.as_str() {
+                    node.params.insert("host".into(), s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(grpc) = g("grpc-opts").and_then(|v| v.as_mapping().cloned()) {
+        if let Some(svc) = grpc.get(&serde_yaml::Value::String("grpc-service-name".into())).and_then(|v| v.as_str()) {
+            node.params.insert("serviceName".into(), svc.to_string());
+        }
+    }
+
     Some(node)
+}
+
+/// YAML scalar → string；bool / number / string 都接收，其它跳过。
+fn scalar_to_string(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(if *b { "1".into() } else { "0".into() }),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// 把 `parent.{key1, key2, ...}` 子映射展开到 params；可选加前缀。
+fn flatten_transport_opts(
+    m: &serde_yaml::Mapping,
+    parent: &str,
+    keys: &[&str],
+    params: &mut std::collections::BTreeMap<String, String>,
+    prefix: &str,
+) {
+    let Some(child) = m
+        .get(&serde_yaml::Value::String(parent.into()))
+        .and_then(|v| v.as_mapping().cloned())
+    else {
+        return;
+    };
+    for k in keys {
+        if let Some(v) = child.get(&serde_yaml::Value::String((*k).into())) {
+            if let Some(s) = scalar_to_string(v) {
+                params.insert(format!("{prefix}{k}"), s);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]

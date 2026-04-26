@@ -176,6 +176,14 @@ impl FakeIpPool {
         self.forward.len()
     }
 
+    /// Clash 兼容 `/cache/fakeip/flush` —— 清空全部映射。返回被清条数。
+    pub fn clear(&self) -> usize {
+        let n = self.forward.len();
+        self.forward.clear();
+        self.reverse.clear();
+        n
+    }
+
     fn allocate_new(&self, family: AddressFamily) -> Option<IpAddr> {
         match family {
             AddressFamily::V4 => self.next_v4_addr(),

@@ -67,6 +67,16 @@ pub struct RulesetMatcher {
     ports: Vec<(u16, u16)>,
     /// 原始 classical 条目，便于 explain。
     pub classical_count: usize,
+
+    /// mihomo MRS domain succinct trie —— 比 suffix_trie + domains 更紧凑、
+    /// 自带 wildcard 语义，几十 MB 域名集亦能 O(|key|) 查询。
+    mrs_domain_set: Option<Arc<crate::parser::mrs::MrsDomainSet>>,
+    /// mihomo MRS ipcidr 闭区间 v4 列表（已按 from 升序排序，二分查找）。
+    mrs_v4_ranges: Vec<(u32, u32)>,
+    /// 同上，IPv6。
+    mrs_v6_ranges: Vec<(u128, u128)>,
+    /// MRS 原始统计（domain count 或 ipcidr range count）。
+    mrs_count: usize,
 }
 
 impl RulesetMatcher {
@@ -159,6 +169,37 @@ impl RulesetMatcher {
         Self::compile(name, entries)
     }
 
+    /// 把 [`crate::parser::RulesetCompiled`] 编译成 matcher。
+    /// `Classical` 走老 [`Self::compile`] 路径；`Mrs` 把预编译产物挂到内部字段。
+    pub fn compile_any(
+        name: impl Into<String>,
+        compiled: crate::parser::RulesetCompiled,
+    ) -> Self {
+        match compiled {
+            crate::parser::RulesetCompiled::Classical(entries) => Self::compile(name, entries),
+            crate::parser::RulesetCompiled::Mrs(payload) => Self::compile_mrs(name, payload),
+        }
+    }
+
+    /// 把 mihomo MRS 预编译产物挂到 matcher。
+    pub fn compile_mrs(name: impl Into<String>, payload: crate::parser::mrs::MrsPayload) -> Self {
+        let mut m = RulesetMatcher::new(name);
+        m.mrs_count = payload.count();
+        match payload {
+            crate::parser::mrs::MrsPayload::Domain { set, .. } => {
+                m.mrs_domain_set = Some(set);
+            }
+            crate::parser::mrs::MrsPayload::IpCidr { set, .. } => {
+                // Arc<MrsIpCidrSet> → 拷贝一份排序好的 Vec 进 matcher 字段
+                // （MrsIpCidrSet 内部已经排过序）。MrsIpCidrSet 不暴露所有权移动，
+                // 直接 clone 出 v4/v6 ranges 即可。
+                m.mrs_v4_ranges = set.v4_ranges.clone();
+                m.mrs_v6_ranges = set.v6_ranges.clone();
+            }
+        }
+        m
+    }
+
     /// 主入口：判断 host/ip/port 是否命中。
     pub fn matches(&self, host: &str, ip: Option<IpAddr>, port: Option<u16>, process: Option<&str>) -> bool {
         // 域名相关
@@ -172,6 +213,10 @@ impl RulesetMatcher {
             if let Some(rs) = &self.regex_set {
                 if rs.is_match(&host_lc) { return true; }
             }
+            // mihomo MRS domain succinct trie（含 wildcard 语义）
+            if let Some(set) = &self.mrs_domain_set {
+                if set.has(&host_lc) { return true; }
+            }
         }
         // IP / CIDR
         let resolved_ip = ip.or_else(|| host.parse::<IpAddr>().ok());
@@ -179,9 +224,19 @@ impl RulesetMatcher {
             match ip {
                 IpAddr::V4(v) => {
                     if self.cidr_v4.iter().any(|n| n.contains(&v)) { return true; }
+                    if !self.mrs_v4_ranges.is_empty()
+                        && contains_range_v4(&self.mrs_v4_ranges, u32::from(v))
+                    {
+                        return true;
+                    }
                 }
                 IpAddr::V6(v) => {
                     if self.cidr_v6.iter().any(|n| n.contains(&v)) { return true; }
+                    if !self.mrs_v6_ranges.is_empty()
+                        && contains_range_v6(&self.mrs_v6_ranges, u128::from(v))
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -197,17 +252,52 @@ impl RulesetMatcher {
     }
 
     pub fn stats(&self) -> RulesetStats {
+        // MRS domain set 的"domains"概念不能简单地映射到 self.domains.len()。
+        // 我们把 mrs_count（header.count）记到一个独立字段，并在 cidr_* 里
+        // 也累计 MRS v4/v6 ranges，便于 dashboard 总数显示。
+        let domains_total =
+            self.domains.len() + self.mrs_domain_set.as_ref().map(|_| self.mrs_count).unwrap_or(0);
         RulesetStats {
-            domains: self.domains.len(),
+            domains: domains_total,
             suffixes: self.suffix_trie.len(),
             keywords: self.keywords.len(),
             regex: self.regex_set.as_ref().map(|r| r.len()).unwrap_or(0),
-            cidr_v4: self.cidr_v4.len(),
-            cidr_v6: self.cidr_v6.len(),
+            cidr_v4: self.cidr_v4.len() + self.mrs_v4_ranges.len(),
+            cidr_v6: self.cidr_v6.len() + self.mrs_v6_ranges.len(),
             processes: self.processes.len(),
             ports: self.ports.len(),
         }
     }
+}
+
+#[inline]
+fn contains_range_v4(ranges: &[(u32, u32)], ip: u32) -> bool {
+    ranges
+        .binary_search_by(|(from, to)| {
+            if ip < *from {
+                std::cmp::Ordering::Greater
+            } else if ip > *to {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+#[inline]
+fn contains_range_v6(ranges: &[(u128, u128)], ip: u128) -> bool {
+    ranges
+        .binary_search_by(|(from, to)| {
+            if ip < *from {
+                std::cmp::Ordering::Greater
+            } else if ip > *to {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 #[derive(Debug, Clone, Default)]

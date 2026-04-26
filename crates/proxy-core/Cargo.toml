@@ -29,6 +29,8 @@ tokio         = { workspace = true }
 anyhow        = { workspace = true }
 tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
+# rustls：进程级 CryptoProvider 安装 —— 修复 0.23 多依赖时 builder() panic 问题。
+rustls        = { workspace = true }
 serde_json    = { workspace = true }
 serde_yaml    = { workspace = true }
 async-trait   = { workspace = true }

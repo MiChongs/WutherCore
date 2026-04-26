@@ -18,6 +18,10 @@ pub struct NativeState {
     pub started_at: std::time::Instant,
     pub secret: Option<String>,
     pub urltest: Arc<UrlTester>,
+    /// 由 main.rs 在 capture 启动后注入；为空时 /v1/capture/state 仅回静态配置。
+    pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
+    /// 订阅管理器（始终注入，可能 idle）—— `/providers/proxies` 端点使用。
+    pub feeds: Option<Arc<core_feeds::FeedManager>>,
 }
 
 pub fn router(state: NativeState) -> Router {
@@ -112,15 +116,41 @@ async fn patch_group(
 }
 
 async fn list_conns(State(s): State<NativeState>) -> impl IntoResponse {
-    Json(json!({ "connections": s.runtime.connections.list() }))
+    // 复用 mihomo 兼容 snapshot：统一字段名（uuid / metadata / upload / download / chains / start ...）
+    let conns: Vec<_> = s
+        .runtime
+        .connections
+        .snapshot()
+        .into_iter()
+        .map(|item| {
+            let entry = item.entry;
+            let up = entry.bytes_up.load(std::sync::atomic::Ordering::Relaxed);
+            let down = entry.bytes_down.load(std::sync::atomic::Ordering::Relaxed);
+            json!({
+                "id": entry.meta.uuid,
+                "metadata": entry.meta,
+                "upload": up,
+                "download": down,
+                "start_at": entry.started_at,
+                "chains": entry.meta.chains,
+                "rule": entry.meta.rule,
+                "rulePayload": entry.meta.rule_payload,
+                "maxUploadRate": item.up_rate_bps,
+                "maxDownloadRate": item.down_rate_bps,
+            })
+        })
+        .collect();
+    Json(json!({ "connections": conns }))
 }
 
 async fn close_conn(
     State(s): State<NativeState>,
-    Path(id): Path<u64>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    s.runtime.connections.close(id);
-    StatusCode::NO_CONTENT
+    if s.runtime.connections.close_by_uuid_or_numeric(&id) {
+        return (StatusCode::NO_CONTENT, Json(json!({}))).into_response();
+    }
+    (StatusCode::NOT_FOUND, Json(json!({"error": "no such connection"}))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -178,13 +208,36 @@ async fn route_check(
 
 async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
     let c = &s.runtime.plan.capture;
-    Json(json!({
+    let mut body = json!({
         "on": c.on,
         "method": format!("{:?}", c.method).to_lowercase(),
         "traffic": format!("{:?}", c.traffic).to_lowercase(),
         "stack": format!("{:?}", c.stack).to_lowercase(),
         "platform": std::env::consts::OS,
-    }))
+        "tun": {
+            "interface_name": c.tun.interface_name.clone(),
+            "address": c.tun.address.clone(),
+            "auto_route": c.tun.auto_route,
+            "auto_redirect": c.tun.auto_redirect,
+            "strict_route": c.tun.strict_route,
+            "endpoint_independent_nat": c.tun.endpoint_independent_nat,
+            "udp_timeout_secs": c.tun.udp_timeout.as_secs(),
+            "exclude_mptcp": c.tun.exclude_mptcp,
+            "iproute2_table_index": c.tun.iproute2_table_index,
+            "iproute2_rule_index": c.tun.iproute2_rule_index,
+            "route_address": c.tun.route_address.clone(),
+            "route_exclude_address": c.tun.route_exclude_address.clone(),
+            "route_address_set": c.tun.route_address_set.clone(),
+            "route_exclude_address_set": c.tun.route_exclude_address_set.clone(),
+            "loopback_address": c.tun.loopback_address.clone(),
+        }
+    });
+    if let Some(sup) = &s.capture {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("runtime".into(), sup.report());
+        }
+    }
+    Json(body)
 }
 
 #[derive(Deserialize)]

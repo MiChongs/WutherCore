@@ -9,6 +9,7 @@ core-config   = { workspace = true }
 core-resolver = { workspace = true }
 core-route    = { workspace = true }
 core-runtime  = { workspace = true }
+core-outbound = { workspace = true }
 core-observe  = { workspace = true }
 async-trait   = { workspace = true }
 anyhow        = { workspace = true }
@@ -22,12 +23,24 @@ dashmap       = { workspace = true }
 once_cell     = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
+# IP/TCP/UDP 报头解析。复用 smoltcp::wire；不启用 socket 栈以保持轻量。
+smoltcp       = { version = "0.11", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "proto-ipv4-fragmentation",
+    "socket-tcp",
+    "socket-udp",
+] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 nix      = { version = "0.29", features = ["net", "socket", "ioctl", "fs", "user"] }
 libc     = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# blake3 用于 wintun adapter 稳定 GUID
+blake3 = { workspace = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

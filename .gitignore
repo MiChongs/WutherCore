@@ -29,3 +29,12 @@ scripts/.cache/
 
 # 杂项
 sonobat.db
+
+# 第三方参考源码（仅本地对照阅读，不进仓）
+mihomo-smart/
+
+# 临时调试脚本
+tproxy.sh
+
+# Claude / 工具元数据
+.claude/

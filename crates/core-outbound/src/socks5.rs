@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::adapter::{BoxedStream, DialContext, OutboundAdapter};
+use crate::transport::Transport;
 
 #[derive(Debug, Clone)]
 pub struct Socks5Outbound {
@@ -43,8 +43,10 @@ impl OutboundAdapter for Socks5Outbound {
         "socks5"
     }
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut s = TcpStream::connect((self.host.as_str(), self.port)).await?;
-        let _ = s.set_nodelay(true);
+        // 走 TcpTransport：自带 RPKernel resolver + SO_MARK 绕 TUN。
+        let mut s = crate::transport::tcp::TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
 
         // greeting
         if self.auth.is_some() {
