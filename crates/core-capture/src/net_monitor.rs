@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::default_iface::{probe, DefaultInterface, ExcludeList};
 
@@ -178,12 +178,10 @@ pub fn notify_network_changed_full(snapshot: DefaultInterface) {
 /// `exclude` 通常由 supervisor 传入：至少包含 plan.interface_name；
 /// [`ExcludeList::from_plan_iface`] 会再叠加常见 TUN 前缀。
 pub fn start_watcher(exclude: ExcludeList) {
-    crate::net_monitor_event::start(exclude.clone());
-    tokio::spawn(poll_watcher(exclude));
-}
-
-async fn poll_watcher(exclude: ExcludeList) {
-    // 立即跑一次拉初值 + 同步全局态。
+    // 同步跑一次初值 + 写全局态 —— 必须在 spawn watcher 任务之前，
+    // 否则 supervisor.start() 返回后 DNS socket 工厂可能立刻被调用，但
+    // outbound_interface_index 还是 None，IP_UNICAST_IF 无效，DNS 包反进
+    // TUN 自循环。这里同步落盘一次能把这个窗口压到 0。
     let initial = probe(&exclude);
     if !initial.is_empty() {
         info!(
@@ -191,12 +189,21 @@ async fn poll_watcher(exclude: ExcludeList) {
             interface = ?initial.name,
             v4_index = ?initial.v4_index,
             v6_index = ?initial.v6_index,
-            "initial default interface"
+            "initial default interface (sync probe)"
         );
         global().submit(initial);
     } else {
-        debug!(target: "capture::net_monitor", "initial probe returned empty");
+        warn!(
+            target: "capture::net_monitor",
+            "initial probe returned empty — outbound socket bind 将无 ifindex；\
+             watcher 会在网络变化时补齐，但启动这段时间内部组件 (DNS 等) 可能落 TUN"
+        );
     }
+    crate::net_monitor_event::start(exclude.clone());
+    tokio::spawn(poll_watcher(exclude));
+}
+
+async fn poll_watcher(exclude: ExcludeList) {
 
     info!(
         target: "capture::net_monitor",

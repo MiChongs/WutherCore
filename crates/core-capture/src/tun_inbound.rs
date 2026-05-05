@@ -258,20 +258,21 @@ impl TunInbound {
         &self.plan
     }
 
-    /// 判断 source 是否是 WutherCore 自身发起的连接（对标 mihomo `C.INNER`）。
-    /// TUN gateway IP 作为 source 意味着本机进程经 TUN 出站——可能是
-    /// WutherCore 自身的 reqwest/DNS/内部组件连接。
-    pub fn is_inner_source(&self, source_ip: IpAddr) -> bool {
-        let v4_gw = IpAddr::V4(self.plan.tun_v4_cidr.addr());
-        if source_ip == v4_gw {
-            return true;
-        }
-        if let Some(v6) = self.plan.tun_v6_cidr {
-            let v6_gw = IpAddr::V6(v6.addr());
-            if source_ip == v6_gw {
-                return true;
-            }
-        }
+    /// 判断 source 是否是 WutherCore 自身发起的内部连接。
+    ///
+    /// 此函数永远返回 `false` —— 历史实现用 `source_ip == tun_gateway` 做检测，
+    /// 但在 Windows wintun / Linux 单 IP tun / macOS utun 这些"接口只挂网关 IP"
+    /// 的常见拓扑上，**所有**用户应用经 TUN 出站时 src IP 也等于网关 IP，
+    /// 导致 100% false positive：用户业务流被误判为内部连接，跳过 rule engine
+    /// 强制 DIRECT，DIRECT 又走 marked DNS 触发同链路超时，整套核心几乎断网。
+    ///
+    /// 内部 socket（resolver / fetch / health-check）已经在创建时通过
+    /// [`core_outbound::bind_outbound_socket`] 走 `IP_UNICAST_IF` /
+    /// `IP_BOUND_IF` / `SO_BINDTODEVICE` 强行绑物理网卡，不会进 TUN，
+    /// 因此本"安全网"在正常工作流里没有补位价值；硬要保留只会再次踩坑。
+    /// 真正可靠的内部连接识别只能由发起方主动 tag（参考 `metadata.is_inner`
+    /// 在 `core-runtime` 内部 RPC 路径上的设置点）。
+    pub fn is_inner_source(&self, _source_ip: IpAddr) -> bool {
         false
     }
 

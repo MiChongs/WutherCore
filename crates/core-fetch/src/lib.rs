@@ -5,13 +5,12 @@
 //! macOS/iOS 等启用，Windows 没暴露 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 注入点
 //! ——也没暴露任何能替换 socket 创建路径的钩子（`connector_layer` 只能包装
 //! 现有 connector，无法拦截到 TCP 创建）。结果：Windows 上订阅 / 规则集
-//! 拉取的 TCP socket 全部经 TUN，再被 `is_inner_source` 安全网捕获回流，
-//! 多 2 段 user-stack 中转，每个字节绕远路。
+//! 拉取的 TCP socket 全部经 TUN 出去，多绕一圈系统协议栈。
 //!
 //! 本 crate 直接走 hyper 1.x 的 `client::conn::http1::handshake` + 自己的
 //! TCP/TLS 创建逻辑：socket 一开局就调 `core_outbound::bind_outbound_socket`，
 //! 把 IP_UNICAST_IF / IP_BOUND_IF / SO_BINDTODEVICE 全打齐，四大平台都真正
-//! 绕过 TUN，不依赖 safety net。
+//! 绕过 TUN，让出站直接落到物理网卡。
 //!
 //! ## 范围
 //! 订阅 / 规则集拉取场景的最小子集：HTTP/1.1 GET（with redirects）、
