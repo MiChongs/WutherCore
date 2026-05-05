@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 
 use crate::engine::CapturePlan;
 use crate::tun_io::{TunIo, TunIoError};

@@ -190,10 +190,13 @@ mod linux_impl {
             SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
             SockProtocol::NetlinkRoute,
         )?;
-        // RTMGRP_IPV4_ROUTE = 0x40, RTMGRP_IPV6_ROUTE = 0x400, RTMGRP_LINK = 0x1
-        let groups = libc::RTMGRP_IPV4_ROUTE as u32
-            | libc::RTMGRP_IPV6_ROUTE as u32
-            | libc::RTMGRP_LINK as u32;
+        // 直接用内核裸值 —— libc crate 在 Android target 下未导出这些常量，
+        // 但 RTMGRP_* 是 linux/rtnetlink.h 的稳定 ABI。
+        // RTMGRP_LINK = 0x1, RTMGRP_IPV4_ROUTE = 0x40, RTMGRP_IPV6_ROUTE = 0x400
+        const RTMGRP_LINK: u32 = 0x1;
+        const RTMGRP_IPV4_ROUTE: u32 = 0x40;
+        const RTMGRP_IPV6_ROUTE: u32 = 0x400;
+        let groups = RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE | RTMGRP_LINK;
         let addr = NetlinkAddr::new(0, groups);
         bind(fd.as_raw_fd(), &addr)?;
         Ok(fd)

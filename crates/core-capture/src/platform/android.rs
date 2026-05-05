@@ -41,9 +41,10 @@ pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, Capture
         // Tun → 走 Linux engine 拿真实 TunIo（root /dev/net/tun 优先；VpnService fd fallback）。
         #[cfg(target_os = "android")]
         EngineKind::Tun => crate::platform::linux::build_engine(plan),
-        EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
-            Ok(Arc::new(AndroidCapture::new(plan)))
-        }
+        // 非 Android 主机调试编译时，Tun 走 stub AndroidCapture（不会真正生效）。
+        #[cfg(not(target_os = "android"))]
+        EngineKind::Tun => Ok(Arc::new(AndroidCapture::new(plan))),
+        EngineKind::Tproxy | EngineKind::Redirect => Ok(Arc::new(AndroidCapture::new(plan))),
         EngineKind::None => Err(CaptureError::Unsupported("kind=None".into())),
     }
 }

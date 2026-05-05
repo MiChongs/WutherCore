@@ -281,7 +281,6 @@ pub async fn run_udp_tproxy(
             }
         }
     }
-    Ok(())
 }
 
 fn spawn_tproxy_udp_return_loop(

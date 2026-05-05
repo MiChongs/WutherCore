@@ -100,7 +100,7 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnFd(
 /// 进入 TUN，形成自循环。
 #[no_mangle]
 pub extern "system" fn Java_org_wuthercore_VpnBridge_setVpnService(
-    mut env: JNIEnv<'_>,
+    env: JNIEnv<'_>,
     _class: JClass<'_>,
     service: JObject<'_>,
 ) {
