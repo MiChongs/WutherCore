@@ -277,7 +277,12 @@ impl Runtime {
     pub fn set_group_manual(&self, group: &str, node: &str) {
         let groups = self.groups.read();
         if let Some(g) = groups.get(group) {
-            g.set_manual(node);
+            // mihomo 兼容：空 node = 清除固定（PUT /proxies/<group> {"name":""}）
+            if node.is_empty() {
+                g.clear_manual();
+            } else {
+                g.set_manual(node);
+            }
         }
         if let Some(store) = &self.store {
             let _ = store.put_json::<String>(

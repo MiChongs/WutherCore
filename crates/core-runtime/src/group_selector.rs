@@ -356,6 +356,11 @@ impl GroupSelector {
         *self.last_pick.write() = Some(n.clone());
         *self.manual_pick.write() = Some(n);
     }
+    /// 清除当前固定选择 —— 与 mihomo `PUT /proxies/<group> {"name":""}` 等价。
+    /// `last_pick` 保留以便下次 pick 仍能给出一个稳定的"近期成员"参考。
+    pub fn clear_manual(&self) {
+        *self.manual_pick.write() = None;
+    }
     pub fn current_manual(&self) -> Option<String> {
         self.manual_pick.read().clone()
     }
