@@ -10,7 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info};
 
 use crate::adapter::{
-    prepare_outbound_udp_socket, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
+    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, BoxedUdp, Capabilities, DialContext,
     OutboundAdapter, UdpSocketLike,
 };
 use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
@@ -127,7 +127,7 @@ impl OutboundAdapter for Socks5Outbound {
             "0.0.0.0:0".parse().unwrap()
         };
         let std_sock = std::net::UdpSocket::bind(local_bind)?;
-        let loopback_guard = prepare_outbound_udp_socket(&std_sock)?;
+        let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_sock, bind)?;
         std_sock.set_nonblocking(true)?;
         let sock = UdpSocket::from_std(std_sock)?;
         sock.connect(bind).await?;

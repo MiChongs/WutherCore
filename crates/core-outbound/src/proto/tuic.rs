@@ -48,7 +48,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
     OutboundAdapter,
 };
 
@@ -174,7 +174,7 @@ impl TuicOutbound {
         };
 
         let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-        let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+        let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
         std_socket.set_nonblocking(true)?;
         let mut endpoint = Endpoint::new(
             quinn::EndpointConfig::default(),

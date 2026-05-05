@@ -36,7 +36,7 @@ use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
     OutboundAdapter,
 };
 
@@ -308,7 +308,7 @@ impl WgSession {
             "0.0.0.0:0".parse().unwrap()
         };
         let std_socket = std::net::UdpSocket::bind(bind)?;
-        let _loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+        let _loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, server_addr)?;
         std_socket.connect(server_addr)?;
         std_socket.set_nonblocking(false)?;
 

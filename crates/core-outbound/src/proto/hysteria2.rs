@@ -35,7 +35,7 @@ use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::adapter::{
-    prepare_outbound_udp_socket, resolve_host, BoxedStream, Capabilities, DialContext,
+    prepare_outbound_udp_socket_for_addr, resolve_host, BoxedStream, Capabilities, DialContext,
     OutboundAdapter,
 };
 
@@ -125,7 +125,7 @@ impl Hysteria2Outbound {
         let (endpoint, loopback_guard) = if let Some(obfs_pwd) = &self.obfs_password {
             // 用 Salamander obfs 包装 UDP socket
             let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-            let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+            let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
             std_socket.set_nonblocking(true)?;
             let obfs_runtime = quinn::TokioRuntime;
             let obfs_socket = SalamanderSocket::new(std_socket, obfs_pwd.as_bytes())?;
@@ -140,7 +140,7 @@ impl Hysteria2Outbound {
             (endpoint, loopback_guard)
         } else {
             let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-            let loopback_guard = prepare_outbound_udp_socket(&std_socket)?;
+            let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
             std_socket.set_nonblocking(true)?;
             let mut endpoint = Endpoint::new(
                 quinn::EndpointConfig::default(),
