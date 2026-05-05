@@ -328,7 +328,9 @@ impl CaptureSupervisor {
         });
         *self.purge_handle.lock() = Some(purge_handle);
 
-        // Network change listener: reset all DNS connections + rebind on interface switch.
+        // Network change listener: reset all DNS connections on interface switch.
+        // 订阅 / 规则集拉取由 core-fetch 自管理（每次 fetch 都现做 socket，
+        // 自动取最新 outbound 全局态），不需要任何 client rebuild。
         {
             let mut net_rx = crate::net_monitor::subscribe();
             let resolver = runtime.resolver.clone();
@@ -340,18 +342,11 @@ impl CaptureSupervisor {
                         interface = ?event.interface.name,
                         v4_index = ?event.interface.v4_index,
                         v6_index = ?event.interface.v6_index,
-                        "network changed: resetting DNS connections + rebuilding HTTP client"
+                        "network changed: resetting DNS connections"
                     );
-                    // (1) DNS 持久连接 (DoT pool, DoQ) 全部重建，用新的
+                    // DNS 持久连接 (DoT pool, DoQ) 全部重建，用新的
                     // SO_BINDTODEVICE / IP_UNICAST_IF / IP_BOUND_IF 走物理接口。
                     resolver.reset_connections().await;
-                    // (2) 替换共享 reqwest client —— Linux/macOS/iOS/Android
-                    // 上 ClientBuilder::interface(name) 把 TCP socket 绑到新出口；
-                    // Windows 不支持，仍走 TUN safety net (功能正确，文档详见
-                    // core-runtime/engine.rs::apply_outbound_aware_http_client)。
-                    core_runtime::engine::apply_outbound_aware_http_client(
-                        event.interface.name.as_deref(),
-                    );
                 }
             });
         }

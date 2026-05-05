@@ -8,7 +8,6 @@ license.workspace = true
 core-config   = { workspace = true }
 core-route    = { workspace = true }
 core-ruleset  = { workspace = true }
-core-feeds    = { workspace = true }
 core-resolver = { workspace = true }
 core-outbound = { workspace = true }
 core-smart    = { workspace = true }
@@ -35,5 +34,4 @@ rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
 socket2          = { version = "0.5", features = ["all"] }
-reqwest          = { workspace = true }
 compact_str      = { workspace = true }

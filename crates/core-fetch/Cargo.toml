@@ -1,0 +1,29 @@
+[package]
+name = "core-fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WutherCore 内置 HTTP/1.1 GET client —— hyper + tokio-rustls + bind_outbound_socket，让订阅 / 规则集拉取真正绕开 TUN（含 Windows，reqwest 无法做到）。"
+
+[dependencies]
+core-outbound    = { workspace = true }
+tokio            = { workspace = true }
+hyper            = { workspace = true }
+hyper-util       = { workspace = true }
+http             = { workspace = true }
+http-body-util   = { workspace = true }
+tokio-rustls     = { workspace = true }
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots     = { workspace = true }
+url              = { workspace = true }
+bytes            = { workspace = true }
+flate2           = { workspace = true }
+brotli           = { workspace = true }
+socket2          = { version = "0.5", features = ["all"] }
+once_cell        = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

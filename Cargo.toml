@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core-config",
+    "crates/core-fetch",
     "crates/core-runtime",
     "crates/core-inbound",
     "crates/core-outbound",
@@ -77,7 +78,15 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "stream"] }
+# 自研 core-fetch 用的 HTTP 1.1 client 栈 —— 直接走 hyper 1.x，注入
+# bind_outbound_socket，关掉所有平台（含 Windows）订阅 / 规则集拉取的 TUN
+# 自循环。已经替代 reqwest，依赖也跟着移除。
+hyper            = { version = "1", features = ["client", "http1"] }
+hyper-util       = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+http             = "1"
+http-body-util   = "0.1"
+flate2           = "1"
+brotli           = "7"
 redb = "2.2"
 # 加密 / TLS / WS / 协议层
 aes-gcm           = "0.10"
@@ -126,6 +135,7 @@ hex = "0.4"
 
 # 内部 crate
 core-config   = { path = "crates/core-config" }
+core-fetch    = { path = "crates/core-fetch" }
 core-runtime  = { path = "crates/core-runtime" }
 core-inbound  = { path = "crates/core-inbound" }
 core-outbound = { path = "crates/core-outbound" }

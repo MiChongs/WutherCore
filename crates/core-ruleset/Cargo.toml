@@ -14,13 +14,12 @@ ahash       = { workspace = true }
 regex       = { workspace = true }
 once_cell   = { workspace = true }
 parking_lot = { workspace = true }
-arc-swap    = { workspace = true }
 dashmap     = { workspace = true }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true }
-reqwest     = { workspace = true }
+core-fetch  = { workspace = true }
 humantime-serde = { workspace = true }
 crc32fast   = "1"
 # 纯 Rust zstd 解码器 —— mihomo MRS v1 整体经 zstd 流压缩。

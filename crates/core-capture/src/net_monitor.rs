@@ -170,9 +170,15 @@ pub fn notify_network_changed_full(snapshot: DefaultInterface) {
     global().submit(snapshot);
 }
 
-/// 启动跨平台 polling watcher。`exclude` 通常由 supervisor 传入：
-/// 至少包含 plan.interface_name，本函数会再叠加常见 TUN 前缀。
+/// 启动 default-iface watcher：
+/// * 跨平台 polling（2s 兜底）—— 永远启动，确保即便事件驱动注册失败也能工作。
+/// * 平台事件驱动（Windows NotifyRouteChange2 / Linux netlink / macOS PF_ROUTE）
+///   —— 把 ≤2s 响应延迟降到 ~ms。失败时静默回退到只 polling。
+///
+/// `exclude` 通常由 supervisor 传入：至少包含 plan.interface_name；
+/// [`ExcludeList::from_plan_iface`] 会再叠加常见 TUN 前缀。
 pub fn start_watcher(exclude: ExcludeList) {
+    crate::net_monitor_event::start(exclude.clone());
     tokio::spawn(poll_watcher(exclude));
 }
 

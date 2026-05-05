@@ -32,6 +32,7 @@ pub mod gc;
 pub mod ipset;
 pub mod nat;
 pub mod net_monitor;
+pub mod net_monitor_event;
 pub mod packet;
 pub mod platform;
 pub mod route_table;

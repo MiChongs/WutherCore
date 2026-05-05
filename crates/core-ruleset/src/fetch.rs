@@ -1,38 +1,12 @@
 //! 规则集抓取 —— core-feeds 同构（HTTP/HTTPS/file/本地路径）。
+//!
+//! HTTP 走 `core_fetch` 自研 client（hyper + tokio-rustls + bind_outbound_socket）
+//! 而不是 reqwest，关掉 Windows 上的 TUN 自循环。
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
-use once_cell::sync::Lazy;
 use thiserror::Error;
 use tracing::{debug, info, warn};
-
-/// 共享 HTTP client —— 由 core-runtime 在启动 / 网络变化时注入；用 ArcSwapOption
-/// 而不是 OnceLock，让 net_monitor 检测到默认网卡切换时能 hot-swap 整个 client
-/// （reqwest::ClientBuilder::interface(name) 在 build 时绑定 SO_BINDTODEVICE /
-/// IP_BOUND_IF，无法 in-place 改 iface，必须 rebuild）。
-static SHARED_CLIENT: Lazy<ArcSwapOption<reqwest::Client>> = Lazy::new(ArcSwapOption::empty);
-
-/// 注入 / 替换共享 client。重复调用会 swap 旧 client；旧 client 被丢弃但
-/// 已经在飞行中的请求仍正常完成。
-pub fn set_shared_http_client(client: reqwest::Client) {
-    SHARED_CLIENT.store(Some(Arc::new(client)));
-}
-
-fn get_or_build_client(timeout: Duration) -> Result<reqwest::Client, FetchError> {
-    if let Some(c) = SHARED_CLIENT.load_full() {
-        return Ok((*c).clone());
-    }
-    reqwest::Client::builder()
-        .user_agent(concat!("WutherCore-ruleset/", env!("CARGO_PKG_VERSION")))
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(10))
-        .gzip(true)
-        .brotli(true)
-        .build()
-        .map_err(|e| FetchError::Http(e.to_string()))
-}
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -46,7 +20,23 @@ pub enum FetchError {
     BadUrl(String),
 }
 
-/// 抓取规则集 body。HTTP/HTTPS 走 reqwest，`file://` 与本地路径走 fs::read。
+impl From<core_fetch::FetchError> for FetchError {
+    fn from(e: core_fetch::FetchError) -> Self {
+        match e {
+            core_fetch::FetchError::Status(c) => Self::Status(c),
+            core_fetch::FetchError::BadUrl(s) => Self::BadUrl(s),
+            core_fetch::FetchError::Io(e) => Self::Io(e),
+            other => Self::Http(other.to_string()),
+        }
+    }
+}
+
+/// 兼容旧 API —— core-runtime 之前会注入 reqwest::Client；现在所有 HTTP 经
+/// `core_fetch`，不再需要外部注入。保留空 stub 防老调用点编译失败，可删。
+#[deprecated(note = "core-ruleset 改走 core_fetch；此函数保留只为编译兼容，无效果")]
+pub fn set_shared_http_client<T>(_client: T) {}
+
+/// 抓取规则集 body。HTTP/HTTPS 走 core_fetch，`file://` 与本地路径走 fs::read。
 ///
 /// 全程 INFO 级日志：
 /// * `begin`   —— 即将抓取的 URL
@@ -72,10 +62,25 @@ pub async fn fetch_ruleset(src: &str, timeout: Duration) -> Result<Vec<u8>, Fetc
         }
         return Err(FetchError::BadUrl(src.into()));
     }
-    let client = get_or_build_client(timeout)?;
     info!(target: "ruleset::fetch", url = src, timeout_ms = timeout.as_millis() as u64, "begin");
-    let resp = match client.get(src).send().await {
+    let opts = core_fetch::FetchOptions {
+        user_agent: concat!("WutherCore-ruleset/", env!("CARGO_PKG_VERSION")).to_string(),
+        timeout,
+        connect_timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let resp = match core_fetch::fetch(src, &opts).await {
         Ok(r) => r,
+        Err(core_fetch::FetchError::Status(code)) => {
+            warn!(
+                target: "ruleset::fetch",
+                url = src,
+                status = code,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "non-2xx"
+            );
+            return Err(FetchError::Status(code));
+        }
         Err(e) => {
             warn!(
                 target: "ruleset::fetch",
@@ -84,31 +89,16 @@ pub async fn fetch_ruleset(src: &str, timeout: Duration) -> Result<Vec<u8>, Fetc
                 error = %e,
                 "send failed"
             );
-            return Err(FetchError::Http(e.to_string()));
+            return Err(FetchError::from(e));
         }
     };
-    let status = resp.status();
-    if !status.is_success() {
-        warn!(
-            target: "ruleset::fetch",
-            url = src,
-            status = status.as_u16(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "non-2xx"
-        );
-        return Err(FetchError::Status(status.as_u16()));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
     info!(
         target: "ruleset::fetch",
         url = src,
-        status = status.as_u16(),
-        bytes = bytes.len(),
+        status = resp.status,
+        bytes = resp.bytes.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "done"
     );
-    Ok(bytes.to_vec())
+    Ok(resp.bytes)
 }

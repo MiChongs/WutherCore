@@ -2,24 +2,17 @@
 //!
 //! HTTP 路径除了把 body 拿回来，还会顺便把响应头里的订阅用量
 //! ([`SubscriptionUserinfo`])、`ETag`、`Content-Type` 等元信息一并解析返回。
+//!
+//! 走 `core_fetch` 而不是 reqwest —— `core_fetch` 内置 hyper + tokio-rustls
+//! + `bind_outbound_socket`，四大平台都能让 TCP 真正绕过 TUN（含 Windows，
+//! reqwest 0.12 没暴露 IP_UNICAST_IF 注入点做不到）。
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
-use once_cell::sync::Lazy;
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::userinfo::SubscriptionUserinfo;
-
-/// 共享 HTTP client —— core-runtime 注入。用 ArcSwapOption 支持网络切换时
-/// hot-swap，与 core-ruleset/fetch.rs 同模式（详见那里的注释）。
-static SHARED_CLIENT: Lazy<ArcSwapOption<reqwest::Client>> = Lazy::new(ArcSwapOption::empty);
-
-pub fn set_shared_http_client(client: reqwest::Client) {
-    SHARED_CLIENT.store(Some(Arc::new(client)));
-}
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -31,6 +24,17 @@ pub enum FetchError {
     Io(#[from] std::io::Error),
     #[error("URL 非法: {0}")]
     BadUrl(String),
+}
+
+impl From<core_fetch::FetchError> for FetchError {
+    fn from(e: core_fetch::FetchError) -> Self {
+        match e {
+            core_fetch::FetchError::Status(code) => Self::Status(code),
+            core_fetch::FetchError::BadUrl(s) => Self::BadUrl(s),
+            core_fetch::FetchError::Io(e) => Self::Io(e),
+            other => Self::Http(other.to_string()),
+        }
+    }
 }
 
 /// 默认 UA —— 模拟主流客户端，避免被机场屏蔽。
@@ -65,6 +69,12 @@ impl FetchResult {
     }
 }
 
+/// 兼容旧 API —— core-runtime 之前会注入 reqwest::Client；现在所有 HTTP 经
+/// `core_fetch`（自身已用 net_monitor 同步的 outbound 全局态），不再需要外部
+/// 注入。保留空 stub 避免老调用点编译失败，未来可删。
+#[deprecated(note = "core-feeds 改走 core_fetch；此函数保留只为编译兼容，无效果")]
+pub fn set_shared_http_client<T>(_client: T) {}
+
 /// 抓取一次订阅原文 + 元信息。
 pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, FetchError> {
     if url.starts_with("file://") {
@@ -80,51 +90,29 @@ pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, Fet
         return Err(FetchError::BadUrl(url.into()));
     }
 
-    let client = if let Some(c) = SHARED_CLIENT.load_full() {
-        (*c).clone()
-    } else {
-        reqwest::Client::builder()
-            .user_agent(DEFAULT_UA)
-            .timeout(timeout)
-            .connect_timeout(Duration::from_secs(10))
-            .gzip(true)
-            .brotli(true)
-            .build()
-            .map_err(|e| FetchError::Http(e.to_string()))?
+    debug!(target: "feeds", url, "fetch http");
+    let opts = core_fetch::FetchOptions {
+        user_agent: DEFAULT_UA.to_string(),
+        timeout,
+        connect_timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let resp = match core_fetch::fetch(url, &opts).await {
+        Ok(r) => r,
+        Err(core_fetch::FetchError::Status(code)) => {
+            warn!(target: "feeds", url, code, "feed http error");
+            return Err(FetchError::Status(code));
+        }
+        Err(e) => return Err(FetchError::from(e)),
     };
 
-    debug!(target: "feeds", url, "fetch http");
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
-    if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        warn!(target: "feeds", url, code, "feed http error");
-        return Err(FetchError::Status(code));
-    }
-
-    // 头要在 body consume 前抓出来 —— resp.bytes() 之后 resp 不可再用。
-    let headers = resp.headers().clone();
     let userinfo = SubscriptionUserinfo::from_headers(
-        headers
+        resp.headers
             .iter()
-            .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?))),
+            .map(|(k, v)| (k.as_str(), v.as_str())),
     );
-    let etag = headers
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let content_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+    let etag = resp.headers.get("etag").cloned();
+    let content_type = resp.headers.get("content-type").cloned();
 
     if let Some(ui) = &userinfo {
         debug!(
@@ -139,7 +127,7 @@ pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, Fet
     }
 
     Ok(FetchResult {
-        bytes: bytes.to_vec(),
+        bytes: resp.bytes,
         userinfo,
         etag,
         content_type,

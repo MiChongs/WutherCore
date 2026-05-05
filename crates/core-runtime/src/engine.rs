@@ -164,10 +164,10 @@ impl Runtime {
         core_resolver::upstream::marked::set_dns_socket_factory(Arc::new(
             OutboundDnsSocketFactory,
         ));
-        // 初始注入 HTTP client —— 启动阶段还不知道默认网卡，先用 None。
-        // capture supervisor 会在 net_monitor 探出物理出口后立刻调
-        // [`apply_outbound_aware_http_client`] 替换为 interface-bound 版本。
-        apply_outbound_aware_http_client(None);
+        // 订阅 / 规则集拉取的 HTTP client 由 core-fetch 自管理：内部直接走
+        // hyper + tokio-rustls + bind_outbound_socket，net_monitor 同步的
+        // 出站 ifindex / 接口名对它即时生效，不需要 client rebuild。
+        // engine 启动时也不需要"初始 client"。
         let smart = if let Some(store) = store.clone() {
             Arc::new(SmartSelector::with_store(
                 plan.smart.goal,
@@ -1267,70 +1267,6 @@ impl core_outbound::DialResolver for ResolverAdapter {
     fn ipv6_enabled(&self) -> bool {
         self.resolver.ipv6_enabled()
     }
-}
-
-/// 构建并替换共享 reqwest client（core-feeds 订阅 + core-ruleset 规则集拉取
-/// 都拿这一个）。
-///
-/// 在支持的平台上调用 [`reqwest::ClientBuilder::interface`] 把 TCP socket 直接
-/// 绑到物理出口（Linux/Android `SO_BINDTODEVICE`、macOS / iOS `IP_BOUND_IF`/
-/// `IPV6_BOUND_IF`）—— 等价于 `bind_outbound_socket` 在四大平台中三个的覆盖。
-///
-/// **Windows 限制**：reqwest 0.12 的 `interface()` 只在 Linux/macOS/iOS/Android
-/// 等启用，Windows 没暴露 `IP_UNICAST_IF` 注入点（连 `connector_layer` 也只能
-/// 包装现有 connector，无法替换 socket 创建路径）。Windows 上订阅/规则集
-/// 拉取仍走 TUN safety net（is_inner_source → dial_direct）—— 功能正确但
-/// 多 2 段 user-stack 中转，低频拉取场景可接受。
-///
-/// 网络切换时由 capture supervisor 重新调本函数 hot-swap 整个 client；
-/// in-flight 请求继续用旧 client 完成，新请求拿到新绑定。
-pub fn apply_outbound_aware_http_client(default_iface: Option<&str>) {
-    if let Ok(client) = build_outbound_aware_http_client(default_iface) {
-        core_ruleset::fetch::set_shared_http_client(client.clone());
-        core_feeds::fetcher::set_shared_http_client(client);
-    }
-}
-
-fn build_outbound_aware_http_client(
-    default_iface: Option<&str>,
-) -> reqwest::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
-        .user_agent("WutherCore/0.3")
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .gzip(true)
-        .brotli(true)
-        .no_proxy();
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    if let Some(iface) = default_iface {
-        b = b.interface(iface);
-    }
-    // 显式忽略 default_iface，否则 Windows 等平台会报 unused-variable。
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    )))]
-    let _ = default_iface;
-    b.build()
 }
 
 struct OutboundDnsSocketFactory;
