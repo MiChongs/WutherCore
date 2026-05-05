@@ -1,19 +1,28 @@
-//! Clash 兼容连接表 —— 1:1 对齐 mihomo `tunnel/statistic`。
+//! Clash 兼容连接表 —— 高吞吐 / 低内存的活跃连接管理器。
 //!
 //! ## 数据模型
-//! * [`ConnectionMeta`] —— 与 mihomo `constant.Metadata` 字段一一对应，能直接
-//!   被 serde 序列化成 dashboard 期望的 metadata 子对象（包含 sourceIP /
-//!   sourcePort / destinationIP / destinationPort / inboundIP / inboundPort /
-//!   inboundName / inboundUser / host / dnsMode / process / processPath /
-//!   specialProxy / specialRules / sniffHost / uuid / chains / rule /
-//!   rulePayload；providerChains 是 tracker 顶层字段，随 meta 在内存中流转但
-//!   不序列化进 metadata 子对象）。
-//! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable meta + 实时
-//!   累计字节数（Arc<AtomicU64>，由 splice 路径在 copy loop 内自增）+ 取消
+//! * [`ConnectionMeta`] —— Clash dashboard 的 metadata 子对象，与 `constant.Metadata`
+//!   字段一一对应，能直接被 serde 序列化（包含 sourceIP / sourcePort / destinationIP /
+//!   destinationPort / inboundIP / inboundPort / inboundName / inboundUser / host /
+//!   dnsMode / process / processPath / specialProxy / specialRules / sniffHost / uuid /
+//!   chains / rule / rulePayload；providerChains 是 tracker 顶层字段，随 meta 在内存
+//!   中流转但不序列化进 metadata 子对象）。
+//! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable Arc<ConnectionMeta> +
+//!   实时累计字节数（Arc<AtomicU64>，由 splice 路径在 copy loop 内自增）+ 取消
 //!   信号（Arc<Notify>，DELETE /connections/:id 触发后让数据流主动 shutdown）+
-//!   上一秒采样（用于计算 maxUploadRate / maxDownloadRate bps）。
+//!   smart-block 旗标（AtomicU8，flip 不需要重建 meta）。
 //! * [`ConnectionGuard`] —— RAII：splice 任务持有 guard，drop 时自动从表移除，
 //!   即便 panic / early-return 也不会漏关。
+//!
+//! ## 内存策略
+//! * 字符串字段统一用 [`compact_str::CompactString`]：≤24 字节内联存储，clone
+//!   只是 24 字节 memcpy；典型 IP / 端口 / 协议名 / dns 模式 全部命中内联。
+//! * 列表字段（chains / geoip）用 `SmallVec<[CompactString; 4]>`：典型链路长度
+//!   1-4，整个 SmallVec 在栈上，无堆分配。
+//! * `meta` 字段在 entry 内是 `Arc<ConnectionMeta>`：clone 只是引用计数自增，
+//!   snapshot 路径几千条连接也只复制几千个 8 字节指针。
+//! * `smart_block` 是唯一可变字段，提到 entry 顶层做 atomic flag，meta 本身
+//!   保持完全不可变 —— Arc 共享时不需要 make_mut clone。
 //!
 //! ## DELETE 语义
 //! * `close(id)` / `close_all()` 都会 **先** 调 `cancel.notify_waiters()` 再
@@ -22,76 +31,95 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use compact_str::{CompactString, ToCompactString};
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+use smallvec::SmallVec;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-/// 连接 metadata —— 完整 mihomo Metadata 字段集，serde 序列化后即 dashboard
-/// 期望的 `metadata` 子对象。所有字符串字段默认空串而不是 null —— 与 mihomo
-/// 行为一致（mihomo 的字段都是值类型 string，零值就是 ""）。
+/// chains / geoip 类列表 —— 典型 1-4 项，内联保存避免堆分配。
+pub type StringList = SmallVec<[CompactString; 4]>;
+
+/// 把 `Vec<String>` / `&[String]` 等转成内联 SmallVec，外部 dial 路径用。
+pub fn string_list_from<I, S>(iter: I) -> StringList
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    iter.into_iter().map(|s| CompactString::new(s.as_ref())).collect()
+}
+
+/// 连接 metadata —— Clash dashboard 期望的 metadata 子对象。
+///
+/// * 字符串字段统一 `CompactString`，短串完全内联（典型 IP / 端口 / 协议名 /
+///   chain name 都 ≤24 字节），clone 不触堆。
+/// * 列表字段统一 `StringList`（[`SmallVec<[CompactString; 4]>`]），长度 ≤4
+///   完全在栈上。
+/// * 整个 struct 设计为 immutable —— 进 [`ConnectionTable`] 后即被 [`Arc`]
+///   包裹共享，不允许就地改写；smart-block 等可变态在 entry 顶层做 atomic
+///   flag。
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionMeta {
-    pub network: String, // "tcp" | "udp"
+    pub network: CompactString, // "tcp" | "udp"
     #[serde(rename = "type")]
-    pub kind: String, // "Mixed" | "HTTP" | "Socks5" | "TPROXY" | "Tun" | "Redirect"
+    pub kind: CompactString, // "Mixed" | "HTTP" | "Socks5" | "TPROXY" | "Tun" | "Redirect"
     #[serde(rename = "sourceIP")]
-    pub source_ip: String,
+    pub source_ip: CompactString,
     #[serde(rename = "sourceGeoIP")]
-    pub source_geoip: Vec<String>,
+    pub source_geoip: StringList,
     #[serde(rename = "sourceIPASN")]
-    pub source_ip_asn: String,
-    pub source_port: String,
+    pub source_ip_asn: CompactString,
+    pub source_port: CompactString,
     #[serde(rename = "destinationIP")]
-    pub destination_ip: String,
+    pub destination_ip: CompactString,
     #[serde(rename = "destinationGeoIP")]
-    pub destination_geoip: Vec<String>,
+    pub destination_geoip: StringList,
     #[serde(rename = "destinationIPASN")]
-    pub destination_ip_asn: String,
-    pub destination_port: String,
+    pub destination_ip_asn: CompactString,
+    pub destination_port: CompactString,
     #[serde(rename = "inboundIP")]
-    pub inbound_ip: String,
-    pub inbound_port: String,
-    pub inbound_name: String,
-    pub inbound_user: String,
-    pub host: String,
-    pub dns_mode: String,
+    pub inbound_ip: CompactString,
+    pub inbound_port: CompactString,
+    pub inbound_name: CompactString,
+    pub inbound_user: CompactString,
+    pub host: CompactString,
+    pub dns_mode: CompactString,
     pub uid: u32,
-    pub process: String,
-    pub process_path: String,
-    pub special_proxy: String,
-    pub special_rules: String,
-    pub remote_destination: String,
+    pub process: CompactString,
+    pub process_path: CompactString,
+    pub special_proxy: CompactString,
+    pub special_rules: CompactString,
+    pub remote_destination: CompactString,
     pub dscp: u8,
-    pub sniff_host: String,
+    pub sniff_host: CompactString,
     #[serde(rename = "id")]
-    pub uuid: String,
-    pub smart_block: String,
-    pub smart_target: String,
-    pub chains: Vec<String>,
+    pub uuid: CompactString,
+    pub smart_target: CompactString,
+    pub chains: StringList,
     #[serde(skip)]
-    pub provider_chains: Vec<String>,
-    pub rule: String,
-    pub rule_payload: String,
+    pub provider_chains: StringList,
+    pub rule: CompactString,
+    pub rule_payload: CompactString,
 }
 
 impl ConnectionMeta {
     pub fn normalize_for_tracking(&mut self) {
         if self.destination_ip.is_empty() {
             if let Ok(ip) = self.host.parse::<IpAddr>() {
-                self.destination_ip = ip.to_string();
+                self.destination_ip = ip.to_compact_string();
             }
         }
         if self.remote_destination.is_empty() {
-            let host = if !self.host.is_empty() {
-                self.host.as_str()
+            let host: &str = if !self.host.is_empty() {
+                self.host.as_ref()
             } else {
-                self.destination_ip.as_str()
+                self.destination_ip.as_ref()
             };
             if let Some(endpoint) = join_host_port(host, &self.destination_port) {
                 self.remote_destination = endpoint;
@@ -100,17 +128,26 @@ impl ConnectionMeta {
     }
 }
 
-fn join_host_port(host: &str, port: &str) -> Option<String> {
+fn join_host_port(host: &str, port: &str) -> Option<CompactString> {
     let host = host.trim();
     let port = port.trim();
     if host.is_empty() || port.is_empty() {
         return None;
     }
-    let host = match host.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) if !host.starts_with('[') => format!("[{host}]"),
-        _ => host.to_string(),
-    };
-    Some(format!("{host}:{port}"))
+    // IPv6 文本（带 :）必须裹方括号；其它情况直接拼。
+    let need_brackets =
+        matches!(host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) && !host.starts_with('[');
+    let mut out = CompactString::default();
+    if need_brackets {
+        out.push('[');
+        out.push_str(host);
+        out.push(']');
+    } else {
+        out.push_str(host);
+    }
+    out.push(':');
+    out.push_str(port);
+    Some(out)
 }
 
 /// 速率采样窗口：连续两次 snapshot 间的字节差 / 时间差 = bytes/s。
@@ -127,25 +164,27 @@ struct TimeBucket {
     bytes: u64,
 }
 
-/// 与 mihomo `bucketWindow(10, 100ms)` 等价：保留最近 1 秒内每 100ms 桶，
-/// 每次写入后返回窗口内最高 bytes/s。
+/// 滑窗速率：保留最近 1 秒内每 100ms 桶，每次写入后返回窗口内最高 bytes/s。
+/// 桶数组长度固定（10），用 SmallVec 内联存储避免堆分配。
 #[derive(Debug)]
 struct BucketWindow {
-    buckets: Vec<TimeBucket>,
+    buckets: SmallVec<[TimeBucket; 16]>,
     interval_ms: u64,
     window_ms: u64,
 }
 
 impl BucketWindow {
     fn new(bucket_count: usize, interval_ms: u64) -> Self {
+        let mut buckets = SmallVec::with_capacity(bucket_count);
+        buckets.resize(
+            bucket_count,
+            TimeBucket {
+                start_ms: 0,
+                bytes: 0,
+            },
+        );
         Self {
-            buckets: vec![
-                TimeBucket {
-                    start_ms: 0,
-                    bytes: 0,
-                };
-                bucket_count
-            ],
+            buckets,
             interval_ms,
             window_ms: interval_ms.saturating_mul(bucket_count as u64),
         }
@@ -174,11 +213,28 @@ impl BucketWindow {
     }
 }
 
-/// 一条活跃连接。字段都是 Arc/原子，方便从 splice 任务并发更新而无需锁。
+/// smart-block 状态：用 AtomicU8 表示，便于在共享 Arc<ConnectionMeta> 之外
+/// 单独 flip。0 = 未拦截，1 = 已拦截。序列化时映射回 "" / "blocked" 字符串。
+const SMART_BLOCK_NONE: u8 = 0;
+const SMART_BLOCK_BLOCKED: u8 = 1;
+
+fn serialize_smart_block<S: Serializer>(state: &Arc<AtomicU8>, ser: S) -> Result<S::Ok, S::Error> {
+    let s = if state.load(Ordering::Relaxed) == SMART_BLOCK_BLOCKED {
+        "blocked"
+    } else {
+        ""
+    };
+    ser.serialize_str(s)
+}
+
+/// 一条活跃连接。字段都是 Arc / 原子，方便从 splice 任务并发更新而无需锁。
+///
+/// `meta` 为 [`Arc<ConnectionMeta>`]：进表后不可变，clone 只是引用计数 +1，
+/// 千条连接 snapshot 也不会触发字符串深拷贝。
 #[derive(Debug, Clone)]
 pub struct ConnectionEntry {
     pub id: u64,
-    pub meta: ConnectionMeta,
+    pub meta: Arc<ConnectionMeta>,
     pub started_at: u64, // unix seconds
     pub bytes_up: Arc<AtomicU64>,
     pub bytes_down: Arc<AtomicU64>,
@@ -186,9 +242,26 @@ pub struct ConnectionEntry {
     pub max_download_rate: Arc<AtomicU64>,
     pub cancel: Arc<Notify>,
     pub last_sample: Arc<Mutex<RateSample>>,
+    pub smart_block: Arc<AtomicU8>,
 }
 
-/// snapshot() 每次返回的条目 —— 把 entry 与"上一次采样到现在"的瞬时速率配对。
+impl ConnectionEntry {
+    /// 是否被 smart-block 拦截。
+    pub fn is_smart_blocked(&self) -> bool {
+        self.smart_block.load(Ordering::Relaxed) == SMART_BLOCK_BLOCKED
+    }
+
+    /// 当前 smart-block 状态对应的 dashboard 字符串值。
+    pub fn smart_block_str(&self) -> &'static str {
+        if self.is_smart_blocked() {
+            "blocked"
+        } else {
+            ""
+        }
+    }
+}
+
+/// snapshot() 每次返回的条目 —— 把 entry 与“上一次采样到现在”的瞬时速率配对。
 #[derive(Debug, Clone)]
 pub struct ConnectionSnapshot {
     pub entry: ConnectionEntry,
@@ -196,21 +269,27 @@ pub struct ConnectionSnapshot {
     pub down_rate_bps: u64,
 }
 
+/// dashboard `/connections` 单条响应。`metadata` 用 [`Arc<ConnectionMeta>`]
+/// 直传以避免一次完整深拷贝；serde 透明序列化 inner，dashboard 看不到差别。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionInfo {
     #[serde(rename = "id")]
-    pub id: String,
-    pub metadata: ConnectionMeta,
+    pub id: CompactString,
+    pub metadata: Arc<ConnectionMeta>,
     pub upload: u64,
     pub download: u64,
     pub start: u64,
-    pub chains: Vec<String>,
-    pub provider_chains: Vec<String>,
-    pub rule: String,
-    pub rule_payload: String,
+    pub chains: StringList,
+    pub provider_chains: StringList,
+    pub rule: CompactString,
+    pub rule_payload: CompactString,
     pub max_upload_rate: u64,
     pub max_download_rate: u64,
+    /// "" 或 "blocked"；序列化时由 [`serialize_smart_block`] 把原子状态映射成
+    /// 字符串，与 dashboard 期望一致。
+    #[serde(rename = "smartBlock", serialize_with = "serialize_smart_block")]
+    pub smart_block: Arc<AtomicU8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,14 +324,14 @@ impl Default for ManagerRateState {
 
 /// 全局连接管理器 —— Runtime 单例持有 `Arc<ConnectionTable>`。
 ///
-/// 名称保留 `ConnectionTable` 是为了兼容现有调用方；内部语义按 mihomo
-/// `tunnel/statistic.Manager`：连接 join/leave、总流量、traffic blip、smart
+/// 名称保留 `ConnectionTable` 是为了兼容现有调用方；内部语义按 Clash 兼容
+/// 的 `tunnel/statistic.Manager`：连接 join/leave、总流量、traffic blip、smart
 /// target 索引、关闭控制都在这里收敛。
 #[derive(Debug, Default)]
 pub struct ConnectionTable {
     next: AtomicU64,
     entries: DashMap<u64, ConnectionEntry>,
-    smart_target: DashMap<String, Arc<Mutex<BTreeSet<String>>>>,
+    smart_target: DashMap<CompactString, Arc<Mutex<BTreeSet<CompactString>>>>,
     upload_total: AtomicU64,
     download_total: AtomicU64,
     rate: Mutex<ManagerRateState>,
@@ -269,7 +348,7 @@ impl ConnectionTable {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         meta.normalize_for_tracking();
         if meta.uuid.is_empty() {
-            meta.uuid = Uuid::new_v4().to_string();
+            meta.uuid = Uuid::new_v4().to_compact_string();
         }
         let bytes_up = Arc::new(AtomicU64::new(0));
         let bytes_down = Arc::new(AtomicU64::new(0));
@@ -284,6 +363,8 @@ impl ConnectionTable {
         }));
         let upload_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
         let download_window = Arc::new(Mutex::new(BucketWindow::new(10, 100)));
+        let smart_block = Arc::new(AtomicU8::new(SMART_BLOCK_NONE));
+        let meta = Arc::new(meta);
         let entry = ConnectionEntry {
             id,
             meta,
@@ -294,6 +375,7 @@ impl ConnectionTable {
             max_download_rate: max_download_rate.clone(),
             cancel: cancel.clone(),
             last_sample,
+            smart_block: smart_block.clone(),
         };
         self.join_indexes(&entry);
         self.entries.insert(id, entry.clone());
@@ -307,6 +389,7 @@ impl ConnectionTable {
             cancel,
             upload_window,
             download_window,
+            smart_block,
         }
     }
 
@@ -322,7 +405,7 @@ impl ConnectionTable {
         }
     }
 
-    /// 兼容字符串 id（mihomo 用 UUID 字符串作为 dashboard `id`）。
+    /// 兼容字符串 id（dashboard 用 UUID 字符串作为 `id` 字段）。
     pub fn close_by_uuid_or_numeric(&self, key: &str) -> bool {
         // 1) 先按 numeric id
         if let Ok(id) = key.parse::<u64>() {
@@ -333,7 +416,7 @@ impl ConnectionTable {
         // 2) 按 uuid 字符串扫
         let mut hit: Option<u64> = None;
         for r in self.entries.iter() {
-            if r.value().meta.uuid == key {
+            if r.value().meta.uuid.as_str() == key {
                 hit = Some(*r.key());
                 break;
             }
@@ -369,9 +452,9 @@ impl ConnectionTable {
         self.entries.iter().map(|e| e.value().clone()).collect()
     }
 
-    /// 同 list，但额外计算每条的瞬时上下行速率（bps）。同时把"现在"的累计
+    /// 同 list，但额外计算每条的瞬时上下行速率（bps）。同时把“现在”的累计
     /// 字节数刷新到 `last_sample` —— 下一次 snapshot 拿到的就是过去这一段
-    /// 时间的增量速率，与 mihomo 1s 推送窗口一致。
+    /// 时间的增量速率，与 dashboard 1s 推送窗口一致。
     pub fn snapshot(&self) -> Vec<ConnectionSnapshot> {
         let now_ms = now_millis();
         self.entries
@@ -385,7 +468,7 @@ impl ConnectionTable {
                     let dt_ms = now_ms.saturating_sub(sample.at_ms).max(1);
                     let up_delta = up_now.saturating_sub(sample.up);
                     let down_delta = down_now.saturating_sub(sample.down);
-                    // 字节 / 秒：mihomo 同样发 bytes/s（不是 bits/s）。
+                    // 字节 / 秒：dashboard 同样发 bytes/s（不是 bits/s）。
                     let u = (up_delta as u128 * 1000 / dt_ms as u128) as u64;
                     let d = (down_delta as u128 * 1000 / dt_ms as u128) as u64;
                     *sample = RateSample {
@@ -428,13 +511,13 @@ impl ConnectionTable {
         format!("{proc_label} -> {host}:{}", m.destination_port)
     }
 
-    /// 周期性聚合 —— 给"连接表怎么这么多"的诊断日志用。`top_n` 控制每个 bucket
-    /// 取前几名；`long_lived` 是判定"长连接"的阈值（持续超过 N 秒就单独列出来）。
+    /// 周期性聚合 —— 给“连接表怎么这么多”的诊断日志用。`top_n` 控制每个 bucket
+    /// 取前几名；`long_lived` 是判定“长连接”的阈值（持续超过 N 秒就单独列出来）。
     pub fn summary(&self, top_n: usize, long_lived: std::time::Duration) -> ConnectionSummary {
         let entries: Vec<ConnectionEntry> =
             self.entries.iter().map(|e| e.value().clone()).collect();
         let total = entries.len();
-        let tcp = entries.iter().filter(|e| e.meta.network == "tcp").count();
+        let tcp = entries.iter().filter(|e| e.meta.network.as_str() == "tcp").count();
         let udp = total.saturating_sub(tcp);
 
         let mut dst_hist: HashMap<String, usize> = HashMap::new();
@@ -443,17 +526,29 @@ impl ConnectionTable {
         let mut chain_hist: HashMap<String, usize> = HashMap::new();
         for e in &entries {
             let m = &e.meta;
-            let host = if !m.host.is_empty() {
-                m.host.clone()
+            let host: &str = if !m.host.is_empty() {
+                m.host.as_str()
             } else {
-                m.destination_ip.clone()
+                m.destination_ip.as_str()
             };
             *dst_hist.entry(format!("{host}:{}", m.destination_port)).or_default() += 1;
-            let p = if m.process.is_empty() { "?".into() } else { m.process.clone() };
+            let p = if m.process.is_empty() {
+                "?".to_string()
+            } else {
+                m.process.to_string()
+            };
             *proc_hist.entry(p).or_default() += 1;
-            let r = if m.rule.is_empty() { "?".into() } else { m.rule.clone() };
+            let r = if m.rule.is_empty() {
+                "?".to_string()
+            } else {
+                m.rule.to_string()
+            };
             *rule_hist.entry(r).or_default() += 1;
-            let chain = m.chains.last().cloned().unwrap_or_else(|| "?".into());
+            let chain = m
+                .chains
+                .last()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_string());
             *chain_hist.entry(chain).or_default() += 1;
         }
         let now_secs = now_secs();
@@ -465,14 +560,14 @@ impl ConnectionTable {
                 .map(|e| LongLivedEntry {
                     id: e.id,
                     process: if e.meta.process.is_empty() {
-                        "?".into()
+                        "?".to_string()
                     } else {
-                        e.meta.process.clone()
+                        e.meta.process.to_string()
                     },
                     host: if !e.meta.host.is_empty() {
-                        e.meta.host.clone()
+                        e.meta.host.to_string()
                     } else {
-                        e.meta.destination_ip.clone()
+                        e.meta.destination_ip.to_string()
                     },
                     destination_port: e
                         .meta
@@ -482,7 +577,7 @@ impl ConnectionTable {
                     age_secs: now_secs.saturating_sub(e.started_at),
                     bytes_up: e.bytes_up.load(Ordering::Relaxed),
                     bytes_down: e.bytes_down.load(Ordering::Relaxed),
-                    network: e.meta.network.clone(),
+                    network: e.meta.network.to_string(),
                 })
                 .collect();
             v.sort_by(|a, b| b.age_secs.cmp(&a.age_secs));
@@ -542,20 +637,25 @@ impl ConnectionTable {
     pub fn manager_snapshot(&self) -> ConnectionManagerSnapshot {
         let (upload_total, download_total) = self.total();
         let mut connections: Vec<_> = self
-            .list()
-            .into_iter()
-            .map(|entry| ConnectionInfo {
-                id: entry.meta.uuid.clone(),
-                metadata: entry.meta.clone(),
-                upload: entry.bytes_up.load(Ordering::Relaxed),
-                download: entry.bytes_down.load(Ordering::Relaxed),
-                start: entry.started_at,
-                chains: entry.meta.chains.clone(),
-                provider_chains: entry.meta.provider_chains.clone(),
-                rule: entry.meta.rule.clone(),
-                rule_payload: entry.meta.rule_payload.clone(),
-                max_upload_rate: entry.max_upload_rate.load(Ordering::Relaxed),
-                max_download_rate: entry.max_download_rate.load(Ordering::Relaxed),
+            .entries
+            .iter()
+            .map(|e| {
+                let entry = e.value();
+                ConnectionInfo {
+                    id: entry.meta.uuid.clone(),
+                    // Arc::clone —— 引用计数 +1，无字符串深拷贝。
+                    metadata: Arc::clone(&entry.meta),
+                    upload: entry.bytes_up.load(Ordering::Relaxed),
+                    download: entry.bytes_down.load(Ordering::Relaxed),
+                    start: entry.started_at,
+                    chains: entry.meta.chains.clone(),
+                    provider_chains: entry.meta.provider_chains.clone(),
+                    rule: entry.meta.rule.clone(),
+                    rule_payload: entry.meta.rule_payload.clone(),
+                    max_upload_rate: entry.max_upload_rate.load(Ordering::Relaxed),
+                    max_download_rate: entry.max_download_rate.load(Ordering::Relaxed),
+                    smart_block: Arc::clone(&entry.smart_block),
+                }
             })
             .collect();
         connections.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.id.cmp(&b.id)));
@@ -573,7 +673,7 @@ impl ConnectionTable {
             .iter()
             .filter_map(|e| {
                 let meta = &e.value().meta;
-                if meta.chains.iter().any(|c| c == chain) {
+                if meta.chains.iter().any(|c| c.as_str() == chain) {
                     Some(*e.key())
                 } else {
                     None
@@ -597,7 +697,7 @@ impl ConnectionTable {
         }
         let mut hit = None;
         for r in self.entries.iter() {
-            if r.value().meta.uuid == key {
+            if r.value().meta.uuid.as_str() == key {
                 hit = Some(*r.key());
                 break;
             }
@@ -611,17 +711,17 @@ impl ConnectionTable {
     }
 
     pub fn get_smart_target_ids(&self, target: &str, asn: &str) -> BTreeSet<String> {
-        let mut ids = BTreeSet::new();
+        let mut ids: BTreeSet<CompactString> = BTreeSet::new();
         self.extend_smart_target_ids(target, &mut ids);
         if !asn.is_empty() && asn != "unknown" {
             self.extend_smart_target_ids(asn, &mut ids);
         }
-        ids
+        ids.into_iter().map(Into::into).collect()
     }
 
     fn mark_smart_block(&self, id: u64) -> bool {
-        if let Some(mut entry) = self.entries.get_mut(&id) {
-            entry.meta.smart_block = "blocked".into();
+        if let Some(entry) = self.entries.get(&id) {
+            entry.smart_block.store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
             true
         } else {
             false
@@ -641,10 +741,10 @@ impl ConnectionTable {
         if target.is_empty() {
             return;
         }
-        self.add_smart_target_id(target, &entry.meta.uuid);
+        self.add_smart_target_id(target, entry.meta.uuid.as_str());
         let asn = entry.meta.destination_ip_asn.trim();
         if !asn.is_empty() && asn != "unknown" {
-            self.add_smart_target_id(asn, &entry.meta.uuid);
+            self.add_smart_target_id(asn, entry.meta.uuid.as_str());
         }
     }
 
@@ -653,36 +753,39 @@ impl ConnectionTable {
         if target.is_empty() {
             return;
         }
-        self.remove_smart_target_id(target, &entry.meta.uuid);
+        self.remove_smart_target_id(target, entry.meta.uuid.as_str());
         let asn = entry.meta.destination_ip_asn.trim();
         if !asn.is_empty() && asn != "unknown" {
-            self.remove_smart_target_id(asn, &entry.meta.uuid);
+            self.remove_smart_target_id(asn, entry.meta.uuid.as_str());
         }
     }
 
     fn add_smart_target_id(&self, key: &str, uuid: &str) {
+        let key = CompactString::new(key);
         let set = self
             .smart_target
-            .entry(key.to_string())
+            .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(BTreeSet::new())))
             .clone();
-        set.lock().insert(uuid.to_string());
+        set.lock().insert(CompactString::new(uuid));
     }
 
     fn remove_smart_target_id(&self, key: &str, uuid: &str) {
+        let key = CompactString::new(key);
         let mut should_remove_key = false;
-        if let Some(set) = self.smart_target.get(key) {
+        if let Some(set) = self.smart_target.get(&key) {
             let mut ids = set.lock();
             ids.remove(uuid);
             should_remove_key = ids.is_empty();
         }
         if should_remove_key {
-            self.smart_target.remove(key);
+            self.smart_target.remove(&key);
         }
     }
 
-    fn extend_smart_target_ids(&self, key: &str, out: &mut BTreeSet<String>) {
-        if let Some(set) = self.smart_target.get(key) {
+    fn extend_smart_target_ids(&self, key: &str, out: &mut BTreeSet<CompactString>) {
+        let key = CompactString::new(key);
+        if let Some(set) = self.smart_target.get(&key) {
             out.extend(set.lock().iter().cloned());
         }
     }
@@ -700,6 +803,7 @@ pub struct ConnectionGuard {
     pub cancel: Arc<Notify>,
     upload_window: Arc<Mutex<BucketWindow>>,
     download_window: Arc<Mutex<BucketWindow>>,
+    smart_block: Arc<AtomicU8>,
 }
 
 impl ConnectionGuard {
@@ -727,6 +831,11 @@ impl ConnectionGuard {
     }
     pub fn record_download(&self, size: u64) {
         self.accounting().record_download(size);
+    }
+
+    /// 主动给当前连接打 smart-block 标 —— DELETE /smart-target 等管理路径用。
+    pub fn mark_smart_blocked(&self) {
+        self.smart_block.store(SMART_BLOCK_BLOCKED, Ordering::Relaxed);
     }
 }
 
@@ -797,7 +906,7 @@ fn now_millis() -> u64 {
 }
 
 /* ========================================================================
-诊断聚合 —— "连接表怎么这么多"日志的支撑结构。
+诊断聚合 —— “连接表怎么这么多”日志的支撑结构。
 ======================================================================== */
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -934,7 +1043,7 @@ mod tests {
         let g = t.open(ConnectionMeta::default());
         let id = g.id;
         let cancel = g.cancel_token();
-        // 把 guard forget 掉，模拟"由 close(id) 主动结束"路径
+        // 把 guard forget 掉，模拟“由 close(id) 主动结束”路径
         std::mem::forget(g);
         assert_eq!(t.len(), 1);
         // notify_waiters 在没有等待者时是 noop —— 给一个等待者验证唤醒
@@ -1012,7 +1121,7 @@ mod tests {
             destination_port: "443".into(),
             process: "chrome.exe".into(),
             rule: "GEOIP".into(),
-            chains: vec!["main".into(), "node-a".into()],
+            chains: string_list_from(["main", "node-a"]),
             ..ConnectionMeta::default()
         });
         let _g2 = t.open(ConnectionMeta {
@@ -1021,7 +1130,7 @@ mod tests {
             destination_port: "443".into(),
             process: "chrome.exe".into(),
             rule: "GEOIP".into(),
-            chains: vec!["main".into(), "node-a".into()],
+            chains: string_list_from(["main", "node-a"]),
             ..ConnectionMeta::default()
         });
         let _g3 = t.open(ConnectionMeta {
@@ -1030,7 +1139,7 @@ mod tests {
             destination_port: "53".into(),
             process: "WutherCore".into(),
             rule: "MATCH".into(),
-            chains: vec!["DIRECT".into()],
+            chains: string_list_from(["DIRECT"]),
             ..ConnectionMeta::default()
         });
         let s = t.summary(10, std::time::Duration::from_secs(300));
@@ -1072,7 +1181,7 @@ mod tests {
         };
         assert!(!uuid.is_empty());
         std::mem::forget(g); // 不让 drop 提前清掉
-        assert!(t.close_by_uuid_or_numeric(&uuid));
+        assert!(t.close_by_uuid_or_numeric(uuid.as_str()));
         assert_eq!(t.len(), 0);
     }
 
@@ -1105,7 +1214,7 @@ mod tests {
             network: "tcp".into(),
             kind: "HTTP".into(),
             host: "example.com".into(),
-            chains: vec!["Auto".into(), "node-a".into()],
+            chains: string_list_from(["Auto", "node-a"]),
             ..ConnectionMeta::default()
         });
 
@@ -1132,25 +1241,22 @@ mod tests {
             host: "example.com".into(),
             destination_port: "443".into(),
             smart_target: "example.com".into(),
-            chains: vec!["main".into(), "provider-a/node-1".into()],
-            provider_chains: vec!["provider-a".into()],
+            chains: string_list_from(["main", "provider-a/node-1"]),
+            provider_chains: string_list_from(["provider-a"]),
             rule: "MATCH".into(),
             rule_payload: "preset:global any".into(),
             ..ConnectionMeta::default()
         });
 
         let entry = t.get(g.id).unwrap();
-        assert_eq!(entry.meta.remote_destination, "example.com:443");
-        assert_eq!(entry.meta.smart_target, "example.com");
+        assert_eq!(entry.meta.remote_destination.as_str(), "example.com:443");
+        assert_eq!(entry.meta.smart_target.as_str(), "example.com");
 
         let snap = t.manager_snapshot();
         assert_eq!(snap.connections.len(), 1);
+        assert_eq!(snap.connections[0].provider_chains.as_slice(), ["provider-a"]);
         assert_eq!(
-            snap.connections[0].provider_chains,
-            vec!["provider-a".to_string()]
-        );
-        assert_eq!(
-            snap.connections[0].metadata.remote_destination,
+            snap.connections[0].metadata.remote_destination.as_str(),
             "example.com:443"
         );
     }
@@ -1163,7 +1269,7 @@ mod tests {
             destination_ip_asn: "AS15169".into(),
             ..ConnectionMeta::default()
         });
-        let uuid = t.get(g.id).unwrap().meta.uuid;
+        let uuid = t.get(g.id).unwrap().meta.uuid.to_string();
 
         let ids = t.get_smart_target_ids("example.com", "AS15169");
         assert!(ids.contains(&uuid));
@@ -1176,11 +1282,11 @@ mod tests {
     fn close_by_chain_only_closes_matching_connections() {
         let t = ConnectionTable::new();
         let g1 = t.open(ConnectionMeta {
-            chains: vec!["ProviderA".into(), "node-a".into()],
+            chains: string_list_from(["ProviderA", "node-a"]),
             ..ConnectionMeta::default()
         });
         let g2 = t.open(ConnectionMeta {
-            chains: vec!["ProviderB".into(), "node-b".into()],
+            chains: string_list_from(["ProviderB", "node-b"]),
             ..ConnectionMeta::default()
         });
         let keep_id = g2.id;
@@ -1190,5 +1296,55 @@ mod tests {
         assert_eq!(t.close_by_chain("ProviderA"), 1);
         assert!(t.get(keep_id).is_some());
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn smart_block_flag_flips_atomically_and_serializes() {
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            uuid: "fixed-uuid".into(),
+            ..ConnectionMeta::default()
+        });
+        let id = g.id;
+        std::mem::forget(g);
+        let entry = t.get(id).unwrap();
+        assert!(!entry.is_smart_blocked());
+
+        // 模拟管理路径：set_smart_block_and_close 会 mark 然后 close
+        assert!(t.set_smart_block_and_close("fixed-uuid"));
+        // close 之后 entry 已离表，但保留的 entry 句柄仍能看到 flag 已翻转
+        assert!(entry.is_smart_blocked());
+
+        let info = ConnectionInfo {
+            id: entry.meta.uuid.clone(),
+            metadata: entry.meta.clone(),
+            upload: 0,
+            download: 0,
+            start: entry.started_at,
+            chains: entry.meta.chains.clone(),
+            provider_chains: entry.meta.provider_chains.clone(),
+            rule: entry.meta.rule.clone(),
+            rule_payload: entry.meta.rule_payload.clone(),
+            max_upload_rate: 0,
+            max_download_rate: 0,
+            smart_block: entry.smart_block.clone(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"smartBlock\":\"blocked\""), "got {json}");
+    }
+
+    #[test]
+    fn meta_clone_is_arc_bump_not_deep_copy() {
+        // 验证 Arc<ConnectionMeta> 共享 —— 修改 meta 内容必须经 normalize 流程，
+        // entry 之间不会出现“一个改了另一个看到”的情况，因为 Arc 是 immutable 共享。
+        let t = ConnectionTable::new();
+        let g = t.open(ConnectionMeta {
+            host: "a.example.com".into(),
+            destination_port: "443".into(),
+            ..ConnectionMeta::default()
+        });
+        let entry = t.get(g.id).unwrap();
+        let cloned = entry.clone();
+        assert!(Arc::ptr_eq(&entry.meta, &cloned.meta));
     }
 }

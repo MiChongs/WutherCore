@@ -92,8 +92,8 @@ async fn http_connect_through_mixed() {
         conn.metadata.remote_destination,
         format!("127.0.0.1:{echo_port}")
     );
-    assert_eq!(conn.chains, vec!["DIRECT"]);
-    assert_eq!(conn.provider_chains, Vec::<String>::new());
+    assert_eq!(conn.chains.as_slice(), ["DIRECT"]);
+    assert!(conn.provider_chains.is_empty());
     assert_eq!(conn.rule, "MATCH");
     assert_eq!(conn.rule_payload, "preset:direct any");
     assert!(conn.upload >= 5);

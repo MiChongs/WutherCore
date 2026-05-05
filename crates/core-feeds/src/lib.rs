@@ -19,8 +19,10 @@ pub mod cache;
 pub mod fetcher;
 pub mod manager;
 pub mod parser;
+pub mod userinfo;
 
 pub use cache::{url_digest, FeedDiskCache, FeedMeta};
-pub use fetcher::{fetch_feed, FetchError};
+pub use fetcher::{fetch_feed, FetchError, FetchResult};
 pub use manager::{FeedManager, FeedSink, FeedStatus, FeedUpdate};
 pub use parser::{apply_filter_rename, parse_feed_payload, FormatHint};
+pub use userinfo::SubscriptionUserinfo;

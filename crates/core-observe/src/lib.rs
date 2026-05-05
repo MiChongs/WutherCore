@@ -14,11 +14,13 @@ pub mod copy_counted;
 pub mod log_bus;
 pub mod metrics;
 pub mod tracing_init;
+pub mod watchdog;
 
 pub use connections::{
-    log_connection_summary, ConnectionAccounting, ConnectionEntry, ConnectionGuard,
-    ConnectionInfo, ConnectionManagerSnapshot, ConnectionMeta, ConnectionSnapshot,
-    ConnectionSummary, ConnectionTable, LongLivedEntry, RateSample,
+    log_connection_summary, string_list_from, ConnectionAccounting, ConnectionEntry,
+    ConnectionGuard, ConnectionInfo, ConnectionManagerSnapshot, ConnectionMeta,
+    ConnectionSnapshot, ConnectionSummary, ConnectionTable, LongLivedEntry, RateSample,
+    StringList,
 };
 pub use copy_counted::{copy_bidirectional_counted, copy_bidirectional_tracked};
 pub use log_bus::{LogBus, LogEvent};
@@ -27,3 +29,4 @@ pub use tracing_init::{
     attach_log_bus, init_tracing, init_tracing_with_bus, init_tracing_with_config, TracingConfig,
     TracingFileConfig, TracingFormat,
 };
+pub use watchdog::{Watchdog, WatchdogConfig};

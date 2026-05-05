@@ -177,7 +177,7 @@ async fn connections_snapshot_uses_connection_manager() {
         host: "example.com".into(),
         destination_ip_asn: "AS15169".into(),
         smart_target: "example.com".into(),
-        chains: vec!["main".into(), "NodeA".into()],
+        chains: core_observe::string_list_from(["main", "NodeA"]),
         rule: "MATCH".into(),
         rule_payload: "main".into(),
         ..ConnectionMeta::default()

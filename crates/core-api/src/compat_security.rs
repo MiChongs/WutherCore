@@ -254,8 +254,11 @@ impl Drop for WsPermit {
 
 /// 每个 IP 一只 token bucket。`tokens` f64 让 sub-1 速率配置生效；
 /// `last_refill` 单调时钟（Instant）防止 NTP 跳变干扰。
+///
+/// `Arc<Mutex<TokenBucket>>`：把 mutex 包进 Arc 是为了能"先 clone Arc，再释放
+/// dashmap entry"，规避 [`Self::allow`] 注释里讲的 entry × len 同 shard 死锁。
 pub struct IpRateLimiter {
-    buckets: DashMap<IpAddr, Mutex<TokenBucket>>,
+    buckets: DashMap<IpAddr, Arc<Mutex<TokenBucket>>>,
     rate_per_sec: f64,
     burst: f64,
     /// 估算的内存开销控制：bucket 数超过 max_entries 时跑一次 GC。
@@ -279,18 +282,33 @@ impl IpRateLimiter {
     }
 
     /// 返回 true 表示允许这次请求；false 表示触发限流。
+    ///
+    /// **重要 / DEADLOCK 教训**：
+    /// `dashmap::DashMap::entry()` 返回的 `RefMut` 在作用域结束前持有所在 shard 的
+    /// **write lock**。同 shard 上若再调用任何 `len()` / `iter()` / `retain()` 等
+    /// 走 read lock 的方法 → 同线程递归 read-on-write，parking_lot 不可重入直接
+    /// 死锁；表现为生产环境"API 一段时间后卡死，log bus 也死，但进程仍在"。
+    ///
+    /// 修复：把 entry 拿值（拷出 `Arc<Mutex<...>>`）之后立即释放 entry，再做任何
+    /// 后续 `len` / `gc` 操作。
     pub fn allow(&self, ip: IpAddr) -> bool {
-        // dashmap entry().or_insert_with 把"新建"和"使用"合成一个原子操作；
-        // 比先 get 后 insert 更省 lock。
-        let entry = self.buckets.entry(ip).or_insert_with(|| {
-            Mutex::new(TokenBucket {
-                tokens: self.burst,
-                last_refill: Instant::now(),
-            })
-        });
+        // 第一步：拿到（或新建）这个 IP 对应的 bucket Arc，**短锁内必须只持
+        // entry，不调任何 self.buckets.* 方法**。
+        let bucket = {
+            let entry = self.buckets.entry(ip).or_insert_with(|| {
+                Arc::new(Mutex::new(TokenBucket {
+                    tokens: self.burst,
+                    last_refill: Instant::now(),
+                }))
+            });
+            Arc::clone(entry.value())
+            // entry 在这里 drop —— shard write lock 释放
+        };
+
+        // 第二步：在 entry 释放之后再 lock 内层 token bucket，无嵌套锁风险。
         let now = Instant::now();
         let allow = {
-            let mut b = entry.lock();
+            let mut b = bucket.lock();
             let elapsed = now.duration_since(b.last_refill).as_secs_f64();
             b.tokens = (b.tokens + elapsed * self.rate_per_sec).min(self.burst);
             b.last_refill = now;
@@ -301,7 +319,8 @@ impl IpRateLimiter {
                 false
             }
         };
-        // 简单 LRU 触发：超出阈值时偶发清理一次（O(N) 但不阻塞 hot path）。
+
+        // 第三步：偶发 LRU 清理 —— 现在 entry 已无 hold，调 len() / retain() 安全。
         if self.buckets.len() > self.max_entries {
             self.gc(now);
         }

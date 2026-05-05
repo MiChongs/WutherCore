@@ -55,10 +55,20 @@ url = "2"
 ipnet = { version = "2", features = ["serde"] }
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls", "dns-over-https-rustls"] }
 
-# Hash / 集合
+# Hash / 集合 / 内存优化
 ahash = "0.8"
 dashmap = "6"
-parking_lot = "0.12"
+# `deadlock_detection` 让 watchdog 能侦测出循环互斥 —— 生产环境 API 卡死的
+# 头号嫌疑（同 thread 在 entry RefMut 里再访问同 shard 的递归 RwLock）。
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
+# 卡死时拿当前所有线程的栈，写进 panic.log 给运行人员排障。
+backtrace = "0.3"
+# 短字符串内联（≤24 字节不分配堆），活跃连接的 metadata 字段几乎全部命中。
+compact_str = { version = "0.8", features = ["serde"] }
+# 小向量内联（typical chains 长度 1-4），避免 chains/geoip 触发堆分配。
+smallvec = { version = "1", features = ["serde", "union", "const_generics", "const_new"] }
+# Arc 原子换页，给"连接表写入低频、快照读取高频"的场景做无锁切换。
+arc-swap = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

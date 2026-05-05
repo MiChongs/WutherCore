@@ -1109,7 +1109,7 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
             .collect();
     }
     let status = s.feeds.as_ref().and_then(|m| m.status(name));
-    let (last_ms, next_ms, raw_bytes, from_cache, every_secs, url) = status
+    let (last_ms, next_ms, raw_bytes, from_cache, every_secs, url, userinfo) = status
         .as_ref()
         .map(|st| {
             (
@@ -1119,10 +1119,28 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
                 st.last_from_cache,
                 st.every_secs,
                 st.url.clone(),
+                st.userinfo,
             )
         })
-        .unwrap_or((0, 0, 0, false, 0, String::new()));
+        .unwrap_or((0, 0, 0, false, 0, String::new(), None));
     let vehicle_type = if url.is_empty() { "File" } else { "HTTP" };
+    let userinfo_json = userinfo
+        .map(|ui| {
+            json!({
+                "Upload":   ui.upload,
+                "Download": ui.download,
+                "Total":    ui.total,
+                "Expire":   ui.expire,
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "Upload":   0,
+                "Download": 0,
+                "Total":    0,
+                "Expire":   0,
+            })
+        });
     json!({
         "name": name,
         "type": "Proxy",
@@ -1130,15 +1148,9 @@ fn provider_json(s: &NativeState, name: &str) -> Value {
         "proxies": nodes,
         "updatedAt": iso8601(last_ms / 1000),
         "expectedStatus": "*",
-        // sing-box `subscriptionInfo` 接口 —— mihomo dashboard 显示订阅
-        // 用量。我们的 FeedManager 暂不解析 SSR-Subscribe-Userinfo / 类似头，
-        // 这里 4 个字段都给 0；待 feeds 层接入后再回填。
-        "subscriptionInfo": {
-            "Upload":   0,
-            "Download": 0,
-            "Total":    0,
-            "Expire":   0,
-        },
+        // 订阅用量四元组 —— 解析自 HTTP 响应的 Subscription-Userinfo
+        // 或同义头。机场没回该头时四字段全 0，dashboard 视为"无配额信息"。
+        "subscriptionInfo": userinfo_json,
         "healthCheck": {
             "enable":   true,
             "url":      default_url,

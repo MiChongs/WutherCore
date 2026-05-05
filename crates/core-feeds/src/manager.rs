@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use crate::cache::{url_digest, FeedDiskCache, FeedMeta};
 use crate::fetcher::fetch_feed;
 use crate::parser::{apply_filter_rename, parse_feed_payload, FormatHint};
+use crate::userinfo::SubscriptionUserinfo;
 
 /// 一次刷新结果。
 #[derive(Debug, Clone)]
@@ -36,6 +37,8 @@ pub struct FeedUpdate {
     pub nodes: Vec<ParsedNode>,
     pub from_cache: bool,
     pub raw_bytes: usize,
+    /// 解析自 HTTP 响应的订阅用量；本地路径 / 缺头 / 走缓存时为 None。
+    pub userinfo: Option<SubscriptionUserinfo>,
 }
 
 /// 节点接收方 —— 由 Runtime 实现，把新节点列表注册到 outbound + groups。
@@ -55,6 +58,9 @@ pub struct FeedStatus {
     pub last_node_count: usize,
     pub last_raw_bytes: u64,
     pub last_from_cache: bool,
+    /// 上次成功在线刷新时拿到的订阅用量；走缓存或本地源时保持上一次的值
+    /// （不被覆盖为 None），方便面板持续显示。
+    pub userinfo: Option<SubscriptionUserinfo>,
 }
 
 #[derive(Default)]
@@ -87,6 +93,7 @@ impl FeedManager {
                     last_node_count: 0,
                     last_raw_bytes: 0,
                     last_from_cache: false,
+                    userinfo: None,
                 },
             );
         }
@@ -285,6 +292,12 @@ impl FeedManager {
             s.last_raw_bytes = update.raw_bytes as u64;
             s.last_from_cache = update.from_cache;
             s.next_due_ms = last_ms.saturating_add(every.as_millis() as u64);
+            // 仅当本次有新 userinfo 时覆盖；缓存路径不抹掉上次的真实数据，
+            // 让面板上 "Upload / Download / Total / Expire" 不会因为一次离线
+            // 刷新就变成 0。
+            if update.userinfo.is_some() {
+                s.userinfo = update.userinfo;
+            }
         }
         let sink = { self.sink.read().clone() };
         if let Some(sink) = sink {
@@ -332,6 +345,7 @@ impl FeedManager {
                 nodes: nodes.clone(),
                 from_cache: true,
                 raw_bytes: raw.len(),
+                userinfo: None,
             },
             last_refreshed_ms,
             every,
@@ -362,19 +376,19 @@ impl FeedManager {
         detail: &FeedDetail,
         timeout: Duration,
     ) -> Result<FeedUpdate, String> {
-        let raw = match fetch_feed(&detail.url, timeout).await {
-            Ok(b) => {
+        let (raw, userinfo) = match fetch_feed(&detail.url, timeout).await {
+            Ok(result) => {
                 if let Some(cache) = &self.cache {
                     let meta = FeedMeta {
                         last_refreshed_ms: now_ms(),
-                        raw_size: b.len() as u64,
-                        etag: None,
-                        content_type: None,
+                        raw_size: result.bytes.len() as u64,
+                        etag: result.etag.clone(),
+                        content_type: result.content_type.clone(),
                         url_hash: Some(url_digest(&detail.url)),
                     };
-                    cache.save_with_meta(name, &b, &meta);
+                    cache.save_with_meta(name, &result.bytes, &meta);
                 }
-                b
+                (result.bytes, result.userinfo)
             }
             Err(e) => {
                 warn!(target: "feeds", name, error = %e, "online fetch failed; trying disk cache");
@@ -389,6 +403,7 @@ impl FeedManager {
                     nodes,
                     from_cache: true,
                     raw_bytes: cache.len(),
+                    userinfo: None,
                 });
             }
         };
@@ -399,6 +414,7 @@ impl FeedManager {
             nodes,
             from_cache: false,
             raw_bytes: raw.len(),
+            userinfo,
         })
     }
 

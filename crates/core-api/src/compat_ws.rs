@@ -19,6 +19,24 @@
 //! * Producer 闭包只捕获自己需要的 `Arc<...>`（避免捕获 `NativeState` 形成
 //!   `Arc` 循环）。
 //!
+//! ## 生命周期 / 防泄漏（**重要**）
+//!
+//! 旧实现 `tokio::spawn(async move { me.run().await })` 把 `Arc<Self>` 强绑到
+//! 任务内，造成 `Arc` 循环：hub 永远不会析构，子任务永远不会退出，进程退出
+//! 前一直占内存；测试场景里多个 #[tokio::test] 串行跑时，第二个测试的
+//! runtime drop 撞到第一个测试遗留的孤儿任务，整体卡死。
+//!
+//! 现在：
+//!
+//! * 子任务只持 [`Weak<Self>`]；每拍 `weak.upgrade()` 一下；upgrade 失败 →
+//!   hub 已被 owner 释放 → 立即退出。
+//! * 同时探测 `watch::Sender::is_closed()`：所有 receiver 都掉了之后，
+//!   producer 进入"低成本心跳"分支，每 5×interval 才检查一次（不再 produce
+//!   payload），避免 idle 时仍 1Hz 调 producer 闭包。新 subscriber 来了之后
+//!   自动恢复 1Hz。
+//! * 析构 [`WsHub`] 时通过 `shutdown` 一次性 cancel：[`AtomicBool`] 触发
+//!   下一拍 break；测试场景里也能立刻收尾。
+//!
 //! ## 慢消费者保护
 //!
 //! `watch` 不堆消息：subscriber 慢的话只会丢掉中间帧，永远只看到最新的。
@@ -26,7 +44,7 @@
 //! 的风险，更适合 1Hz 监控类场景。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -35,6 +53,7 @@ use tokio::sync::watch;
 pub struct WsHub {
     tx: watch::Sender<String>,
     started: AtomicBool,
+    shutdown: AtomicBool,
     interval: Duration,
     /// 不可变：构造期一次性传入。`Box<dyn Fn>` 让我们能在 [`WsHubs`] 里收纳
     /// 不同 producer 的多个 hub。
@@ -52,6 +71,7 @@ impl WsHub {
         Arc::new(Self {
             tx,
             started: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
             interval,
             producer: Box::new(producer),
             label,
@@ -61,8 +81,12 @@ impl WsHub {
     /// 订阅；首次订阅触发 producer 协程。
     pub fn subscribe(self: &Arc<Self>) -> watch::Receiver<String> {
         if !self.started.swap(true, Ordering::AcqRel) {
-            let me = self.clone();
-            tokio::spawn(async move { me.run().await });
+            // 子任务只拿 Weak —— 父 hub 析构后下一拍立即退出，不形成循环引用。
+            let weak = Arc::downgrade(self);
+            let label = self.label;
+            tokio::spawn(async move {
+                run(weak, label).await;
+            });
         }
         self.tx.subscribe()
     }
@@ -79,7 +103,7 @@ impl WsHub {
     }
 
     /// 强制就地刷新（同步，绕过 ticker）。HTTP 非 WS 调用 `/traffic`、
-    /// `/memory` 等聚合 GET 时用，让响应永远反映"最新一拍"而不是 hub 上一拍。
+    /// `/memory` 等聚合 GET 时用，让响应永远反映“最新一拍”而不是 hub 上一拍。
     pub fn build_now(&self) -> String {
         let payload = (self.producer)();
         // 也写回 watch，让 WS subscriber 能少等一个 tick 拿到最新。
@@ -87,32 +111,82 @@ impl WsHub {
         payload
     }
 
-    async fn run(self: Arc<Self>) {
-        // 首拍立刻 produce，让早期连接的 subscriber 不用等 interval。
-        let first = (self.producer)();
-        let _ = self.tx.send(first);
+    /// 显式关停 —— 测试场景或优雅停机时调用，下一拍 producer 立刻 break。
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
 
-        let mut tick = tokio::time::interval(self.interval);
-        // tick.tick() 第一次立即返回 —— 跳过它免得连续 tick 两次。
-        tick.tick().await;
-        // missed-tick 行为 = Skip：tick 落后时（producer 偶尔慢）合并到下一拍，
-        // 不补打缺失的 tick。监控类场景永远只关心"最新值"。
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            // 即使没有 subscriber 也继续 tick：watch 写入是常数代价（无队列）；
-            // 这样 NEW subscriber 在 ≤ interval 内一定看到一帧实数据，
-            // 不会因 hub 处于"刚 idle 的窗口"而看到 init 空串。
-            let payload = (self.producer)();
-            // 大对象送 watch 时，watch 的内部 Mutex 会序列化 readers；为了
-            // 避免 producer 阻塞所有 readers，先存到 swap，然后短锁内置换。
-            let _ = self.tx.send(payload);
-            tracing::trace!(target: "api::ws_hub", label = self.label, "tick");
+impl Drop for WsHub {
+    fn drop(&mut self) {
+        // hub 析构 → 立即标记 shutdown，让 spawned 任务下一拍跳出 loop。
+        // 另外 weak.upgrade() 在下一拍也会失败（self 已 drop），双保险。
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Producer 协程实体 —— 持 [`Weak<WsHub>`]，每拍 upgrade 检查父 hub 是否还在。
+/// 把 `run` 抽成自由函数（而不是 `WsHub` 的方法）是因为 Drop 顺序：函数体里
+/// 不再隐式持 `Arc<Self>`，只在 upgrade 成功时短暂持有，确保 hub 引用计数能
+/// 真正归零。
+async fn run(weak: Weak<WsHub>, label: &'static str) {
+    // 首拍立刻 produce，让早期连接的 subscriber 不用等 interval。
+    let interval = match weak.upgrade() {
+        Some(hub) => {
+            let payload = (hub.producer)();
+            let _ = hub.tx.send(payload);
+            hub.interval
         }
+        None => return,
+    };
+
+    let mut tick = tokio::time::interval(interval);
+    // tick.tick() 第一次立即返回 —— 跳过它免得连续 tick 两次。
+    tick.tick().await;
+    // missed-tick 行为 = Skip：tick 落后时（producer 偶尔慢）合并到下一拍，
+    // 不补打缺失的 tick。监控类场景永远只关心“最新值”。
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // idle backoff：所有 subscriber 都掉了之后，跳过 produce 节省 CPU；
+    // 每 idle_skip_max 个空拍探测一次（仍走 watch idle，不动 producer）。
+    let mut idle_skip = 0u32;
+    const IDLE_SKIP_MAX: u32 = 5;
+    loop {
+        tick.tick().await;
+        // upgrade 失败 = hub 已 drop = 父 owner 不再持有 = 立即退出。
+        let Some(hub) = weak.upgrade() else {
+            tracing::debug!(target: "api::ws_hub", label, "owner dropped; producer exiting");
+            return;
+        };
+        // 显式 shutdown（owner 调 shutdown() 或 hub Drop 触发）= 立即退出。
+        if hub.shutdown.load(Ordering::Acquire) {
+            tracing::debug!(target: "api::ws_hub", label, "shutdown signalled; producer exiting");
+            return;
+        }
+        // 没 subscriber 时进入低成本心跳：跳过 produce，节省 CPU。
+        if hub.tx.is_closed() {
+            idle_skip = idle_skip.saturating_add(1);
+            if idle_skip < IDLE_SKIP_MAX {
+                continue;
+            }
+            // idle_skip_max 拍后再探一次，避免长 idle 也烧 CPU。
+            idle_skip = 0;
+            continue;
+        }
+        idle_skip = 0;
+        let payload = (hub.producer)();
+        // 大对象送 watch 时，watch 的内部 Mutex 会序列化 readers；为了
+        // 避免 producer 阻塞所有 readers，先 send 一次（写时拷贝）。
+        let _ = hub.tx.send(payload);
+        tracing::trace!(target: "api::ws_hub", label, "tick");
     }
 }
 
 /// 三个高频端点共享一个 [`WsHubs`]。NativeState 持 `Arc<WsHubs>`。
+///
+/// `Drop` 时把所有子 hub 也 shutdown —— 即使外部多持了一份 `Arc<WsHub>`，
+/// producer 协程也会在下一拍退出，避免 NativeState 已落但 hub 协程还在跑
+/// 的"幽灵任务"现象。
 pub struct WsHubs {
     pub traffic: Arc<WsHub>,
     pub memory: Arc<WsHub>,
@@ -163,6 +237,16 @@ impl WsHubs {
             memory,
             connections,
         })
+    }
+}
+
+impl Drop for WsHubs {
+    fn drop(&mut self) {
+        // 显式 shutdown 三个子 hub：即使外部还多持一份 Arc<WsHub>，spawn 任务
+        // 下一拍也会因 shutdown 标记 break。
+        self.traffic.shutdown();
+        self.memory.shutdown();
+        self.connections.shutdown();
     }
 }
 
@@ -226,10 +310,11 @@ fn iso8601_secs(ts_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_start_only_after_first_subscribe() {
-        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::new(AtomicUsize::new(0));
         let n_for_producer = n.clone();
         let hub = WsHub::new("test", Duration::from_millis(20), move || {
             n_for_producer.fetch_add(1, Ordering::Relaxed);
@@ -247,7 +332,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn multiple_subscribers_share_one_producer() {
-        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::new(AtomicUsize::new(0));
         let n_for_producer = n.clone();
         let hub = WsHub::new("test", Duration::from_millis(15), move || {
             n_for_producer.fetch_add(1, Ordering::Relaxed);
@@ -270,5 +355,67 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         let v = rx.borrow_and_update().clone();
         assert_eq!(v, "payload");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_exits_when_hub_dropped() {
+        // 关键回归：旧实现 producer 持 Arc<Self> → hub 永不析构 → 任务永不退出 →
+        // tokio runtime drop 时挂起。新实现持 Weak<Self>，hub 一 drop 立即退出。
+        let n = Arc::new(AtomicUsize::new(0));
+        let n_for_producer = n.clone();
+        let hub = WsHub::new("dropme", Duration::from_millis(10), move || {
+            n_for_producer.fetch_add(1, Ordering::Relaxed);
+            String::from("x")
+        });
+        let _rx = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let before_drop = n.load(Ordering::Relaxed);
+        assert!(before_drop >= 2);
+
+        drop(_rx);
+        drop(hub);
+        // 给 producer 几拍时间走完 Drop → shutdown → 下一拍 break 流程
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stable = n.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let after = n.load(Ordering::Relaxed);
+        assert_eq!(
+            stable, after,
+            "producer must stop ticking after hub drop (stable={stable}, after={after})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_backoff_pauses_producer_when_no_subscribers() {
+        // 所有 subscriber 都掉了之后，producer 应进入 idle 模式，不再 produce
+        // payload；新 subscriber 加入又恢复。
+        let n = Arc::new(AtomicUsize::new(0));
+        let n_for_producer = n.clone();
+        let hub = WsHub::new("idle", Duration::from_millis(10), move || {
+            n_for_producer.fetch_add(1, Ordering::Relaxed);
+            String::from("p")
+        });
+        let rx = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let active = n.load(Ordering::Relaxed);
+        assert!(active >= 2);
+        drop(rx);
+        // idle 后再观察 80 ms，producer 至少进入低速节奏（IDLE_SKIP_MAX × 10ms 内
+        // 一拍真 produce 都没有）
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after_idle = n.load(Ordering::Relaxed);
+        // active 之后应至多多 1 次 produce（idle 进入前那拍可能仍 produce）
+        assert!(
+            after_idle <= active + 1,
+            "idle backoff failed: active={active}, after_idle={after_idle}"
+        );
+        // 新 subscriber 加入 → 立即恢复 produce
+        let _rx2 = hub.subscribe();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let recovered = n.load(Ordering::Relaxed);
+        assert!(
+            recovered > after_idle,
+            "subscriber wakeup failed: after_idle={after_idle}, recovered={recovered}"
+        );
     }
 }

@@ -419,6 +419,7 @@ mod tests {
                 path: "data/logs/custom.log".into(),
             },
             format: LogFormat::Json,
+            connection_summary_interval: std::time::Duration::ZERO,
         };
 
         let tracing = tracing_config_from_user_log(&log);
@@ -448,6 +449,7 @@ mod tests {
                 path: "data/logs/custom.log".into(),
             },
             format: LogFormat::Text,
+            connection_summary_interval: std::time::Duration::ZERO,
         };
 
         let tracing = tracing_config_from_user_log(&log);
@@ -514,6 +516,42 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     } else {
         core_observe::init_tracing();
     }
+
+    // ---------- 进程级 watchdog 安装 ----------
+    //
+    // 关键：watchdog 走独立 std::thread + 同步文件 IO，与 tokio runtime / tracing
+    // 桥接完全解耦。即便整个 tokio 运行时卡死（曾发生：DashMap entry × len 同
+    // shard 递归 RwLock；WsHub Arc 循环让 producer 永不退出导致 runtime drop
+    // 挂起），运维仍能从 panic.log / watchdog.log 拿到 STUCK / DEADLOCK 报告。
+    let log_dir = plan
+        .log
+        .as_ref()
+        .and_then(|l| {
+            PathBuf::from(&l.file.path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+        })
+        .unwrap_or_else(|| PathBuf::from("data/logs"));
+    let wd = core_observe::Watchdog::install(core_observe::WatchdogConfig {
+        panic_log_path: log_dir.join("panic.log"),
+        watchdog_log_path: log_dir.join("watchdog.log"),
+        ..Default::default()
+    });
+    // tokio 心跳任务 —— 1Hz 调 wd.heartbeat()。卡死时 watchdog 监督线程
+    // 立即捕获并 dump 栈，运维不会再面对"进程在跑但啥都不响应"的黑盒。
+    {
+        let wd = wd.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                wd.heartbeat();
+            }
+        });
+    }
+
     info!(name = %plan.name, profile = ?plan.profile, "config loaded");
 
     // 启动钩子：检测特权 + Android 优先尝试 su 提权再降级。

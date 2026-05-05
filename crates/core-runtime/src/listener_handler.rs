@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use compact_str::ToCompactString;
 use core_observe::{copy_bidirectional_tracked, ConnectionGuard, ConnectionMeta};
 use core_route::{FlowContext, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -496,25 +497,25 @@ fn tcp_connection_meta(metadata: &InboundMetadata, result: &DialResult) -> Conne
     let (inbound_ip, inbound_port) = inbound_parts(metadata.inbound);
     ConnectionMeta {
         network: "tcp".into(),
-        kind: metadata.kind.clone(),
-        source_ip: metadata.source.ip().to_string(),
-        source_port: metadata.source.port().to_string(),
+        kind: metadata.kind.as_str().into(),
+        source_ip: metadata.source.ip().to_compact_string(),
+        source_port: metadata.source.port().to_compact_string(),
         destination_ip: destination_ip(metadata),
-        destination_port: metadata.destination_port.to_string(),
+        destination_port: metadata.destination_port.to_compact_string(),
         inbound_ip,
         inbound_port,
-        inbound_name: metadata.inbound_name.clone(),
-        host: metadata.target_host(),
-        dns_mode: metadata.dns_mode.clone(),
-        process: metadata.process.clone().unwrap_or_default(),
-        process_path: metadata.process_path.clone().unwrap_or_default(),
-        sniff_host: metadata.sniff_host.clone(),
-        remote_destination: result.remote_destination.clone(),
-        smart_target: result.smart_target.clone(),
-        chains: result.chain.clone(),
-        provider_chains: result.provider_chains.clone(),
-        rule: result.rule.clone(),
-        rule_payload: result.rule_payload.clone(),
+        inbound_name: metadata.inbound_name.as_str().into(),
+        host: metadata.target_host().into(),
+        dns_mode: metadata.dns_mode.as_str().into(),
+        process: metadata.process.as_deref().unwrap_or_default().into(),
+        process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        sniff_host: metadata.sniff_host.as_str().into(),
+        remote_destination: result.remote_destination.as_str().into(),
+        smart_target: result.smart_target.as_str().into(),
+        chains: core_observe::string_list_from(&result.chain),
+        provider_chains: core_observe::string_list_from(&result.provider_chains),
+        rule: result.rule.as_str().into(),
+        rule_payload: result.rule_payload.as_str().into(),
         ..ConnectionMeta::default()
     }
 }
@@ -523,40 +524,43 @@ fn udp_connection_meta(metadata: &InboundMetadata, result: &UdpDialResult) -> Co
     let (inbound_ip, inbound_port) = inbound_parts(metadata.inbound);
     ConnectionMeta {
         network: "udp".into(),
-        kind: metadata.kind.clone(),
-        source_ip: metadata.source.ip().to_string(),
-        source_port: metadata.source.port().to_string(),
+        kind: metadata.kind.as_str().into(),
+        source_ip: metadata.source.ip().to_compact_string(),
+        source_port: metadata.source.port().to_compact_string(),
         destination_ip: destination_ip(metadata),
-        destination_port: metadata.destination_port.to_string(),
+        destination_port: metadata.destination_port.to_compact_string(),
         inbound_ip,
         inbound_port,
-        inbound_name: metadata.inbound_name.clone(),
-        host: metadata.target_host(),
-        dns_mode: metadata.dns_mode.clone(),
-        process: metadata.process.clone().unwrap_or_default(),
-        process_path: metadata.process_path.clone().unwrap_or_default(),
-        sniff_host: metadata.sniff_host.clone(),
-        remote_destination: result.remote_destination.clone(),
-        smart_target: result.smart_target.clone(),
-        chains: result.chain.clone(),
-        provider_chains: result.provider_chains.clone(),
-        rule: result.rule.clone(),
-        rule_payload: result.rule_payload.clone(),
+        inbound_name: metadata.inbound_name.as_str().into(),
+        host: metadata.target_host().into(),
+        dns_mode: metadata.dns_mode.as_str().into(),
+        process: metadata.process.as_deref().unwrap_or_default().into(),
+        process_path: metadata.process_path.as_deref().unwrap_or_default().into(),
+        sniff_host: metadata.sniff_host.as_str().into(),
+        remote_destination: result.remote_destination.as_str().into(),
+        smart_target: result.smart_target.as_str().into(),
+        chains: core_observe::string_list_from(&result.chain),
+        provider_chains: core_observe::string_list_from(&result.provider_chains),
+        rule: result.rule.as_str().into(),
+        rule_payload: result.rule_payload.as_str().into(),
         ..ConnectionMeta::default()
     }
 }
 
-fn inbound_parts(addr: Option<SocketAddr>) -> (String, String) {
+fn inbound_parts(addr: Option<SocketAddr>) -> (compact_str::CompactString, compact_str::CompactString) {
     match addr {
-        Some(addr) => (addr.ip().to_string(), addr.port().to_string()),
-        None => (String::new(), String::new()),
+        Some(addr) => (
+            addr.ip().to_compact_string(),
+            addr.port().to_compact_string(),
+        ),
+        None => (compact_str::CompactString::default(), compact_str::CompactString::default()),
     }
 }
 
-fn destination_ip(metadata: &InboundMetadata) -> String {
+fn destination_ip(metadata: &InboundMetadata) -> compact_str::CompactString {
     metadata
         .destination_ip
         .or_else(|| metadata.host.parse::<IpAddr>().ok())
-        .map(|ip| ip.to_string())
+        .map(|ip| ip.to_compact_string())
         .unwrap_or_default()
 }

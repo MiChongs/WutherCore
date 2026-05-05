@@ -35,3 +35,4 @@ rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
 socket2          = { version = "0.5", features = ["all"] }
 reqwest          = { workspace = true }
+compact_str      = { workspace = true }

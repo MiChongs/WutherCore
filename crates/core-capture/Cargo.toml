@@ -11,6 +11,7 @@ core-route    = { workspace = true }
 core-runtime  = { workspace = true }
 core-outbound = { workspace = true }
 core-observe  = { workspace = true }
+compact_str   = { workspace = true }
 async-trait   = { workspace = true }
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }

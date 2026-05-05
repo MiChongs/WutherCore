@@ -9,7 +9,8 @@ tracing               = { workspace = true }
 tracing-subscriber    = { workspace = true }
 tracing-appender      = { workspace = true }
 tokio                 = { workspace = true }
-serde                 = { workspace = true }
+# `rc` 特性允许 serde 序列化 `Arc<T>` —— 连接表 metadata 共享需要。
+serde                 = { workspace = true, features = ["rc"] }
 serde_json            = { workspace = true }
 parking_lot           = { workspace = true }
 dashmap               = { workspace = true }
@@ -17,3 +18,7 @@ ahash                 = { workspace = true }
 once_cell             = { workspace = true }
 uuid                  = { workspace = true }
 futures               = { workspace = true }
+compact_str           = { workspace = true }
+smallvec              = { workspace = true }
+arc-swap              = { workspace = true }
+backtrace             = { workspace = true }

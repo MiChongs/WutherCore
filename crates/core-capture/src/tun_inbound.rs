@@ -8,7 +8,8 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use core_observe::ConnectionMeta;
+use compact_str::ToCompactString;
+use core_observe::{string_list_from, ConnectionMeta};
 use core_resolver::FakeIpPool;
 use core_route::NetworkKind;
 use core_runtime::InboundMetadata;
@@ -472,22 +473,26 @@ impl TunInbound {
         ConnectionMeta {
             network: session.network.into(),
             kind: "Tun".into(),
-            source_ip: session.source.ip().to_string(),
-            source_port: session.source.port().to_string(),
-            destination_ip: session.original_dst.ip().to_string(),
-            destination_port: session.original_dst.port().to_string(),
-            inbound_ip: inbound.ip().to_string(),
-            inbound_port: inbound.port().to_string(),
+            source_ip: session.source.ip().to_compact_string(),
+            source_port: session.source.port().to_compact_string(),
+            destination_ip: session.original_dst.ip().to_compact_string(),
+            destination_port: session.original_dst.port().to_compact_string(),
+            inbound_ip: inbound.ip().to_compact_string(),
+            inbound_port: inbound.port().to_compact_string(),
             inbound_name: "tun".into(),
-            host: session.target.host.clone(),
+            host: session.target.host.as_str().into(),
             dns_mode: session.target.dns_mode.as_str().into(),
-            sniff_host: session.sniff_host.clone().unwrap_or_default(),
-            remote_destination: outbound.remote_destination.clone(),
-            smart_target: outbound.smart_target.clone(),
-            chains: outbound.chains.clone(),
-            provider_chains: outbound.provider_chains.clone(),
-            rule: outbound.rule.clone(),
-            rule_payload: outbound.rule_payload.clone(),
+            sniff_host: session
+                .sniff_host
+                .as_deref()
+                .unwrap_or_default()
+                .into(),
+            remote_destination: outbound.remote_destination.as_str().into(),
+            smart_target: outbound.smart_target.as_str().into(),
+            chains: string_list_from(&outbound.chains),
+            provider_chains: string_list_from(&outbound.provider_chains),
+            rule: outbound.rule.as_str().into(),
+            rule_payload: outbound.rule_payload.as_str().into(),
             ..ConnectionMeta::default()
         }
     }
@@ -914,8 +919,8 @@ mod tests {
         assert_eq!(meta.destination_ip, "8.8.8.8");
         assert_eq!(meta.host, "www.google.com");
         assert_eq!(meta.sniff_host, "www.google.com");
-        assert_eq!(meta.chains, vec!["Proxy", "NodeA"]);
-        assert_eq!(meta.provider_chains, vec!["ProviderA"]);
+        assert_eq!(meta.chains.as_slice(), ["Proxy", "NodeA"]);
+        assert_eq!(meta.provider_chains.as_slice(), ["ProviderA"]);
         assert_eq!(meta.rule_payload, "google.com");
     }
 }
