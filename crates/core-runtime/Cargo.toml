@@ -8,6 +8,7 @@ license.workspace = true
 core-config   = { workspace = true }
 core-route    = { workspace = true }
 core-ruleset  = { workspace = true }
+core-feeds    = { workspace = true }
 core-resolver = { workspace = true }
 core-outbound = { workspace = true }
 core-smart    = { workspace = true }

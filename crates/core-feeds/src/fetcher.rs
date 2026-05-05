@@ -3,18 +3,22 @@
 //! HTTP 路径除了把 body 拿回来，还会顺便把响应头里的订阅用量
 //! ([`SubscriptionUserinfo`])、`ETag`、`Content-Type` 等元信息一并解析返回。
 
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
+use once_cell::sync::Lazy;
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::userinfo::SubscriptionUserinfo;
 
-static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// 共享 HTTP client —— core-runtime 注入。用 ArcSwapOption 支持网络切换时
+/// hot-swap，与 core-ruleset/fetch.rs 同模式（详见那里的注释）。
+static SHARED_CLIENT: Lazy<ArcSwapOption<reqwest::Client>> = Lazy::new(ArcSwapOption::empty);
 
 pub fn set_shared_http_client(client: reqwest::Client) {
-    let _ = SHARED_CLIENT.set(client);
+    SHARED_CLIENT.store(Some(Arc::new(client)));
 }
 
 #[derive(Debug, Error)]
@@ -76,8 +80,8 @@ pub async fn fetch_feed(url: &str, timeout: Duration) -> Result<FetchResult, Fet
         return Err(FetchError::BadUrl(url.into()));
     }
 
-    let client = if let Some(c) = SHARED_CLIENT.get() {
-        c.clone()
+    let client = if let Some(c) = SHARED_CLIENT.load_full() {
+        (*c).clone()
     } else {
         reqwest::Client::builder()
             .user_agent(DEFAULT_UA)
