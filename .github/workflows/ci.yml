@@ -25,10 +25,6 @@ jobs:
             name: linux-amd64
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
-          - target: x86_64-unknown-linux-musl
-            name: linux-amd64-musl
-          - target: aarch64-unknown-linux-musl
-            name: linux-arm64-musl
           - target: aarch64-linux-android
             name: android-arm64
           #- target: x86_64-pc-windows-gnu
