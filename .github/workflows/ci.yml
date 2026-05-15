@@ -1,0 +1,79 @@
+name: Build and Release (Cross Matrix)
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/ci.yml'
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: x86_64-unknown-linux-gnu
+            name: linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            name: linux-arm64
+          - target: x86_64-unknown-linux-musl
+            name: linux-amd64-musl
+          - target: aarch64-unknown-linux-musl
+            name: linux-arm64-musl
+          - target: aarch64-linux-android
+            name: android-arm64
+          #- target: x86_64-pc-windows-gnu
+          #  name: windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.platform.target }}
+          components: rust-src
+      - name: Install Cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross.git --rev 15e610e --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
+      - name: Run Cross Build
+        run: |
+          cross build --release --target ${{ matrix.platform.target }}
+
+      - name: Package Artifacts
+        run: |
+          mkdir -p ./dist
+          mkdir -p ./pkg_dir
+          FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core"
+          
+          if [ -f "$FILE_PATH" ]; then
+            cp "$FILE_PATH" ./pkg_dir/
+          else
+            echo "Error: Failed to find artifacts $FILE_PATH"
+            exit 1
+          fi
+          
+          cd ./pkg_dir
+          zip -r ../dist/wuther-core-${{ matrix.platform.name }}.zip ./*
+          cd ..
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wuther-core-${{ matrix.platform.name }}
+          path: ./dist/*
+          archive: false
+          retention-days: 1
