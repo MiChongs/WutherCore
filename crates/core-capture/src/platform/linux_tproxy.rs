@@ -540,7 +540,7 @@ fn recvmsg_with_origdst(
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    hdr.msg_controllen = control.len() as libc::size_t;
+    hdr.msg_controllen = libc::size_t::from(control.len());
 
     // SAFETY: msghdr 字段全部初始化；recvmsg 写入 name/iov/control 不超过提供长度。
     let n = unsafe { libc::recvmsg(fd, &mut hdr, 0) };
