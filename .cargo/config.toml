@@ -18,11 +18,6 @@ rustflags = [
     "-C", "link-arg=/OPT:REF",
 ]
 
-[target.aarch64-linux-android]
-rustflags = [
-    "-C", "link-arg=-lunwind",
-]
-
 [net]
 # 用 git CLI 抓取 git deps，避免 libgit2 在 Windows 大仓上的卡顿
 git-fetch-with-cli = true
