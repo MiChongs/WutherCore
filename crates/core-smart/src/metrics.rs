@@ -1,5 +1,7 @@
-use std::collections::VecDeque;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use core_store::{HistoryEntry, NodeStatsBlob};
 use parking_lot::RwLock;

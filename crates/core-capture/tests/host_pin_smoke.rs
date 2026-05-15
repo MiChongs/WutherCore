@@ -1,7 +1,8 @@
 //! Smart NAT pinning：同 host 在 udp_timeout 内复用同一 outbound。
 
-use core_capture::nat::NatTable;
 use std::time::Duration;
+
+use core_capture::nat::NatTable;
 
 #[test]
 fn pin_and_lookup_host() {

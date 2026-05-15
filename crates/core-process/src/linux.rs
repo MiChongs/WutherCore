@@ -11,9 +11,11 @@
 //! 所以 Android 上这个 finder 返回 None 是预期行为；建议 Android 用户用
 //! `find-process-mode: off` 或单独走 `ConnectivityManager.getConnectionOwnerUid`。
 
-use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::{
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo};
 

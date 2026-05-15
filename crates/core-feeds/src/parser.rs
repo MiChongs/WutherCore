@@ -1,8 +1,10 @@
 //! 订阅格式解析 + 过滤/重命名。
 
 use base64::Engine;
-use core_config::model::FeedDetail;
-use core_config::node_uri::{NodeProtocol, ParsedNode, parse_uri};
+use core_config::{
+    model::FeedDetail,
+    node_uri::{NodeProtocol, ParsedNode, parse_uri},
+};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -371,9 +373,11 @@ pub fn apply_filter_rename(detail: &FeedDetail, mut nodes: Vec<ParsedNode>) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use core_config::model::{FeedDetail, FeedFilter, FeedRename};
     use std::time::Duration;
+
+    use core_config::model::{FeedDetail, FeedFilter, FeedRename};
+
+    use super::*;
 
     fn detail() -> FeedDetail {
         FeedDetail {

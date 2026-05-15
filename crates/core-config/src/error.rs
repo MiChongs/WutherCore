@@ -1,4 +1,5 @@
 use std::fmt;
+
 use thiserror::Error;
 
 /// 三段式 friendly 错误：错误描述 + 位置 + 修复建议。

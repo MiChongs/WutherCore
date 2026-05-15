@@ -17,20 +17,21 @@
 //! * 自动 keep-alive（每 25 秒 cookie reply 时刷新）
 //! * 多个 dial 共享同一 WG session
 
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    task::{Context, Poll, Waker},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
-use blake2::digest::Update as Blake2Update;
-use blake2::{Blake2s256, Digest as Blake2Digest};
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use curve25519_dalek::montgomery::MontgomeryPoint;
-use curve25519_dalek::scalar::Scalar;
+use blake2::{Blake2s256, Digest as Blake2Digest, digest::Update as Blake2Update};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
+use curve25519_dalek::{montgomery::MontgomeryPoint, scalar::Scalar};
 use parking_lot::Mutex as PlMutex;
 use rand::RngCore;
 use tokio::sync::Mutex as AsyncMutex;

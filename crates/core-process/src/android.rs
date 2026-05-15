@@ -37,15 +37,15 @@
 //! - 用 `getNameForUid` 而非 `getPackagesForUid`：单调用足够拿包名；返回
 //!   "package:uid" 形式时去掉冒号后缀。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
-use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
-use jni::{JNIEnv, JavaVM};
+use jni::{
+    JNIEnv, JavaVM,
+    objects::{GlobalRef, JByteArray, JObject, JString, JValue},
+};
 use once_cell::sync::OnceCell;
 
-use crate::linux::LinuxFinder;
-use crate::{NetworkProto, ProcessFinder, ProcessInfo};
+use crate::{NetworkProto, ProcessFinder, ProcessInfo, linux::LinuxFinder};
 
 /// `ConnectivityManager.getConnectionOwnerUid` 找不到时返回的 sentinel。
 const INVALID_UID: i32 = -1;

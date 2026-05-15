@@ -1,7 +1,6 @@
 //! DNS 上游抽象：所有具体实现（系统 / DoH / DoT / UDP / QUIC）都通过同一个 trait 接入 group。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use async_trait::async_trait;
 use hickory_resolver::proto::rr::{

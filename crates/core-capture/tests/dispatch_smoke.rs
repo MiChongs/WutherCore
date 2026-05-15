@@ -1,19 +1,16 @@
 //! TunDispatcher 构造性 / state 推断测试：仅验证可构造、handles 可优雅 stop。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use core_capture::eim_nat::EimNatTable;
-use core_capture::engine::CapturePlan;
-use core_capture::nat::NatTable;
-use core_capture::noop_ipset_provider;
-use core_capture::tun_dispatch::TunDispatcher;
+use core_capture::{
+    eim_nat::EimNatTable, engine::CapturePlan, nat::NatTable, noop_ipset_provider,
+    tun_dispatch::TunDispatcher,
+};
 use core_config::model::{
     Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
     TunInboundOptions,
 };
-use core_resolver::fake_ip::FakeIpConfig;
-use core_resolver::{DnsService, FakeIpPool};
+use core_resolver::{DnsService, FakeIpPool, fake_ip::FakeIpConfig};
 
 fn capture() -> Capture {
     Capture {

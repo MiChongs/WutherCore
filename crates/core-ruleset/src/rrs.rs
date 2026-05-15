@@ -48,8 +48,10 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::matcher::{ClassicalEntry, ClassicalKind};
-use crate::parser::ParseError;
+use crate::{
+    matcher::{ClassicalEntry, ClassicalKind},
+    parser::ParseError,
+};
 
 pub const MAGIC: [u8; 4] = *b"RRS\0";
 pub const VERSION: u16 = 1;

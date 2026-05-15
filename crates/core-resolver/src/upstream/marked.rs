@@ -6,14 +6,18 @@
 //! 解析超时或自循环。本模块用 `hickory_resolver::proto` 编解码 + 自建 marked
 //! socket 完成同样功能，与 mihomo `dns/client.go` 对齐。
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
-use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
-use hickory_resolver::proto::serialize::binary::BinDecodable;
+use hickory_resolver::proto::{
+    op::{Message, MessageType, OpCode, Query},
+    rr::{Name, RData, Record, RecordType},
+    serialize::binary::BinDecodable,
+};
 use tokio::net::UdpSocket;
 
 use super::{DnsError, DnsUpstream};

@@ -398,10 +398,14 @@ pub fn process_vnet_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{Ipv4Repr, Ipv6Repr, TcpControl, TcpRepr, TcpSeqNumber, UdpRepr};
     use std::net::Ipv6Addr;
+
+    use smoltcp::{
+        phy::ChecksumCapabilities,
+        wire::{Ipv4Repr, Ipv6Repr, TcpControl, TcpRepr, TcpSeqNumber, UdpRepr},
+    };
+
+    use super::*;
 
     /* ---------- 构造原始大段（IPv4+TCP）的辅助 ---------- */
 

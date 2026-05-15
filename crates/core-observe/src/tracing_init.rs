@@ -1,13 +1,16 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use tracing::field::{Field, Visit};
-use tracing::{Event, Subscriber};
+use tracing::{
+    Event, Subscriber,
+    field::{Field, Visit},
+};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::Context, prelude::*};
 
 use crate::log_bus::LogBus;
 

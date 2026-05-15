@@ -1,8 +1,10 @@
 //! Capture 引擎抽象 —— 平台无关协议契约。
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use core_config::model::{
@@ -440,11 +442,12 @@ pub fn is_excluded(plan: &CapturePlan, ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{
         Capture, CaptureExclude, CaptureResolver, TunHttpProxyOptions, TunInboundOptions,
         TunPlatformOptions,
     };
+
+    use super::*;
 
     fn base() -> Capture {
         Capture {

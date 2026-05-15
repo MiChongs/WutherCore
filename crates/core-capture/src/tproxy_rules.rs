@@ -406,8 +406,9 @@ fn push_bypass_rule(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{Capture, CaptureMethod};
+
+    use super::*;
 
     fn tproxy_plan() -> CapturePlan {
         let mut c = Capture::default();

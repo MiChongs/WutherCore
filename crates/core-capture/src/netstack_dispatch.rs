@@ -3,25 +3,28 @@
 //! 当 `stack: gvisor` 或 `stack: smoltcp` 时使用。TCP 由 netstack-smoltcp
 //! 的用户态 TCP 栈处理（TcpListener + TcpStream），UDP 复用现有 udp_handle 路径。
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use core_runtime::{ListenerHandler, Runtime};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::oneshot;
-use tokio::time::MissedTickBehavior;
+use tokio::{sync::oneshot, time::MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::eim_nat::EimNatTable;
-use crate::engine::CapturePlan;
-use crate::frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun};
-use crate::nat::NatTable;
-use crate::packet::parse_tun_frame;
-use crate::tun_inbound::{TunDropReason, TunInbound, TunPacket, build_inbound_metadata};
-use crate::tun_io::TunIo;
-use crate::tun_pump::{
-    PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
-    TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog,
+use crate::{
+    eim_nat::EimNatTable,
+    engine::CapturePlan,
+    frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun},
+    nat::NatTable,
+    packet::parse_tun_frame,
+    tun_inbound::{TunDropReason, TunInbound, TunPacket, build_inbound_metadata},
+    tun_io::TunIo,
+    tun_pump::{
+        PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
+        TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog,
+    },
 };
 
 pub struct NetstackDispatcher {

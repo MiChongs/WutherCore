@@ -4,19 +4,20 @@
 //! it parses a DNS request, applies fake-ip/enhanced-mode handling when a pool
 //! is attached, otherwise delegates A/AAAA lookups to the resolver policy flow.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use core_config::model::FakeMode;
 use tracing::{debug, trace};
 
-use crate::Resolver;
-use crate::cache::QType;
-use crate::fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool};
-use crate::mapping::IpHostMapping;
-use crate::packet::{
-    TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response, build_ip_response,
-    build_record_response, parse_first_question,
+use crate::{
+    Resolver,
+    cache::QType,
+    fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool},
+    mapping::IpHostMapping,
+    packet::{
+        TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response, build_ip_response,
+        build_record_response, parse_first_question,
+    },
 };
 
 #[derive(Clone)]
@@ -275,10 +276,12 @@ fn is_global_unicast(ip: std::net::IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::net::{IpAddr, SocketAddr};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use core_config::model::{FakeMode, Resolver as ResolverCfg, ResolverMode};

@@ -8,8 +8,10 @@
 //!
 //! Fake host 池在 supervisor 层另行持有；本表只缓存"曾经走过"的 host。
 
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 

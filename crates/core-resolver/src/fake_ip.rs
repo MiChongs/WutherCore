@@ -5,8 +5,10 @@
 //! * 回避：跳过 broadcast/network/保留地址；不覆盖 Tailnet/局域网。
 //! * 双栈：A 查询给 IPv4，AAAA 查询给 IPv6；用户可关闭其中一族。
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};

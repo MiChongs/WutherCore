@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::adapter::{BoxedStream, DialContext, OutboundAdapter};
-use crate::transport::Transport;
+use crate::{
+    adapter::{BoxedStream, DialContext, OutboundAdapter},
+    transport::Transport,
+};
 
 #[derive(Debug, Clone)]
 pub struct HttpOutbound {

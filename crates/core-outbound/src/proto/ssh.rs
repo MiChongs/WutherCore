@@ -18,8 +18,7 @@
 //! * **Channel 数限制**：通过 `russh::client::Config.maximum_channels`
 //! * **失败重连**：断线时下一个 dial 触发重新握手
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;

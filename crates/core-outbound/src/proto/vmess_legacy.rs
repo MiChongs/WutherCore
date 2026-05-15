@@ -29,10 +29,12 @@ use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::vmess::{VMESS_OPTION_CHUNK_STREAM, VmessSecurity, build_legacy_header_payload};
-use crate::transport::{
-    TlsOptions, Transport, WsOptions, tcp::TcpTransport, tls::TlsTransport, ws::WsTransport,
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    proto::vmess::{VMESS_OPTION_CHUNK_STREAM, VmessSecurity, build_legacy_header_payload},
+    transport::{
+        TlsOptions, Transport, WsOptions, tcp::TcpTransport, tls::TlsTransport, ws::WsTransport,
+    },
 };
 
 type HmacMd5 = Hmac<Md5>;

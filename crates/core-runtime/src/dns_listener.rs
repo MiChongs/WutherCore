@@ -13,14 +13,15 @@
 //! - **错误处理**：单个查询 / 连接失败只记 debug 日志；listener 本身只在
 //!   bind / accept 致命错误（端口被占用、socket 关闭）时退出。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use core_resolver::DnsService;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
@@ -233,14 +234,18 @@ async fn handle_tcp_conn(mut stream: TcpStream, service: Arc<DnsService>) -> std
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{
+        net::IpAddr,
+        sync::atomic::{AtomicU32, Ordering},
+    };
+
     use core_resolver::{
         DnsService, ResolverBuilder,
         group::{DnsGroup, GroupStrategy},
         upstream::{DnsError, DnsUpstream},
     };
-    use std::net::IpAddr;
-    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
 
     #[derive(Debug)]
     struct StaticUp {

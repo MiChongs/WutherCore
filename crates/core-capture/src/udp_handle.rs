@@ -10,22 +10,24 @@
 //!
 //! 与 mihomo / sing-tun 的语义对齐：fake-DNS 缺失直接 drop（不 fallback 系统 DNS）。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
 
 use core_resolver::DnsService;
 use core_runtime::ListenerHandler;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, mpsc::error::TrySendError};
 use tracing::{debug, info, trace, warn};
 
-use crate::frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun};
-use crate::nat::{NatEntry, NatTable};
-use crate::tun_inbound::{TunDropReason, TunInbound, build_inbound_metadata};
-use crate::tun_io::TunIo;
-use crate::udp_session::{PendingUdpSession, UDP_PENDING_QUEUE_CAPACITY};
+use crate::{
+    frame_cache::{TunFrameFormatCache, write_ip_packet_to_tun},
+    nat::{NatEntry, NatTable},
+    tun_inbound::{TunDropReason, TunInbound, build_inbound_metadata},
+    tun_io::TunIo,
+    udp_session::{PendingUdpSession, UDP_PENDING_QUEUE_CAPACITY},
+};
 
 /// 跨 dispatcher 的 UDP 派发上下文（克隆开销 = 几个 `Arc::clone`）。
 #[derive(Clone)]

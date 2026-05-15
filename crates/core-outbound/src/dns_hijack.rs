@@ -14,14 +14,18 @@
 //! - **无远端连接**：`dial_id` 仅用于日志；不打 SO_MARK，不走 TUN bypass，
 //!   不创建出站 socket。
 
-use std::collections::VecDeque;
-use std::pin::Pin;
-use std::sync::{Arc, RwLock};
-use std::task::{Context, Poll};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::{Arc, RwLock},
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Mutex, Notify, mpsc},
+};
 use tracing::debug;
 
 use crate::adapter::{
@@ -324,8 +328,9 @@ impl AsyncWrite for DnsTcpHijack {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     #[derive(Debug)]
     struct EchoLenResponder;

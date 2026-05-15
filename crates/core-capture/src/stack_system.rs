@@ -29,27 +29,34 @@
 //! - **3** DirectRouteMapping + Linux/Darwin batch I/O 适配。
 //! - **5** Android (VpnService) + iOS (NEPacketTunnelProvider) 冒烟。
 
-use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use core_observe::copy_bidirectional_tracked;
 use core_resolver::DnsService;
 use core_runtime::{ListenerHandler, PreparedTcp};
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{
-    Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address,
-    Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr,
-    TcpSeqNumber,
+use smoltcp::{
+    phy::ChecksumCapabilities,
+    wire::{
+        Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet, IpAddress, IpProtocol,
+        Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl,
+        TcpPacket, TcpRepr, TcpSeqNumber,
+    },
 };
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+};
 use tracing::{debug, info, warn};
 
-use crate::tcp_nat::{NatSession, TcpNat};
-use crate::tun_inbound::{TunInbound, build_inbound_metadata};
+use crate::{
+    tcp_nat::{NatSession, TcpNat},
+    tun_inbound::{TunInbound, build_inbound_metadata},
+};
 
 /// 包处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1123,9 +1130,12 @@ async fn handle_accepted_conn(
 
 #[cfg(test)]
 mod tests {
+    use smoltcp::{
+        phy::ChecksumCapabilities,
+        wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber},
+    };
+
     use super::*;
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
 
     fn build_v4_tcp(
         src_ip: Ipv4Addr,

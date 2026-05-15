@@ -1,19 +1,18 @@
 //! 规则集编排：拉取 → 解析 → 编译 → 推送给索引；后台周期刷新。
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::fetch::fetch_ruleset;
-use crate::format::detect_format;
-use crate::matcher::{RulesetIndex, RulesetMatcher};
-use crate::parser::parse_ruleset_compiled;
-use crate::spec::RulesetSpec;
+use crate::{
+    fetch::fetch_ruleset,
+    format::detect_format,
+    matcher::{RulesetIndex, RulesetMatcher},
+    parser::parse_ruleset_compiled,
+    spec::RulesetSpec,
+};
 
 #[derive(Debug, Clone)]
 pub struct RulesetUpdate {
@@ -241,8 +240,9 @@ fn safe_name(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[tokio::test]
     async fn inline_payload_compiles_immediately() {

@@ -9,8 +9,10 @@
 //! **SRS**：sing-box 二进制规则集，结构与 MRS 完全不同（gob-like + 自定义版本协议），
 //! 暂未实现。等上游 spec 稳定再补。
 
-use crate::matcher::ClassicalEntry;
-use crate::parser::{ParseError, mrs};
+use crate::{
+    matcher::ClassicalEntry,
+    parser::{ParseError, mrs},
+};
 
 /// 老 API：把 MRS 解析成 `Vec<ClassicalEntry>`。
 ///

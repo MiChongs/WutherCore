@@ -9,14 +9,16 @@
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha224};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::Mutex as AsyncMutex;
-
-use crate::adapter::{
-    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    sync::Mutex as AsyncMutex,
 };
-use crate::proto::addr::encode_socks_addr;
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+
+use crate::{
+    adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
+    proto::addr::encode_socks_addr,
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 const TROJAN_CMD_TCP: u8 = 0x01;
 const TROJAN_CMD_UDP: u8 = 0x03;

@@ -12,8 +12,10 @@
 //!   ...
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -142,8 +144,10 @@ fn safe_name(name: &str) -> String {
 
 /// 计算 url 的 8 位摘要 —— 仅用于 meta.url_hash 比对，不要求加密强度。
 pub fn url_digest(url: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
     let mut h = DefaultHasher::new();
     url.hash(&mut h);
     format!("{:016x}", h.finish())

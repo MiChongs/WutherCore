@@ -2,39 +2,41 @@
 //!
 //! 内置规则：direct / block 自动注册；其它协议按 [`NodeProtocol`] 选择。
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use core_config::node_uri::{NodeProtocol, ParsedNode};
 use uuid::Uuid;
 
-use crate::adapter::SharedOutbound;
-use crate::block::BlockOutbound;
-use crate::direct::DirectOutbound;
-use crate::dns_hijack::DnsHijackOutbound;
-use crate::http::HttpOutbound;
-use crate::proto::anytls::AnyTlsOutbound;
-use crate::proto::hysteria::HysteriaOutbound;
-use crate::proto::hysteria2::Hysteria2Outbound;
-use crate::proto::mieru::{MieruCipher, MieruOutbound};
-use crate::proto::shadowsocks::{ShadowsocksOutbound, SsCipher};
-use crate::proto::snell::{SnellCipher, SnellOutbound};
-use crate::proto::ss2022::{Ss22Cipher, Ss2022Outbound};
-use crate::proto::ssh::SshOutbound;
-use crate::proto::ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol};
-use crate::proto::sudoku::{AeadMethod as SudokuAead, SudokuOutbound};
-use crate::proto::trojan::TrojanOutbound;
-use crate::proto::trusttunnel::TrustTunnelOutbound;
-use crate::proto::tuic::TuicOutbound;
-use crate::proto::vless::VlessNetwork;
-use crate::proto::vless::VlessOutbound;
-use crate::proto::vmess::{VmessNetwork, VmessOutbound, VmessSecurity};
-use crate::proto::vmess_legacy::VmessLegacyOutbound;
-use crate::proto::wireguard::WireGuardOutbound;
-use crate::proto::xhttp::Config as XhttpConfig;
-use crate::socks5::Socks5Outbound;
-use crate::stub::StubOutbound;
-use crate::transport::{GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions};
+use crate::{
+    adapter::SharedOutbound,
+    block::BlockOutbound,
+    direct::DirectOutbound,
+    dns_hijack::DnsHijackOutbound,
+    http::HttpOutbound,
+    proto::{
+        anytls::AnyTlsOutbound,
+        hysteria::HysteriaOutbound,
+        hysteria2::Hysteria2Outbound,
+        mieru::{MieruCipher, MieruOutbound},
+        shadowsocks::{ShadowsocksOutbound, SsCipher},
+        snell::{SnellCipher, SnellOutbound},
+        ss2022::{Ss22Cipher, Ss2022Outbound},
+        ssh::SshOutbound,
+        ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol},
+        sudoku::{AeadMethod as SudokuAead, SudokuOutbound},
+        trojan::TrojanOutbound,
+        trusttunnel::TrustTunnelOutbound,
+        tuic::TuicOutbound,
+        vless::{VlessNetwork, VlessOutbound},
+        vmess::{VmessNetwork, VmessOutbound, VmessSecurity},
+        vmess_legacy::VmessLegacyOutbound,
+        wireguard::WireGuardOutbound,
+        xhttp::Config as XhttpConfig,
+    },
+    socks5::Socks5Outbound,
+    stub::StubOutbound,
+    transport::{GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions},
+};
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
 

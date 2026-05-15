@@ -10,8 +10,10 @@
 //!
 //! 与 mihomo / Clash / Quantumult 等绝大多数文本规则集互通。
 
-use crate::matcher::{ClassicalEntry, ClassicalKind};
-use crate::parser::ParseError;
+use crate::{
+    matcher::{ClassicalEntry, ClassicalKind},
+    parser::ParseError,
+};
 
 pub fn parse(body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
     let text = std::str::from_utf8(body).unwrap_or("");

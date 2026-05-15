@@ -31,8 +31,7 @@
 //! TTL 不能太长 —— 同一 (proto, ip, port) 在 10s 内可能被另一个进程重用（apps
 //! 关闭后 socket 进入 TIME_WAIT，30s 后端口可重用；mihomo 也用 ~10s）。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 pub mod cache;
 

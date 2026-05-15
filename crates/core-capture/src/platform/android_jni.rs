@@ -27,14 +27,20 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
-use std::os::fd::RawFd;
-use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    os::fd::RawFd,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::jstring;
-use jni::{JNIEnv, JavaVM};
+use jni::{
+    JNIEnv, JavaVM,
+    objects::{GlobalRef, JClass, JObject, JString, JValue},
+    sys::jstring,
+};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 

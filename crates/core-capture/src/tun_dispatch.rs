@@ -11,28 +11,33 @@
 //! supervisor 决定启用哪种模式：当 `stack ∈ {gvisor, smoltcp, mixed}`
 //! 时启用本派发，并把平台 engine 自带的轻量 emit loop 关掉避免重复。
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use core_runtime::{ListenerHandler, Runtime};
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::time::MissedTickBehavior;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Notify, mpsc, oneshot},
+    time::MissedTickBehavior,
+};
 use tracing::{debug, info, trace, warn};
 
-use crate::eim_nat::EimNatTable;
-use crate::engine::CapturePlan;
-use crate::frame_cache::{TunFrameFormatCache, write_ip_packets_to_tun_batch};
-use crate::nat::NatTable;
-use crate::packet::parse_tun_frame;
-use crate::stack::{AcceptedTcp, SharedStack, SpliceManager, UserSpaceStack};
-use crate::tun_inbound::{TunDropReason, TunInbound, TunPacket, build_inbound_metadata};
-use crate::tun_io::TunIo;
-
-use crate::tun_pump::{
-    PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
-    TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog as TunTrafficLogState,
+use crate::{
+    eim_nat::EimNatTable,
+    engine::CapturePlan,
+    frame_cache::{TunFrameFormatCache, write_ip_packets_to_tun_batch},
+    nat::NatTable,
+    packet::parse_tun_frame,
+    stack::{AcceptedTcp, SharedStack, SpliceManager, UserSpaceStack},
+    tun_inbound::{TunDropReason, TunInbound, TunPacket, build_inbound_metadata},
+    tun_io::TunIo,
+    tun_pump::{
+        PUMP_BATCH_N, TUN_FRAME_FORMAT_MAX_ENTRIES, TUN_FRAME_FORMAT_TTL, TUN_IDLE_LOG_INTERVAL,
+        TUN_TRAFFIC_SUMMARY_INTERVAL, TrafficLog as TunTrafficLogState,
+    },
 };
 
 pub struct TunDispatcher {

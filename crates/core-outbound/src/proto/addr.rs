@@ -2,8 +2,9 @@
 //!
 //! 三个协议都用同一种格式：ATYP(1) + ADDR(变长) + PORT(2 BE)。
 
-use bytes::BufMut;
 use std::io;
+
+use bytes::BufMut;
 
 #[derive(Debug, Clone)]
 pub enum Address<'a> {

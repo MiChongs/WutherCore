@@ -2,10 +2,12 @@
 
 use std::path::Path;
 
-use crate::error::{ConfigError, ConfigErrorKind, ConfigResult};
-use crate::model::*;
-use crate::profile::apply_defaults;
-use crate::runtime_plan::RuntimePlan;
+use crate::{
+    error::{ConfigError, ConfigErrorKind, ConfigResult},
+    model::*,
+    profile::apply_defaults,
+    runtime_plan::RuntimePlan,
+};
 
 /// 从字符串加载并完整编译。
 pub fn load_from_str(text: &str) -> ConfigResult<RuntimePlan> {

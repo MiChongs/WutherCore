@@ -1,9 +1,11 @@
 //! 集成测试：smoltcp 用户态栈与虚拟设备的端到端 happy-path。
 
 use core_capture::stack::{UserSpaceStack, VirtualTunDevice};
-use smoltcp::phy::{Device, RxToken, TxToken};
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{Ipv4Address, Ipv6Address};
+use smoltcp::{
+    phy::{Device, RxToken, TxToken},
+    time::Instant as SmolInstant,
+    wire::{Ipv4Address, Ipv6Address},
+};
 
 #[test]
 fn user_stack_can_be_polled_with_listener() {

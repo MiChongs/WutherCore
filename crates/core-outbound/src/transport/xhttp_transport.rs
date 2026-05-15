@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::adapter::BoxedStream;
-use crate::proto::xhttp::{Config as XhttpConfig, XhttpClient};
-use crate::transport::Transport;
+use crate::{
+    adapter::BoxedStream,
+    proto::xhttp::{Config as XhttpConfig, XhttpClient},
+    transport::Transport,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct XhttpOptions {

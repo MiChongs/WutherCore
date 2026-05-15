@@ -3,12 +3,13 @@
 //! Packet parsing, fake-ip allocation and response synthesis live in
 //! `core-resolver::DnsService`; capture only owns socket I/O.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use core_resolver::DnsService;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
+};
 use tracing::{debug, trace, warn};
 
 pub async fn run_fake_dns(bind: SocketAddr, service: Arc<DnsService>) -> std::io::Result<()> {

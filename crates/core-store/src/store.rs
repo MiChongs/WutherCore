@@ -1,15 +1,16 @@
 //! Store —— redb 数据库句柄 + 同步读写 API。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use redb::{Database, ReadableTable};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::blobs::*;
-use crate::schema::*;
+use crate::{blobs::*, schema::*};
 
 #[derive(Debug, Error)]
 pub enum StoreError {

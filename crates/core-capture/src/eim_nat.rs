@@ -12,9 +12,11 @@
 //! * value 持有一个 `Arc<UdpSocket>` —— 外部源回包共用；
 //! * 老化使用与 [`NatTable`] 相同的 `udp_timeout`。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use tokio::net::UdpSocket;

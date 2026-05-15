@@ -24,11 +24,13 @@ use bytes::BufMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::transport::{
-    GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
-    grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
-    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    transport::{
+        GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
+        grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
+        tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

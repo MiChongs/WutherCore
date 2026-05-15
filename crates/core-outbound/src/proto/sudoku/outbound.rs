@@ -8,19 +8,24 @@ use bytes::BufMut;
 use rand::Rng;
 use tokio::io::AsyncWriteExt;
 
-use super::conn::ObfsStream;
-use super::httpmask;
-use super::kip::{
-    KIP_FEAT_ALL, KIP_FEAT_OPEN_TCP, KIP_HELLO_NONCE_SIZE, KIP_HELLO_PUB_SIZE,
-    KIP_HELLO_USER_HASH_SIZE, KIP_TYPE_CLIENT_HELLO, KIP_TYPE_KEEPALIVE, KIP_TYPE_OPEN_TCP,
-    KIP_TYPE_SERVER_HELLO, KIPClientHello, KIPMessage, derive_psk_directional_bases,
-    derive_session_directional_bases, encode_kip_message, parse_kip_message, parse_server_hello,
-    random_nonce, random_x25519_priv, user_hash_from_key, x25519_pub, x25519_shared,
+use super::{
+    conn::ObfsStream,
+    httpmask,
+    kip::{
+        KIP_FEAT_ALL, KIP_FEAT_OPEN_TCP, KIP_HELLO_NONCE_SIZE, KIP_HELLO_PUB_SIZE,
+        KIP_HELLO_USER_HASH_SIZE, KIP_TYPE_CLIENT_HELLO, KIP_TYPE_KEEPALIVE, KIP_TYPE_OPEN_TCP,
+        KIP_TYPE_SERVER_HELLO, KIPClientHello, KIPMessage, derive_psk_directional_bases,
+        derive_session_directional_bases, encode_kip_message, parse_kip_message,
+        parse_server_hello, random_nonce, random_x25519_priv, user_hash_from_key, x25519_pub,
+        x25519_shared,
+    },
+    record::{AeadMethod, RecordCryptor, RecordStream},
+    table::Table,
 };
-use super::record::{AeadMethod, RecordCryptor, RecordStream};
-use super::table::Table;
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::transport::{Transport, tcp::TcpTransport};
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    transport::{Transport, tcp::TcpTransport},
+};
 
 #[derive(Debug, Clone)]
 pub struct SudokuConfig {

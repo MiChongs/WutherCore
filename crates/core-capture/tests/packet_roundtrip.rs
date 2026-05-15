@@ -5,10 +5,12 @@
 use core_capture::packet::{
     FrameFormat, IpVersion, L4, encode_tun_ip_frame, parse_ip_packet, parse_tun_frame,
 };
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{
-    IpAddress, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr, TcpControl,
-    TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+use smoltcp::{
+    phy::ChecksumCapabilities,
+    wire::{
+        IpAddress, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    },
 };
 
 fn build_v6_udp(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {

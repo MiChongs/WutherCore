@@ -10,23 +10,28 @@
 //!   IPv4-mapped 地址 .NET / 部分 app 会用 IPv6 socket 监听 dual-stack；这种
 //!   情况下 IPv4 表里查不到 (laddr=0.0.0.0)，会回退到 IPv6 表查 `::`。
 
-use std::ffi::OsString;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::windows::ffi::OsStringExt;
-use std::path::Path;
-use std::ptr;
+use std::{
+    ffi::OsString,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    os::windows::ffi::OsStringExt,
+    path::Path,
+    ptr,
+};
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE},
+    NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
+        MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    },
+    Networking::WinSock::{AF_INET, AF_INET6},
+    System::{
+        ProcessStatus::GetProcessImageFileNameW,
+        Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    },
 };
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
-    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
-};
-use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-use windows_sys::Win32::System::ProcessStatus::GetProcessImageFileNameW;
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo};
 

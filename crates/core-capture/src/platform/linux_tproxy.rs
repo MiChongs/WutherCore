@@ -18,22 +18,28 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use core_observe::ConnectionGuard;
 use core_outbound::adapter::BoxedUdp;
 use core_runtime::{InboundMetadata, ListenerHandler};
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::mpsc,
+};
 use tracing::{debug, info, warn};
 
-use crate::engine::{CaptureError, CaptureEvent};
-use crate::udp_session::UdpFlowKey;
+use crate::{
+    engine::{CaptureError, CaptureEvent},
+    udp_session::UdpFlowKey,
+};
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
 

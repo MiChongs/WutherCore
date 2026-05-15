@@ -5,8 +5,10 @@
 
 use std::net::IpAddr;
 
-use hickory_resolver::proto::rr::Record;
-use hickory_resolver::proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_resolver::proto::{
+    rr::Record,
+    serialize::binary::{BinEncodable, BinEncoder},
+};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;

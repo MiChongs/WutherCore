@@ -14,10 +14,12 @@
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
-use std::ffi::{CString, OsStr, c_void};
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::{
+    ffi::{CString, OsStr, c_void},
+    os::windows::ffi::OsStrExt,
+    path::Path,
+    sync::Arc,
+};
 
 use parking_lot::Mutex;
 

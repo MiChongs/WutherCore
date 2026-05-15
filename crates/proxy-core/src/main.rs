@@ -6,8 +6,7 @@
 //! * `explain <yaml>`：输出编译后的 RuntimePlan（JSON，便于排错）。
 //! * `migrate mihomo <old.yaml> -o <friendly.yaml>`：旧配置迁移。
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -15,9 +14,7 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_inbound::MixedListener;
-use core_inbound::ensure_best_effort_privilege;
-use core_inbound::run_mixed;
+use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
@@ -411,8 +408,9 @@ async fn cmd_feeds(action: FeedsCmd) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{Log, LogFile, LogFormat, LogLevel};
+
+    use super::*;
 
     #[test]
     fn user_log_config_maps_to_observe_tracing_config() {

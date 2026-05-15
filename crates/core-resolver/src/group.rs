@@ -5,14 +5,10 @@
 //! * **Fallback**：按顺序尝试，失败/空才到下一个。
 //! * **All**：等所有上游，结果 IP 取并集（去重）。
 
-use std::collections::HashSet;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
 
 use hickory_resolver::proto::rr::{Record, RecordType};
-use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::{task::JoinSet, time::timeout};
 
 use crate::upstream::{DnsError, DnsUpstream};
 
@@ -275,10 +271,12 @@ impl DnsGroup {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
     use crate::upstream::DnsUpstream;
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[derive(Debug)]
     struct StaticUpstream {

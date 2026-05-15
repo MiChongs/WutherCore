@@ -13,22 +13,24 @@
 //! 配置变更检测：`meta.url_hash` 与当前 url 不一致时强制重拉，避免用旧域名
 //! 的 cache 给新订阅。
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
-use core_config::model::FeedDetail;
-use core_config::node_uri::ParsedNode;
+use core_config::{model::FeedDetail, node_uri::ParsedNode};
 use parking_lot::RwLock;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 use tracing::{debug, info, warn};
 
-use crate::cache::{FeedDiskCache, FeedMeta, url_digest};
-use crate::fetcher::fetch_feed;
-use crate::parser::{FormatHint, apply_filter_rename, parse_feed_payload};
-use crate::userinfo::SubscriptionUserinfo;
+use crate::{
+    cache::{FeedDiskCache, FeedMeta, url_digest},
+    fetcher::fetch_feed,
+    parser::{FormatHint, apply_filter_rename, parse_feed_payload},
+    userinfo::SubscriptionUserinfo,
+};
 
 /// 一次刷新结果。
 #[derive(Debug, Clone)]
@@ -445,8 +447,9 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{FeedFilter, FeedRename};
+
+    use super::*;
 
     fn detail(url: &str, every_secs: u64) -> FeedDetail {
         FeedDetail {

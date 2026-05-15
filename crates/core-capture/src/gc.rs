@@ -6,16 +6,12 @@
 //!
 //! 周期与 supervisor 对齐：`max(udp_timeout / 2, 5s)`。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::{sync::oneshot, task::JoinHandle, time::MissedTickBehavior};
 use tracing::debug;
 
-use crate::tcp_nat::TcpNat;
-use crate::udp_session::UdpSessionTable;
+use crate::{tcp_nat::TcpNat, udp_session::UdpSessionTable};
 
 /// 计算 GC 周期：`max(udp_timeout/2, 5s)`，与 supervisor 一致。
 pub fn purge_period(udp_timeout: Duration) -> Duration {

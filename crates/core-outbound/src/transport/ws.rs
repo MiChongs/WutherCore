@@ -2,20 +2,24 @@
 //!
 //! 通过 tokio-tungstenite 完成 HTTP Upgrade，然后包装成 AsyncRead/AsyncWrite。
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest, http::HeaderValue, protocol::Message,
+};
 
-use crate::adapter::BoxedStream;
-use crate::transport::{Transport, WsOptions};
+use crate::{
+    adapter::BoxedStream,
+    transport::{Transport, WsOptions},
+};
 
 #[derive(Debug, Clone)]
 pub struct WsTransport {

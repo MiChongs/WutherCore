@@ -14,9 +14,7 @@
 //! 失败时记录 warning 但不中断（写路由失败常见于权限/接口尚未就绪），
 //! 撤销时尽力回滚（best-effort）。
 
-use std::net::IpAddr;
-use std::process::Command;
-use std::sync::Arc;
+use std::{net::IpAddr, process::Command, sync::Arc};
 
 use ipnet::IpNet;
 use parking_lot::Mutex;
@@ -342,8 +340,9 @@ fn is_expected_route_delete_absence(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     #[derive(Debug, Default)]
     struct FakeBackend {

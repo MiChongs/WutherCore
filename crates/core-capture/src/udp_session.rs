@@ -15,9 +15,11 @@
 //!    或 `recv_from` EOF 自然退出，`ConnectionGuard` drop 时自动从
 //!    `ConnectionTable` 移除（dashboard `/connections` 同步消失）。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use core_observe::ConnectionGuard;
 use core_outbound::adapter::BoxedUdp;

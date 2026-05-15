@@ -5,10 +5,11 @@
 //! facts into [`InboundMetadata`] and enter this handler through
 //! [`ListenerHandler::new_connection`] or [`ListenerHandler::new_packet`].
 
-use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, atomic::Ordering},
+};
 
 use compact_str::ToCompactString;
 use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};

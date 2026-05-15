@@ -3,9 +3,11 @@
 //! Resolves domains from system `/etc/hosts` (or Windows equivalent)
 //! and custom user-provided mappings before the DNS policy engine.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use crate::cache::QType;
 

@@ -30,8 +30,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-use std::collections::HashMap;
-use std::process::Command;
+use std::{collections::HashMap, process::Command};
 
 use tracing::{debug, info, warn};
 

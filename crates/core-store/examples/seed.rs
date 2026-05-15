@@ -1,5 +1,6 @@
-use core_store::{AsyncWriter, NodeStatsBlob, Store, store::BatchOp};
 use std::sync::Arc;
+
+use core_store::{AsyncWriter, NodeStatsBlob, Store, store::BatchOp};
 
 #[tokio::main]
 async fn main() {

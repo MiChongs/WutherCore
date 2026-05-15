@@ -47,6 +47,8 @@ pub use policy::{
 pub use resolver::{ResolveAnswer, ResolveError, Resolver, ResolverBuilder, ResolverConfigError};
 pub use service::DnsService;
 pub use singleflight::Singleflight;
-pub use upstream::hickory::{HickoryKind, HickoryUpstream};
-pub use upstream::system::SystemUpstream;
-pub use upstream::{DnsError, DnsUpstream, FilteredUpstream, UpstreamParams};
+pub use upstream::{
+    DnsError, DnsUpstream, FilteredUpstream, UpstreamParams,
+    hickory::{HickoryKind, HickoryUpstream},
+    system::SystemUpstream,
+};

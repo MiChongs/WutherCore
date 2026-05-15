@@ -12,8 +12,7 @@
 
 use thiserror::Error;
 
-use crate::format::RulesetFormat;
-use crate::matcher::ClassicalEntry;
+use crate::{format::RulesetFormat, matcher::ClassicalEntry};
 
 pub mod binary;
 pub mod mrs;

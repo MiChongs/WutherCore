@@ -59,14 +59,20 @@
 //!   Padding (GLOBAL_PADDING 启用): random_bytes(SHAKE128(req_iv).next2() % 64)
 //! ```
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use aes::Aes128;
-use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit};
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce};
+use aes::{
+    Aes128,
+    cipher::{BlockEncrypt, KeyInit as AesKeyInit},
+};
+use aes_gcm::{
+    Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -80,16 +86,18 @@ use sha3::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::vmess_kdf::{
-    KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN,
-    KDF_AEAD_RESP_HEADER_LEN_IV, KDF_AEAD_RESP_HEADER_LEN_KEY, KDF_AEAD_RESP_HEADER_PAYLOAD_IV,
-    KDF_AEAD_RESP_HEADER_PAYLOAD_KEY, KDF_AUTH_ID, kdf_n,
-};
-use crate::transport::{
-    GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
-    grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
-    tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    proto::vmess_kdf::{
+        KDF_AEAD_KEY, KDF_AEAD_KEY_LEN, KDF_AEAD_NONCE, KDF_AEAD_NONCE_LEN,
+        KDF_AEAD_RESP_HEADER_LEN_IV, KDF_AEAD_RESP_HEADER_LEN_KEY, KDF_AEAD_RESP_HEADER_PAYLOAD_IV,
+        KDF_AEAD_RESP_HEADER_PAYLOAD_KEY, KDF_AUTH_ID, kdf_n,
+    },
+    transport::{
+        GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
+        grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
+        tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+    },
 };
 
 pub const VMESS_OPTION_CHUNK_STREAM: u8 = 0x01;

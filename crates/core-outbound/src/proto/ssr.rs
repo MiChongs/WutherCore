@@ -31,14 +31,18 @@
 //! 本实现以 mihomo `transport/ssr` 为参照。auth_chain 系列的 RNG 算法
 //! 选取了 mihomo 默认实现（mt19937 64bit）。
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
-use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-use cfb_mode::{Decryptor as CfbDec, Encryptor as CfbEnc};
+use cfb_mode::{
+    Decryptor as CfbDec, Encryptor as CfbEnc,
+    cipher::{AsyncStreamCipher, KeyIvInit},
+};
 use ctr::cipher::StreamCipher as CtrStreamCipher;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
@@ -47,9 +51,11 @@ use rand::RngCore;
 use sha1::Sha1;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::addr::encode_socks_addr;
-use crate::transport::{Transport, tcp::TcpTransport};
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    proto::addr::encode_socks_addr,
+    transport::{Transport, tcp::TcpTransport},
+};
 
 type HmacMd5 = Hmac<Md5>;
 type HmacSha1 = Hmac<Sha1>;

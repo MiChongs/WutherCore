@@ -25,20 +25,23 @@
 //! * UserSpaceStack 通过 tokio::sync::Notify 实现"poll 时机"通知；
 //! * SpliceManager 跟踪每个 SocketHandle 的 outbound 任务，graceful close。
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, atomic::Ordering},
+};
 
 use parking_lot::Mutex;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv6Address,
+use smoltcp::{
+    iface::{Config, Interface, SocketHandle, SocketSet},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::tcp,
+    time::Instant as SmolInstant,
+    wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv6Address},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Notify,
+};
 use tracing::{info, warn};
 
 /* ============================================================

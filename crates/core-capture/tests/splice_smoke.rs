@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use core_capture::stack::{SpliceManager, UserSpaceStack};
 use parking_lot::Mutex;
-use smoltcp::socket::tcp;
-use smoltcp::wire::{Ipv4Address, Ipv6Address};
-use tokio::io::duplex;
-use tokio::sync::Notify;
+use smoltcp::{
+    socket::tcp,
+    wire::{Ipv4Address, Ipv6Address},
+};
+use tokio::{io::duplex, sync::Notify};
 
 #[tokio::test]
 async fn splice_manager_spawns_and_aborts() {

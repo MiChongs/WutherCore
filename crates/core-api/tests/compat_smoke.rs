@@ -1,10 +1,11 @@
 //! Clash 兼容层关键端点的 smoke 测试 —— 直接打 axum router 验证响应形状。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use core_api::native::NativeState;
 use core_config::loader::load_from_str;
 use core_observe::ConnectionMeta;

@@ -8,15 +8,18 @@
 //!
 //! 仅 `unsafe_open_utun` + `unsafe_read/write` 使用 unsafe；其它逻辑全在 safe 区。
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
+use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
-use crate::engine::CapturePlan;
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    engine::CapturePlan,
+    tun_io::{TunIo, TunIoError},
+};
 
 const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
 // _IOC(IOC_INOUT,'N',3,sizeof(struct ctl_info)) ↦ 0xC0644E03（macOS）

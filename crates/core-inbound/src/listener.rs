@@ -1,7 +1,9 @@
 //! 智能 TCP 监听 —— 特权端口降级 + share 模式选地址 + 端口冲突重试。
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::ops::RangeInclusive;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::RangeInclusive,
+};
 
 use core_config::model::Share;
 use tokio::net::TcpListener;
@@ -84,8 +86,9 @@ pub async fn bind_with_fallback(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::Share;
+
+    use super::*;
 
     #[test]
     fn select_bind_addr_share_modes() {

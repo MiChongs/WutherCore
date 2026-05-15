@@ -3,21 +3,21 @@
 //! Each middleware can short-circuit with a response or pass to the next layer.
 //! Order: IPv6Filter → Hosts → FakeIP → Mapping → Resolver.
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{net::IpAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, trace};
 
-use crate::Resolver;
-use crate::cache::QType;
-use crate::fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool};
-use crate::hosts::HostsTable;
-use crate::mapping::IpHostMapping;
-use crate::packet::{
-    DnsQuestion, TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response, build_ip_response,
-    parse_first_question,
+use crate::{
+    Resolver,
+    cache::QType,
+    fake_ip::{AddressFamily, FakeIpFilter, FakeIpPool},
+    hosts::HostsTable,
+    mapping::IpHostMapping,
+    packet::{
+        DnsQuestion, TYPE_A, TYPE_AAAA, TYPE_HTTPS, TYPE_SVCB, build_empty_response,
+        build_ip_response, parse_first_question,
+    },
 };
 
 pub enum MiddlewareResult {

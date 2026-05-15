@@ -19,8 +19,10 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
-use crate::android_caps::{AndroidCapability, AndroidTier};
-use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
+use crate::{
+    android_caps::{AndroidCapability, AndroidTier},
+    engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind},
+};
 
 pub fn list_interfaces() -> Vec<String> {
     // Android 没有 /sys/class/net 用户可读 —— 通过 ip 命令或 `getifaddrs`

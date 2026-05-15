@@ -273,8 +273,9 @@ fn prefix_sort_key(prefix: &AndroidIpPrefix) -> (u8, u128, u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{Capture, CaptureMethod, CaptureResolver};
+
+    use super::*;
 
     fn plan(mut capture: Capture) -> CapturePlan {
         capture.on = true;

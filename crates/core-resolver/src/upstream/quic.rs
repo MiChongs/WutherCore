@@ -4,9 +4,11 @@
 //! DNS message ID is set to 0 (RFC 9250 §4.2.1). Each query opens a new
 //! bidirectional stream with a 2-byte length prefix (same as DNS-over-TCP).
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
@@ -317,9 +319,11 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /* ---------- DNS Wire Format Helpers ---------- */
 
 fn build_dns_query(host: &str, record_type: RecordType) -> Result<Vec<u8>, DnsError> {
-    use hickory_resolver::proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_resolver::proto::rr::DNSClass;
-    use hickory_resolver::proto::serialize::binary::BinEncodable;
+    use hickory_resolver::proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::DNSClass,
+        serialize::binary::BinEncodable,
+    };
 
     let name = Name::from_ascii(host.trim_end_matches('.'))
         .map_err(|e| DnsError::Failed(format!("invalid domain: {e}")))?;
@@ -341,8 +345,7 @@ fn build_dns_query(host: &str, record_type: RecordType) -> Result<Vec<u8>, DnsEr
 }
 
 fn parse_dns_response(buf: &[u8], record_type: RecordType) -> Result<Vec<IpAddr>, DnsError> {
-    use hickory_resolver::proto::op::Message;
-    use hickory_resolver::proto::serialize::binary::BinDecodable;
+    use hickory_resolver::proto::{op::Message, serialize::binary::BinDecodable};
 
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 
@@ -371,8 +374,7 @@ fn parse_dns_records(
     _host: &str,
     _record_type: RecordType,
 ) -> Result<Vec<Record>, DnsError> {
-    use hickory_resolver::proto::op::Message;
-    use hickory_resolver::proto::serialize::binary::BinDecodable;
+    use hickory_resolver::proto::{op::Message, serialize::binary::BinDecodable};
 
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
 

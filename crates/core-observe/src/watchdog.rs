@@ -51,14 +51,18 @@
 //! });
 //! ```
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::panic;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    panic,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 /// Watchdog 配置。所有 path 父目录会按需创建。
 #[derive(Debug, Clone)]
@@ -387,8 +391,9 @@ fn dump_all_threads() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    use super::*;
 
     fn unique_temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

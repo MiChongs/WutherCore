@@ -25,8 +25,10 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
-use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    os::fd::RawFd,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use parking_lot::Mutex;
 

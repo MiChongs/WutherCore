@@ -26,17 +26,22 @@
 //! 仅 `unsafe_ioctl_tunsetiff` 局部使用 unsafe（`libc::ioctl` 调用 + `ifreq`
 //! 字段填充）。其它代码全在 safe 区域。
 
-use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::sync::Arc;
+use std::{
+    net::Ipv4Addr,
+    os::{
+        fd::{AsRawFd, OwnedFd, RawFd},
+        unix::fs::OpenOptionsExt,
+    },
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
-use crate::engine::CapturePlan;
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    engine::CapturePlan,
+    tun_io::{TunIo, TunIoError},
+};
 
 const IFF_TUN: i32 = 0x0001;
 const IFF_NO_PI: i32 = 0x1000;
@@ -73,10 +78,10 @@ const TCP_OFFLOAD: u32 = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
 /// UDP 段大段输出（与 sing-tun `tunUDPOffloads` 一致）；TCP 之上叠加。
 const UDP_OFFLOAD: u32 = TUN_F_USO4 | TUN_F_USO6;
 
-use crate::platform::gro_merge::{GroOutput, merge_for_linux_tun_batch};
-use crate::platform::gso_split::process_vnet_segment;
-use crate::platform::vnet_hdr::{
-    VIRTIO_NET_HDR_LEN, ZERO_VNET_HDR, encode_vnet_hdr_bytes, strip_vnet_hdr,
+use crate::platform::{
+    gro_merge::{GroOutput, merge_for_linux_tun_batch},
+    gso_split::process_vnet_segment,
+    vnet_hdr::{VIRTIO_NET_HDR_LEN, ZERO_VNET_HDR, encode_vnet_hdr_bytes, strip_vnet_hdr},
 };
 
 #[repr(C)]

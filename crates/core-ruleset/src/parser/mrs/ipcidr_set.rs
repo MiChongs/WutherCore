@@ -16,9 +16,11 @@
 //! mihomo 用 `go4.org/netipx.IPSet`（内部就是排好序的 IpRange 列表，二分查找）。
 //! 我们直接照搬：把 v4 / v6 拆两个 Vec<(start,end)>，按 start 排序后二分。
 
-use std::cmp::Ordering;
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    cmp::Ordering,
+    io::Read,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use crate::parser::ParseError;
 

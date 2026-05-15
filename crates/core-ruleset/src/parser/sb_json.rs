@@ -24,8 +24,10 @@
 
 use serde::Deserialize;
 
-use crate::matcher::{ClassicalEntry, ClassicalKind};
-use crate::parser::ParseError;
+use crate::{
+    matcher::{ClassicalEntry, ClassicalKind},
+    parser::ParseError,
+};
 
 #[derive(Deserialize)]
 struct Doc {

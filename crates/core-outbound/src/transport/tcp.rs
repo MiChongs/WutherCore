@@ -5,12 +5,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::adapter::{
-    BoxedStream, apply_outbound_mark_for_addr, protect_socket, resolve_host,
-    resolve_host_for_direct,
+use crate::{
+    adapter::{
+        BoxedStream, apply_outbound_mark_for_addr, protect_socket, resolve_host,
+        resolve_host_for_direct,
+    },
+    loopback::TrackedTcpStream,
+    transport::Transport,
 };
-use crate::loopback::TrackedTcpStream;
-use crate::transport::Transport;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TcpTransport {

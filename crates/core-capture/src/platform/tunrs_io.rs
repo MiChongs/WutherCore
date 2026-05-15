@@ -8,14 +8,18 @@
 //! - I/O 错误：`WARN capture::tunrs` — 读写失败时的错误详情
 //! - 流量统计：不在此层——由上层 `TunPump::TrafficLog` 周期汇总
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::engine::CapturePlan;
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    engine::CapturePlan,
+    tun_io::{TunIo, TunIoError},
+};
 
 /// tun-rs I/O 统计（原子计数，无锁）
 struct IoStats {

@@ -54,25 +54,35 @@
 //! * 连接池（最大连接数 + 最小/最大 stream 数）
 //! * 自动重连 + IdleTimeout
 
-use std::future::Future;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use http_body_util::{BodyExt, StreamBody};
-use hyper::body::{Body, Frame, Incoming};
-use hyper::{Method, Request, Uri};
+use hyper::{
+    Method, Request, Uri,
+    body::{Body, Frame, Incoming},
+};
 use parking_lot::Mutex as PlMutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Mutex as AsyncMutex, mpsc},
+};
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 const MAGIC_UDP: &str = "_udp2";
 const MAGIC_ICMP: &str = "_icmp";
@@ -612,8 +622,9 @@ fn io_err<S: Into<String>>(s: S) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::*;
 
     #[test]
     fn basic_auth_format() {

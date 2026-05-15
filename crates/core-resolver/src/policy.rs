@@ -21,9 +21,11 @@
 //! * Reject / Accept / Direct / Proxy / Fake / Route / Respond —— **terminal**
 //! * Evaluate —— **non-terminal**，把上下文 saved response 更新后继续
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use ipnet::IpNet;

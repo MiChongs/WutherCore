@@ -41,27 +41,28 @@
 //!   POST   /upgrade/ui                      Dashboard 升级占位
 //! ```
 
-use std::convert::Infallible;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use axum::extract::{
-    Path, Query, State,
-    ws::{Message, WebSocket, WebSocketUpgrade},
+use axum::{
+    Json, Router,
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode},
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
+    routing::{delete, get, post},
 };
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::response::sse::{Event, Sse};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
 use bytes::Bytes;
 use core_runtime::Runtime;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::compat_security::WsConnectionLimiter;
-use crate::native::NativeState;
+use crate::{compat_security::WsConnectionLimiter, native::NativeState};
 
 /// 单 dashboard 实例同时打开的 WS 数量上限 —— 5 个端点（traffic / memory /
 /// logs / connections / +1 留用）× 50 个 dashboard = 250。再保守 ×2 = 500。
@@ -275,8 +276,7 @@ fn log_event_stream(
     s: NativeState,
     level_filter: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
     // 与 WS 路径同因——保持 snapshot/subscribe 原子化避免事件双发。
     let (snapshot, rx) = s.runtime.logs.subscribe_with_history();

@@ -7,11 +7,13 @@
 use base64::Engine;
 use http::{HeaderName, HeaderValue, Request as HttpRequest};
 
-use super::config::{
-    Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_PATH,
-    PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER, Range,
+use super::{
+    config::{
+        Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_PATH,
+        PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER, Range,
+    },
+    xpadding::{PaddingMethod, XPaddingConfig, XPaddingPlacement, generate_padding},
 };
-use super::xpadding::{PaddingMethod, XPaddingConfig, XPaddingPlacement, generate_padding};
 
 pub struct PreparedRequest {
     pub method: String,

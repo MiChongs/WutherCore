@@ -29,10 +29,14 @@
 //!   从表里 remove。这样即使 splice 任务还在 select! 里等数据，也能立刻收到
 //!   取消信号开始 shutdown，而不是只在表里消失却继续传字节。
 
-use std::collections::{BTreeSet, HashMap};
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU64, Ordering},
+    },
+};
 
 use compact_str::{CompactString, ToCompactString};
 use dashmap::DashMap;

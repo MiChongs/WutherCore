@@ -191,8 +191,9 @@ impl TunIo for NoopTun {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use parking_lot::Mutex;
+
+    use super::*;
 
     #[tokio::test]
     async fn noop_tun_close_is_ok() {

@@ -8,11 +8,12 @@
 //!
 //! 这样保证：写热路径只有一次原子入队（mpsc），数据库提交批量化。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use tokio::sync::{Notify, mpsc};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use tracing::{debug, warn};
 
 use crate::store::{BatchOp, Store};
@@ -128,8 +129,7 @@ fn flush(store: &Arc<Store>, buffer: &mut Vec<BatchOp>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blobs::NodeStatsBlob;
-    use crate::store::Store;
+    use crate::{blobs::NodeStatsBlob, store::Store};
 
     #[tokio::test]
     async fn enqueue_and_flush_persists() {

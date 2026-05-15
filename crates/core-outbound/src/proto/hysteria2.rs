@@ -21,16 +21,17 @@
 //! * Salamander obfs（自定义 AsyncUdpSocket 包装）
 //! * 自动 keep-alive（quinn 内置）
 
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use blake2::digest::{Update, VariableOutput};
 use bytes::Bytes;
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 

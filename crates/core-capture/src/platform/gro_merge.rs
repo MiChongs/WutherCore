@@ -613,13 +613,17 @@ fn coalesce_udp(item: &mut UdpGroItem, pkt: &[u8], parsed: &ParsedUdpIp) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{
-        IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet,
-        Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
-    };
     use std::net::Ipv6Addr;
+
+    use smoltcp::{
+        phy::ChecksumCapabilities,
+        wire::{
+            IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet,
+            Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+        },
+    };
+
+    use super::*;
 
     fn build_v4_tcp(
         src_port: u16,

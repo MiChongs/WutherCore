@@ -1,5 +1,7 @@
-use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::{
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -778,11 +780,12 @@ async fn resolve_host_internal(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::direct::DirectOutbound;
-    use crate::transport::tcp::marked_connect;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::{direct::DirectOutbound, transport::tcp::marked_connect};
 
     static TEST_PROTECTOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

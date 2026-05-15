@@ -7,15 +7,15 @@
 //! 这里产出的结构是给 `core-runtime` / `core-route` / `core-outbound`
 //! 共同消费的 *已展开* 数据，而非 YAML 原貌。
 
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ConfigError, ConfigResult};
-use crate::model::*;
-use crate::node_uri::{NodeProtocol, ParsedNode, parse_uri};
+use crate::{
+    error::{ConfigError, ConfigResult},
+    model::*,
+    node_uri::{NodeProtocol, ParsedNode, parse_uri},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePlan {

@@ -27,13 +27,11 @@
 //! * UDP relay（datagram + stream 双模式）
 //! * 可选 obfs
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::BufMut;
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 

@@ -29,10 +29,14 @@
 //! 8. **`?token=` 限定**（在 server.rs 调用处实现）：除 WS upgrade 请求外，
 //!    `?token=` 不再被接受（防止凭证写入 access log / Referer）。
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,

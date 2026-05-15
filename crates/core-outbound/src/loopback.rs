@@ -7,11 +7,13 @@
 //! loopback detector: register outbound local endpoints, then reject inbound
 //! metadata whose source endpoint matches those records.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
-use std::sync::OnceLock;
-use std::task::{Context, Poll};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::OnceLock,
+    task::{Context, Poll},
+};
 
 use parking_lot::Mutex;
 use pin_project_lite::pin_project;

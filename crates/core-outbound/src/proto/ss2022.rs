@@ -38,12 +38,16 @@
 //! [AEAD(length)] [AEAD(payload)] ...
 //! ```
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use aes_gcm::{
+    Aes128Gcm, Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -51,9 +55,11 @@ use pin_project_lite::pin_project;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::addr::encode_socks_addr;
-use crate::transport::{Transport, tcp::TcpTransport};
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    proto::addr::encode_socks_addr,
+    transport::{Transport, tcp::TcpTransport},
+};
 
 const PAYLOAD_MAX: usize = 0xffff;
 /// timestamp 漂移容差（秒）—— 与 mihomo 保持一致

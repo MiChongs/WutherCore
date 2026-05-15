@@ -1,6 +1,7 @@
-use std::net::SocketAddr;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use core_route::RouteDecision;
 use core_runtime::{InboundMetadata, ListenerHandler, Runtime};

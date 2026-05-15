@@ -1,20 +1,23 @@
 //! SOCKS5 出站 —— TCP CONNECT + UDP ASSOCIATE，支持 user/pass 认证。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
+    sync::Mutex as AsyncMutex,
+};
 use tracing::{debug, info};
 
-use crate::adapter::{
-    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
-    prepare_outbound_udp_socket_for_addr, resolve_host,
+use crate::{
+    adapter::{
+        BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+        prepare_outbound_udp_socket_for_addr, resolve_host,
+    },
+    proto::addr::{decode_socks_addr, encode_socks_addr},
+    transport::Transport,
 };
-use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
-use crate::transport::Transport;
 
 #[derive(Debug, Clone)]
 pub struct Socks5Outbound {
@@ -302,10 +305,13 @@ impl UdpSocketLike for Socks5Udp {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+    };
+
     use super::*;
     use crate::adapter::OutboundAdapter;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
 
     #[test]
     fn socks5_udp_capability_is_declared_when_enabled() {

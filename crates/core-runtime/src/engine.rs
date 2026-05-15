@@ -1,13 +1,17 @@
 //! Runtime —— 启动 + 持有所有运行时组件 + 提供 dispatch 接口。
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    sync::Arc,
+    time::Instant,
+};
 
-use core_config::model::{ChooseStrategy, FeedDetail};
-use core_config::node_uri::ParsedNode;
-use core_config::runtime_plan::RuntimePlan;
+use core_config::{
+    model::{ChooseStrategy, FeedDetail},
+    node_uri::ParsedNode,
+    runtime_plan::RuntimePlan,
+};
 use core_observe::{ConnectionTable, Metrics};
 use core_outbound::{
     adapter::{DialContext, SharedOutbound},
@@ -987,9 +991,11 @@ impl Runtime {
 /// 同一个 outbound label 的 "UDP unsupported" 警告每分钟最多 1 次，避免高 QPS UDP
 /// 流量（QUIC/STUN）每包 warn 把日志刷爆。
 fn warn_udp_unsupported_once(label: &str) {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        sync::OnceLock,
+        time::{Duration, Instant},
+    };
     static LAST: OnceLock<parking_lot::Mutex<HashMap<String, Instant>>> = OnceLock::new();
     let map = LAST.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let now = Instant::now();
@@ -1327,11 +1333,13 @@ impl core_resolver::upstream::marked::DnsSocketFactory for OutboundDnsSocketFact
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::IpAddr;
+
     use async_trait::async_trait;
     use core_outbound::DialResolver;
     use core_resolver::{DnsError, DnsGroup, DnsUpstream, GroupStrategy, QType, ResolverBuilder};
-    use std::net::IpAddr;
+
+    use super::*;
 
     #[derive(Debug)]
     struct StaticDnsUpstream {

@@ -20,25 +20,29 @@
 //! * **memory safe**：100% 安全 Rust（unsafe-free），仅依赖 `tokio_rustls` 完成
 //!   TLS。`tokio::sync::Semaphore` 限并发，避免压垮上游。
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use core_outbound::adapter::{BoxedStream, DialContext};
 use parking_lot::{Mutex, RwLock};
-use rustls::ClientConfig;
-use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, pki_types::ServerName};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Semaphore,
+    task::JoinSet,
+    time::timeout,
+};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
-use crate::engine::Runtime;
-use crate::int_ranges::IntRanges;
+use crate::{engine::Runtime, int_ranges::IntRanges};
 
 /// `LastDelayForTestUrl` 死节点返回值；与 mihomo `0xFFFF` 等价语义但宽度扩为 u32。
 pub const DEAD_DELAY: u32 = u32::MAX;

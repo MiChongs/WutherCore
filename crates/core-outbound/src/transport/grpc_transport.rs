@@ -8,20 +8,26 @@
 //!    - flag=0：普通帧
 //! 5. 双向都按这个 frame 格式 read/write
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderName, HeaderValue, Request as HttpRequest};
 use hyper::body::{Body as HyperBody, Frame, Incoming};
 use parking_lot::Mutex as PlMutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Mutex as AsyncMutex, mpsc},
+};
 
-use crate::adapter::BoxedStream;
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+use crate::{
+    adapter::BoxedStream,
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct GrpcOptions {

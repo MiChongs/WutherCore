@@ -13,13 +13,17 @@
 //! * `aes-256-gcm`             —— 32B key, 32B salt, 12B nonce
 //! * `chacha20-ietf-poly1305`  —— 32B key, 32B salt, 12B nonce
 
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use aes_gcm::{
+    Aes128Gcm, Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -30,15 +34,19 @@ use rand::RngCore;
 use sha1::Sha1;
 #[allow(unused_imports)]
 use sha2 as _;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::UdpSocket;
-
-use crate::adapter::{
-    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
-    prepare_outbound_udp_socket, resolve_host,
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::UdpSocket,
 };
-use crate::proto::addr::{decode_socks_addr, encode_socks_addr};
-use crate::transport::{Transport, tcp::TcpTransport};
+
+use crate::{
+    adapter::{
+        BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+        prepare_outbound_udp_socket, resolve_host,
+    },
+    proto::addr::{decode_socks_addr, encode_socks_addr},
+    transport::{Transport, tcp::TcpTransport},
+};
 
 const PAYLOAD_MAX: usize = 0x3fff;
 
@@ -556,8 +564,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_send_encrypts_socks_address_and_payload() {
-        use crate::adapter::OutboundAdapter;
         use tokio::net::UdpSocket;
+
+        use crate::adapter::OutboundAdapter;
 
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();

@@ -19,11 +19,15 @@
 //! * 运行时缓存写入立刻 enqueue 到 [`AsyncWriter`]，200ms / 256 项触发批量提交；
 //! * shutdown 时 [`Resolver::flush_to_store`] 整体快照 + 等待 writer 落盘。
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use core_config::model::{
     FakeMode, Resolver as ResolverCfg, ResolverFallbackFilter as ResolverFallbackFilterCfg,
@@ -34,14 +38,16 @@ use hickory_resolver::proto::rr::{Record, RecordType};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::cache::{CacheConfig, DnsCache, Hit, QType};
-use crate::fake_ip::{AddressFamily, FakeIpPool};
-use crate::group::{DnsGroup, GroupStrategy};
-use crate::policy::{
-    DnsAction, EvalContext, HostMatch, PolicyEngine, QueryOptions, RejectMethod, matches,
-    parse_rule_value,
+use crate::{
+    cache::{CacheConfig, DnsCache, Hit, QType},
+    fake_ip::{AddressFamily, FakeIpPool},
+    group::{DnsGroup, GroupStrategy},
+    policy::{
+        DnsAction, EvalContext, HostMatch, PolicyEngine, QueryOptions, RejectMethod, matches,
+        parse_rule_value,
+    },
+    upstream::DnsError,
 };
-use crate::upstream::DnsError;
 
 #[derive(Debug, Error)]
 pub enum ResolveError {
@@ -2240,12 +2246,12 @@ impl TryFrom<&str> for IpNetOrAddr {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::group::GroupStrategy;
-    use crate::policy::HostMatch;
-    use crate::upstream::DnsUpstream;
-    use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::{group::GroupStrategy, policy::HostMatch, upstream::DnsUpstream};
 
     #[derive(Debug)]
     struct CountingUp {

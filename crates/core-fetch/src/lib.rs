@@ -18,9 +18,7 @@
 //! 不实现：HTTP/2、cookies、连接池（per-request 临时连接已够用，订阅 /
 //! 规则集是低频拉取）、proxy。
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, header};
@@ -326,8 +324,9 @@ fn decode_body(raw: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, FetchError
 /// 4. 把裸 socket 交给 tokio TcpStream，等 WRITABLE 就绪
 /// 5. 检 SO_ERROR 区分"连上了"与"被拒"
 async fn connect_tcp_outbound_bound(peer: std::net::SocketAddr) -> std::io::Result<TcpStream> {
-    use socket2::SockAddr;
     use std::io::ErrorKind;
+
+    use socket2::SockAddr;
     use tokio::io::Interest;
 
     let domain = if peer.is_ipv4() {

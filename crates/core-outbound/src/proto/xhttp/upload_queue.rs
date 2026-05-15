@@ -10,9 +10,7 @@
 //! * `read(buf)` 按 seq 顺序输出字节
 //! * 若队列超过 `max_packets` 视为重组缓冲过大，断开
 
-use std::collections::BTreeMap;
-use std::io;
-use std::sync::Arc;
+use std::{collections::BTreeMap, io, sync::Arc};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -108,8 +106,9 @@ impl UploadQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::thread;
+
+    use super::*;
 
     #[test]
     fn push_pop_in_order() {

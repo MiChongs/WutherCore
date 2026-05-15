@@ -34,9 +34,11 @@
 //!   (Android shortcut: app GID == app UID for UIDs ≥ 10000)
 //! - **Package**: `/data/system/packages.list` on Android, empty on Linux
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
+};
 
 use parking_lot::RwLock;
 use tracing::{debug, trace};
@@ -438,8 +440,9 @@ fn load_android_packages() -> HashMap<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn ip_matches_hex_v4() {

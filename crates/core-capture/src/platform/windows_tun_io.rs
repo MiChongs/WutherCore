@@ -23,8 +23,10 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 use super::wintun_abi::{Wintun, WintunSession};
-use crate::engine::CapturePlan;
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    engine::CapturePlan,
+    tun_io::{TunIo, TunIoError},
+};
 
 const RECV_QUEUE: usize = 2048;
 const WRITE_RETRY_BACKOFF_US: u64 = 200;

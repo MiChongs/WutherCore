@@ -24,8 +24,7 @@
 
 use std::time::Duration;
 
-use crate::default_iface::ExcludeList;
-use crate::net_monitor::global;
+use crate::{default_iface::ExcludeList, net_monitor::global};
 
 /// 100ms 去抖 —— 网络切换时一波路由 / 接口事件风暴（add / del / link up /
 /// link down 等），合并成一次 probe。
@@ -63,17 +62,20 @@ pub fn start(exclude: ExcludeList) {
 ============================================================ */
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::*;
-    use std::ffi::c_void;
-    use std::sync::Arc;
+    use std::{ffi::c_void, sync::Arc};
+
     use tokio::sync::Notify;
     use tracing::{info, warn};
-    use windows_sys::Win32::Foundation::{HANDLE, NO_ERROR};
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
-        NotifyRouteChange2,
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, NO_ERROR},
+        NetworkManagement::IpHelper::{
+            MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+            NotifyIpInterfaceChange, NotifyRouteChange2,
+        },
+        Networking::WinSock::AF_UNSPEC,
     };
-    use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
+
+    use super::*;
 
     pub fn start(exclude: ExcludeList) {
         let notify = Arc::new(Notify::new());
@@ -152,12 +154,12 @@ mod windows_impl {
 ============================================================ */
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux_impl {
-    use super::*;
-    use std::os::fd::AsRawFd;
-    use std::sync::Arc;
-    use tokio::io::unix::AsyncFd;
-    use tokio::sync::Notify;
+    use std::{os::fd::AsRawFd, sync::Arc};
+
+    use tokio::{io::unix::AsyncFd, sync::Notify};
     use tracing::{info, warn};
+
+    use super::*;
 
     pub fn start(exclude: ExcludeList) {
         let notify = Arc::new(Notify::new());
@@ -253,12 +255,15 @@ mod linux_impl {
 ============================================================ */
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod darwin_impl {
-    use super::*;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::sync::Arc;
-    use tokio::io::unix::AsyncFd;
-    use tokio::sync::Notify;
+    use std::{
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        sync::Arc,
+    };
+
+    use tokio::{io::unix::AsyncFd, sync::Notify};
     use tracing::{info, warn};
+
+    use super::*;
 
     pub fn start(exclude: ExcludeList) {
         let notify = Arc::new(Notify::new());

@@ -8,14 +8,14 @@
 //! 2. 交给 [`core_runtime::ListenerHandler`] 做规则路由、出站拨号与连接管理；
 //! 3. 双向 splice 转发字节。
 
-use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{io, net::SocketAddr, sync::Arc};
 
 use base64::Engine;
 use core_runtime::{InboundMetadata, ListenerHandler, Runtime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+};
 use tracing::{debug, info};
 
 #[derive(Debug, Clone)]

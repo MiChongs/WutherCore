@@ -17,12 +17,18 @@
 //!     copy_bidirectional_counted(&mut inbound, &mut outbound, up, down, cancel, metrics).await?;
 //! ```
 
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::Notify,
+};
 
 use crate::{ConnectionAccounting, Metrics};
 
@@ -217,8 +223,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     /// rustls 在 peer 关 TCP 不发 close_notify 时返回 `UnexpectedEof`；
     /// 该错误必须被归类为 clean EOF，否则 relay 层会 `warn!` 一条假错误。

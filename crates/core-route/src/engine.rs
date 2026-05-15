@@ -3,8 +3,7 @@
 //! 输入：[`FlowContext`] —— 一次连接的目标（域名/IP/端口/网络/进程）。
 //! 输出：[`RouteDecision`] —— direct / block / group("xxx")。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
 use core_ruleset::RulesetIndex;
@@ -276,8 +275,9 @@ fn match_cidr(ctx: &FlowContext, cidr: &str, extra: &[IpNet]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::runtime_plan::{RoutePlan, RouteStep};
+
+    use super::*;
 
     fn plan_cn_smart() -> RoutePlan {
         let mut p = RoutePlan {

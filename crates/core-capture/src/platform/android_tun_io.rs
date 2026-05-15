@@ -7,17 +7,19 @@
 //!    `OwnedFd` + `AsyncFd`，无需 root。
 //! 3. 都不可用：返回 `Unsupported`。
 
+#[cfg(target_os = "android")]
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 #[cfg(target_os = "android")]
 use parking_lot::Mutex;
 #[cfg(target_os = "android")]
-use std::os::fd::RawFd;
-#[cfg(target_os = "android")]
 use tracing::{info, warn};
 
-use crate::engine::CapturePlan;
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    engine::CapturePlan,
+    tun_io::{TunIo, TunIoError},
+};
 
 #[cfg(target_os = "android")]
 static INJECTED_FD: Mutex<Option<RawFd>> = Mutex::new(None);

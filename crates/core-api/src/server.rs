@@ -25,8 +25,7 @@
 //! * **WebSocket 用 `?token=`**：浏览器 WS 不能带自定义 Authorization 头。
 //! * **OPTIONS 永不要 secret**：否则浏览器吃 401，到不了 CORS 层。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -36,18 +35,20 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use core_runtime::Runtime;
+use core_runtime::{Runtime, UrlTester};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use crate::compat_security::{
-    IpRateLimiter, body_limit_layer, build_cors, constant_time_eq, is_sse_request,
-    is_websocket_upgrade, request_timeout, security_headers,
+use crate::{
+    compat,
+    compat_security::{
+        IpRateLimiter, body_limit_layer, build_cors, constant_time_eq, is_sse_request,
+        is_websocket_upgrade, request_timeout, security_headers,
+    },
+    compat_ws::WsHubs,
+    native::NativeState,
 };
-use crate::compat_ws::WsHubs;
-use crate::{compat, native::NativeState};
-use core_runtime::UrlTester;
 
 pub struct ApiServer {
     pub addr: SocketAddr,

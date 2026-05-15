@@ -26,8 +26,10 @@
 //! `utun*` / `tun*` / `wintun*` / `WutherCore` / `Meta` 一律剔除，
 //! 避免 TUN 抢了默认路由后再探拿到自己 → 自循环。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;

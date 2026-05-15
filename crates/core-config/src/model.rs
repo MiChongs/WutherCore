@@ -3,8 +3,7 @@
 //! 所有 field 默认值通过 [`profile::Profile::apply_defaults`] 注入，
 //! 模型本身只负责"原样反序列化 + 短写法/长写法兼容"。
 
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 

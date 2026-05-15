@@ -16,10 +16,14 @@
 //!   实现用 `parking_lot::RwLock<BTreeMap>` 保留 last_used 索引。
 //! * **泛型 Key**：`(host, qtype)` 组合 key，支持 A / AAAA / 双栈分桶。
 
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;

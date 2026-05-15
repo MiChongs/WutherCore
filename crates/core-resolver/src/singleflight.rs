@@ -3,9 +3,7 @@
 //! When multiple tasks request the same (host, qtype) simultaneously on a cache miss,
 //! only one actual upstream query executes; the others await its result.
 
-use std::future::Future;
-use std::hash::Hash;
-use std::sync::Arc;
+use std::{future::Future, hash::Hash, sync::Arc};
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -100,10 +98,13 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> Default for Singleflight<K> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::IpAddr,
+        sync::atomic::{AtomicU32, Ordering},
+        time::Duration,
+    };
+
     use super::*;
-    use std::net::IpAddr;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
 
     #[tokio::test]
     async fn single_execution() {

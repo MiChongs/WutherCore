@@ -33,18 +33,18 @@
 //! * Dissociate
 //! * 多路复用：单条 QUIC connection 承载多个 TCP/UDP 子流
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsConfig;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::adapter::{

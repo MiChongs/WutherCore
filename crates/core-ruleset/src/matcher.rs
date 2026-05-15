@@ -1,7 +1,6 @@
 //! 高速规则匹配器：编译后的 trie / set / cidr / 关键字 / 正则 复合体。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use ahash::{AHashMap, AHashSet};
 use ipnet::IpNet;

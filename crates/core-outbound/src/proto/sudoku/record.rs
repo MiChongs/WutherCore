@@ -19,12 +19,16 @@
 //! - 严格按序接收：epoch 必须 >= last；同 epoch 内 seq 必须 == last+1
 //! - epoch 跳跃 > 8 视为攻击
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes128Gcm, Nonce};
+use aes_gcm::{
+    Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};

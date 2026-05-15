@@ -1,12 +1,13 @@
 //! 端到端：跑 Mixed 入站 + DIRECT 出口，验证 HTTP CONNECT 与 SOCKS5 都能贯通。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use core_inbound::{MixedListener, run_mixed};
 use core_runtime::Runtime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 const CONFIG: &str = r#"
 version: 1

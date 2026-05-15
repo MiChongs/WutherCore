@@ -3,8 +3,10 @@
 //! Provides reverse lookup from resolved IPs back to hostnames, independent of
 //! the Fake-IP pool. Used by TUN/capture to recover SNI when HTTPS is proxied.
 
-use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 
@@ -78,8 +80,9 @@ impl Default for IpHostMapping {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     #[test]
     fn insert_and_find() {

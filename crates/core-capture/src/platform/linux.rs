@@ -10,17 +10,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
-use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::packet::{L4, parse_tun_frame};
-use crate::platform::linux_tun_io;
-use crate::route_table::{ManagedRoute, RouteTable};
-use crate::tproxy_rules;
-use crate::tun_io::TunIo;
-use crate::tun_logging::root_tun_summary;
+use crate::{
+    engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind},
+    packet::{L4, parse_tun_frame},
+    platform::linux_tun_io,
+    route_table::{ManagedRoute, RouteTable},
+    tproxy_rules,
+    tun_io::TunIo,
+    tun_logging::root_tun_summary,
+};
 
 pub fn list_interfaces() -> Vec<String> {
     let mut out = Vec::new();

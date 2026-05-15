@@ -9,20 +9,26 @@
 //!
 //! 重组回包成 IP/UDP 包用 [`smoltcp::wire`]，与 [`crate::packet`] 解析对称。
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet, Ipv6Repr,
-    UdpPacket, UdpRepr,
+use smoltcp::{
+    phy::ChecksumCapabilities,
+    wire::{
+        IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, Ipv6Address, Ipv6Packet,
+        Ipv6Repr, UdpPacket, UdpRepr,
+    },
 };
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
-use crate::eim_nat::{EimKey, EimNatTable};
-use crate::tun_io::TunIo;
+use crate::{
+    eim_nat::{EimKey, EimNatTable},
+    tun_io::TunIo,
+};
 
 /// UDP forwarder 配置。
 pub struct UdpForwarderConfig {

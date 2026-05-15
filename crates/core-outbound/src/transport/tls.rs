@@ -3,15 +3,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::adapter::{BoxedStream, resolve_host};
-use crate::loopback::TrackedTcpStream;
-use crate::transport::{TlsOptions, Transport, tcp::marked_connect};
+use crate::{
+    adapter::{BoxedStream, resolve_host},
+    loopback::TrackedTcpStream,
+    transport::{TlsOptions, Transport, tcp::marked_connect},
+};
 
 #[derive(Debug, Clone)]
 pub struct TlsTransport {

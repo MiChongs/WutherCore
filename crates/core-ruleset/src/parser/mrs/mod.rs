@@ -26,8 +26,7 @@
 //! * [`ipcidr_set`] —— IPCIDR Behavior 反序列化与查询。
 //! * [`bitmap`] —— Succinct rank/select 位运算（被 domain_set 使用）。
 
-use std::io::Read;
-use std::sync::Arc;
+use std::{io::Read, sync::Arc};
 
 use crate::parser::ParseError;
 

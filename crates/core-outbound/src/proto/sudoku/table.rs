@@ -19,8 +19,10 @@ use std::collections::BTreeMap;
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 
-use super::grid::{Grid, generate_all_grids};
-use super::layout::{ByteLayout, resolve_layout};
+use super::{
+    grid::{Grid, generate_all_grids},
+    layout::{ByteLayout, resolve_layout},
+};
 
 #[derive(Debug, Clone)]
 pub struct Table {

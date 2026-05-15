@@ -12,10 +12,12 @@
 //! `proc_*` 系列 API 在 macOS 10.5 之后稳定；非特权进程能扫所有进程的 socket 列表
 //! （内核只过滤了 ptrace / process_kernel 类的访问）。
 
-use std::ffi::{CStr, c_int, c_void};
-use std::mem::{size_of, zeroed};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::Path;
+use std::{
+    ffi::{CStr, c_int, c_void},
+    mem::{size_of, zeroed},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 use crate::{NetworkProto, ProcessFinder, ProcessInfo};
 

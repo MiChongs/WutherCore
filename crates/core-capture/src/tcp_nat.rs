@@ -14,10 +14,14 @@
 //! - 起点单调推进（`AtomicU16` fetch_add + 回绕模运算），冲突时跳过；最多扫一圈。
 //! - 已存在 (src, dst) 复用同一端口（命中 5-tuple 缓存）。
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -178,8 +182,9 @@ fn port_in_range(raw: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
 
     fn sa(ip: [u8; 4], port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)

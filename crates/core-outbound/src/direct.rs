@@ -1,15 +1,18 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
 
-use crate::adapter::{
-    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
-    prepare_outbound_udp_socket_for_addr, resolve_host_for_direct,
+use crate::{
+    adapter::{
+        BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+        prepare_outbound_udp_socket_for_addr, resolve_host_for_direct,
+    },
+    transport::{Transport, tcp::TcpTransport},
 };
-use crate::transport::Transport;
-use crate::transport::tcp::TcpTransport;
 
 #[derive(Debug, Default)]
 pub struct DirectOutbound;

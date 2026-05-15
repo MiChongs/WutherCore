@@ -1,11 +1,12 @@
 //! URLTest 端到端：模拟一个返回 204 的 mini-HTTP，DIRECT 出口测速并写入 history。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 const CONFIG: &str = r#"
 version: 1

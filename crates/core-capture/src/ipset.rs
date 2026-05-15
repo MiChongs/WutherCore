@@ -7,8 +7,7 @@
 //!
 //! 不注入时使用 [`NoopIpSetProvider`] —— 行为：未知集合 = false（不命中）。
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 pub trait IpSetProvider: Send + Sync + std::fmt::Debug {
     /// 集合 `name` 是否包含 `ip`。集合不存在或不是 IP 集合时返回 false。

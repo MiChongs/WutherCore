@@ -33,12 +33,16 @@
 //! ```
 //! 通过同一条 AEAD 加密的 TCP 流转发。
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce};
+use aes_gcm::{
+    Aes128Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -47,14 +51,16 @@ use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
 use rand::RngCore;
 use sha1::Sha1;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use tokio::sync::Mutex as AsyncMutex;
-
-use crate::adapter::{
-    BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike,
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
+    sync::Mutex as AsyncMutex,
 };
-use crate::proto::addr::encode_socks_addr;
-use crate::transport::{Transport, tcp::TcpTransport};
+
+use crate::{
+    adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
+    proto::addr::encode_socks_addr,
+    transport::{Transport, tcp::TcpTransport},
+};
 
 const PAYLOAD_MAX: usize = 0x3fff;
 

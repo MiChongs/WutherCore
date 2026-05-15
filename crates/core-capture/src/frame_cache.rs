@@ -9,17 +9,21 @@
 //!   平台是此格式，向下兼容）。
 //! - UDP 反向流（外向 src ↔ 内向 dst 互换）也能命中：缓存写入时同时插入正反两个 key。
 
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::packet::{FrameFormat, L4, ParsedPacket, encode_tun_ip_frame, parse_ip_packet};
-use crate::tun_io::{TunIo, TunIoError};
+use crate::{
+    packet::{FrameFormat, L4, ParsedPacket, encode_tun_ip_frame, parse_ip_packet},
+    tun_io::{TunIo, TunIoError},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TunFrameFlowKey {
@@ -225,9 +229,10 @@ pub async fn write_ip_packets_to_tun_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
     use crate::packet::{IpHeader, IpVersion, UdpSummary, encode_tun_ip_frame, parse_tun_frame};
-    use std::net::IpAddr;
 
     #[test]
     fn cache_maps_reverse_udp_flow_for_write_back() {

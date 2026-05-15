@@ -3,8 +3,7 @@
 //! 与 mihomo `transport/sudoku/obfs/httpmask/masker.go` 等价。
 //! 仅实现客户端 write 方向的 legacy mode（最常用且与 CDN 不兼容但不用握手）。
 
-use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::{Rng, seq::SliceRandom};
 
 const USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

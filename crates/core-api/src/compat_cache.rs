@@ -31,9 +31,13 @@
 //!
 //! 100 个并发请求 → 1 次 build → 100 个共享同一份 `Bytes` / `Arc<Value>`。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
@@ -213,8 +217,9 @@ impl Caches {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+    use super::*;
 
     #[test]
     fn fresh_within_ttl_returns_cached() {

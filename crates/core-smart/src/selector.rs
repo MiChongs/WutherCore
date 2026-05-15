@@ -4,8 +4,10 @@
 //! * latency 0.32, success 0.26, stability 0.16, site_memory 0.10,
 //!   load 0.08, preference 0.05, cost 0.03 - cooldown - capability。
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use core_config::model::{SmartGoal, SmartSticky};
 use core_store::{
@@ -17,9 +19,11 @@ use core_store::{
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use crate::cache::{DomainBest, NegativeCache};
-use crate::explain::{ChoiceExplain, NodeScore};
-use crate::metrics::{NodeStatSnapshot, NodeStats};
+use crate::{
+    cache::{DomainBest, NegativeCache},
+    explain::{ChoiceExplain, NodeScore},
+    metrics::{NodeStatSnapshot, NodeStats},
+};
 
 #[derive(Debug, Clone)]
 pub struct SmartContext {

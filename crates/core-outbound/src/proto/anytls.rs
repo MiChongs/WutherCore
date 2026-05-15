@@ -32,24 +32,32 @@
 //! ```
 //! 表示第 N 个 sub-frame 在末尾追加 `random(rand_range...)` 字节随机填充。
 
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    task::{Context, Poll, Waker},
+};
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
 use parking_lot::Mutex as PlMutex;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::Mutex as AsyncMutex,
+};
 
-use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
-use crate::proto::addr::encode_socks_addr;
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+use crate::{
+    adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
+    proto::addr::encode_socks_addr,
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 const CMD_SYN: u8 = 0x00;
 const CMD_PSH: u8 = 0x01;

@@ -5,8 +5,10 @@
 //! 做 fake-IP 反查、DNS mode 标记、规则匹配和连接统计。本模块把这些语义收束成
 //! Rust 侧的单一入口，避免 TUN TCP、TUN UDP、DNS hijack 各自拼一份 metadata。
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use compact_str::ToCompactString;
 use core_observe::{ConnectionMeta, string_list_from};
@@ -14,10 +16,12 @@ use core_resolver::FakeIpPool;
 use core_route::NetworkKind;
 use core_runtime::InboundMetadata;
 
-use crate::dial_meta::{DialTarget, build_dial_target};
-use crate::engine::CapturePlan;
-use crate::ipset::IpSetProvider;
-use crate::packet::{L4, ParsedPacket};
+use crate::{
+    dial_meta::{DialTarget, build_dial_target},
+    engine::CapturePlan,
+    ipset::IpSetProvider,
+    packet::{L4, ParsedPacket},
+};
 
 /// 由 `TunSession` 构造统一的 `InboundMetadata`（TCP/UDP 共用）。
 ///
@@ -495,11 +499,13 @@ impl TunInbound {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::packet::{IpHeader, IpVersion, TcpFlags, TcpSummary, UdpSummary};
+    use std::collections::HashMap;
+
     use core_resolver::fake_ip::{AddressFamily, FakeIpConfig};
     use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-    use std::collections::HashMap;
+
+    use super::*;
+    use crate::packet::{IpHeader, IpVersion, TcpFlags, TcpSummary, UdpSummary};
 
     #[derive(Debug, Default)]
     struct StaticIpSets {

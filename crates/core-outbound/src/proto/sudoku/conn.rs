@@ -11,9 +11,11 @@
 //! 跳过非 hint 字节（视为 padding）。每收到 4 个 hint 字节，排序后查 `decode_map`
 //! 得到原始字节。
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use bytes::{Buf, BytesMut};
 use parking_lot::Mutex as PlMutex;

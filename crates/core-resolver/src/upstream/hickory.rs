@@ -1,14 +1,16 @@
 //! hickory-resolver 包装：DoH / DoT / UDP / TCP 上游。
 
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{
-    NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
+use hickory_resolver::{
+    TokioAsyncResolver,
+    config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts},
+    proto::rr::{Record, RecordType},
 };
-use hickory_resolver::proto::rr::{Record, RecordType};
 
 use super::{DnsError, DnsUpstream};
 

@@ -7,9 +7,11 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use core_ruleset::RulesetFormat;
-use core_ruleset::matcher::RulesetMatcher;
-use core_ruleset::parser::{RulesetCompiled, parse_ruleset_compiled};
+use core_ruleset::{
+    RulesetFormat,
+    matcher::RulesetMatcher,
+    parser::{RulesetCompiled, parse_ruleset_compiled},
+};
 
 fn load(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

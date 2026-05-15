@@ -5,9 +5,11 @@
 //! 2. 客户端发起 PUT/POST 请求，body 是双向 stream
 //! 3. 协议字节作为 request body 写入 / response body 读出
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,11 +17,15 @@ use http::{HeaderName, HeaderValue, Request as HttpRequest};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HyperBody, Frame, Incoming};
 use parking_lot::Mutex as PlMutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Mutex as AsyncMutex, mpsc},
+};
 
-use crate::adapter::BoxedStream;
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+use crate::{
+    adapter::BoxedStream,
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct H2Options {

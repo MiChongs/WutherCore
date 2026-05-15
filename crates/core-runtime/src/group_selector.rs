@@ -19,15 +19,18 @@
 //! * `MarshalJSON`：与 Clash dashboard `/proxies/<group>` 一致字段
 //!   `{ type, now, all, testUrl, expectedStatus, fixed, hidden, icon, strategy? }`
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use ahash::AHasher;
-use core_config::model::ChooseStrategy;
-use core_config::runtime_plan::GroupPlan;
+use core_config::{model::ChooseStrategy, runtime_plan::GroupPlan};
 use core_smart::{SmartContext, SmartSelector};
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
@@ -849,9 +852,9 @@ fn now_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use core_config::{model::ChooseStrategy, runtime_plan::GroupPlan};
+
     use super::*;
-    use core_config::model::ChooseStrategy;
-    use core_config::runtime_plan::GroupPlan;
 
     fn plan(choose: ChooseStrategy, members: &[&str]) -> GroupPlan {
         GroupPlan {

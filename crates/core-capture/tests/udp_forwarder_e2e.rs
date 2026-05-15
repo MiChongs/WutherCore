@@ -3,11 +3,12 @@
 //! 启动一个 UDP echo 监听 → 通过 forwarder 把"TUN 内"流量发出去 →
 //! 验证 echo 包能收到。同时验证 EIM-NAT 模式下复用同一 outbound socket。
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use core_capture::eim_nat::EimNatTable;
-use core_capture::udp_forwarder::{UdpForwarderConfig, send_one};
+use core_capture::{
+    eim_nat::EimNatTable,
+    udp_forwarder::{UdpForwarderConfig, send_one},
+};
 use tokio::net::UdpSocket;
 
 async fn echo_server() -> (Arc<UdpSocket>, std::net::SocketAddr) {

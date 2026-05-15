@@ -17,8 +17,9 @@
 //! * `body`：请求体
 //! * `queryInHeader`：放在某个 header 里的 URL query（如 Referer）
 
-use rand::Rng;
 use std::collections::BTreeMap;
+
+use rand::Rng;
 
 pub const PLACEMENT_QUERY_IN_HEADER: &str = "queryInHeader";
 pub const PLACEMENT_COOKIE: &str = "cookie";

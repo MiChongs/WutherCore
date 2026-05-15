@@ -163,11 +163,12 @@ fn list_interfaces() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use core_config::model::{
         Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
         Mesh, TunInboundOptions,
     };
+
+    use super::*;
 
     fn capture(on: bool) -> Capture {
         Capture {

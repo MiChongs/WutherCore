@@ -4,16 +4,20 @@
 //! - **stream-one** / **stream-up**：reader = response body, writer = request body pipe
 //! - **packet-up**：reader = response body, writer = PacketUpWriter（序列化 POST）
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use bytes::{Buf, BytesMut};
 use hyper::body::{Body as HyperBody, Incoming};
 use parking_lot::Mutex as PlMutex;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::mpsc,
+};
 
 /// WaitReader：阻塞 read 直到底层 reader 被 set
 pub struct WaitReader {

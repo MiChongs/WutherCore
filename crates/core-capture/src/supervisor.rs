@@ -13,25 +13,31 @@
 //! 通过 [`CaptureSupervisor::with_ip_set_provider`] 注入 `IpSetProvider`
 //! 后，supervisor 会按集合名查询 ruleset（动态 IP 集）。
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Instant,
+};
 
 use core_config::model::{Capture, Mesh};
 use core_resolver::fake_ip::FakeIpPool;
 use core_runtime::Runtime;
 use parking_lot::RwLock;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
-use crate::eim_nat::EimNatTable;
-use crate::engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind};
-use crate::ipset::{IpSetProvider, noop};
-use crate::nat::{NatEntry, NatTable};
-use crate::netstack_dispatch::{NetstackDispatcher, NetstackDispatcherHandles};
-use crate::sys_proxy::SystemProxyGuard;
-use crate::system_dispatch::{SystemDispatcher, SystemDispatcherHandles};
+use crate::{
+    eim_nat::EimNatTable,
+    engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind},
+    ipset::{IpSetProvider, noop},
+    nat::{NatEntry, NatTable},
+    netstack_dispatch::{NetstackDispatcher, NetstackDispatcherHandles},
+    sys_proxy::SystemProxyGuard,
+    system_dispatch::{SystemDispatcher, SystemDispatcherHandles},
+};
 
 /// 跨 stack 的 dispatcher 句柄 —— supervisor 内部使用。
 enum DispatcherHandles {
@@ -417,13 +423,15 @@ pub fn first_addr(s: &str) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::IpAddr;
+
     use core_config::model::{
         Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
         Mesh, TunInboundOptions,
     };
     use core_resolver::fake_ip::{AddressFamily, FakeIpConfig};
-    use std::net::IpAddr;
+
+    use super::*;
 
     fn capture() -> Capture {
         Capture {

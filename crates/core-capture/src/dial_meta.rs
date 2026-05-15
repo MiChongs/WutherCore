@@ -116,11 +116,12 @@ pub fn build_dial_target(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{str::FromStr, time::Duration};
+
     use core_resolver::fake_ip::{AddressFamily, FakeIpConfig};
     use ipnet::{Ipv4Net, Ipv6Net};
-    use std::str::FromStr;
-    use std::time::Duration;
+
+    use super::*;
 
     fn fresh_pool() -> FakeIpPool {
         FakeIpPool::new(FakeIpConfig {

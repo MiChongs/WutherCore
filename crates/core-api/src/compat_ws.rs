@@ -43,9 +43,13 @@
 //! 与 `broadcast` 通道相比，没有"队列爆掉 → producer 拒绝写入 → 全员 lag"
 //! 的风险，更适合 1Hz 监控类场景。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::sync::watch;
 
@@ -290,8 +294,9 @@ fn iso8601_secs(ts_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    use super::*;
 
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_start_only_after_first_subscribe() {

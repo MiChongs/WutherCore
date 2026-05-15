@@ -8,15 +8,19 @@
 //! 服务器端会读取并丢弃 HTTP 头部，然后开始裸字节通信。这是最简单的
 //! HTTP obfs 模式（mihomo 中称为 `Network: "http"`，与 xhttp/h2/grpc 不同）。
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::adapter::BoxedStream;
-use crate::transport::{TlsOptions, Transport, tls::TlsTransport};
+use crate::{
+    adapter::BoxedStream,
+    transport::{TlsOptions, Transport, tls::TlsTransport},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct HttpOptions {
