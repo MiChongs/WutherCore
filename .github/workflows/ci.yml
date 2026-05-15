@@ -45,7 +45,7 @@ jobs:
           components: rust-src
       - name: Install Cross
         run: |
-          cargo install cross --git https://github.com/cross-rs/cross.git --rev 15e610e --locked
+          cargo install cross --git https://github.com/cross-rs/cross.git --rev v0.2.5 --locked
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform.target }}
