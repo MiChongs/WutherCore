@@ -1,4 +1,4 @@
-name: Build and Release (Cross Matrix)
+Name: Build and Release (Cross Matrix)
 on:
   workflow_dispatch:
   push:
@@ -23,12 +23,16 @@ jobs:
         platform:
           - target: x86_64-unknown-linux-gnu
             name: linux-amd64
+            is_android: false
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
+            is_android: false
           - target: aarch64-linux-android
             name: android-arm64
+            is_android: true
           #- target: x86_64-pc-windows-gnu
           #  name: windows-amd64
+          #  is_android: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,16 +43,31 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.platform.target }}
           components: rust-src
+      - name: Setup Android NDK
+        if: matrix.platform.is_android == true
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: true
+      - name: Install cargo-ndk
+        if: matrix.platform.is_android == true
+        run: |
+          cargo install cargo-ndk --locked
       - name: Install Cross
+        if: matrix.platform.is_android != true
         run: |
           cargo install cross --git https://github.com/cross-rs/cross.git --rev v0.2.5 --locked
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform.target }}
-      - name: Run Cross Build
+      - name: Run Cargo NDK Build (Android)
+        if: matrix.platform.is_android == true
+        run: |
+          cargo ndk --target ${{ matrix.platform.target }} --android-platform 24 build --release
+      - name: Run Cross Build (Non-Android)
+        if: matrix.platform.is_android != true
         run: |
           cross build --release --target ${{ matrix.platform.target }}
-
       - name: Package Artifacts
         run: |
           mkdir -p ./dist
