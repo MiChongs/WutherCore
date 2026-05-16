@@ -33,9 +33,6 @@ jobs:
           - target: armv7-linux-androideabi
             name: android-arm
             is_android: true
-          - target: i586-unknown-linux-gnu
-            name: linux-i586
-            is_android: false
           - target: i686-unknown-linux-gnu
             name: linux-i686
             is_android: false
