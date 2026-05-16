@@ -39,9 +39,9 @@ jobs:
           - target: s390x-unknown-linux-gnu
             name: linux-s390x
             is_android: false
-          #- target: x86_64-pc-windows-gnu
-          #  name: windows-amd64
-          #  is_android: false
+          - target: x86_64-pc-windows-gnu
+            name: windows-amd64
+            is_android: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,6 +82,10 @@ jobs:
           mkdir -p ./dist
           mkdir -p ./pkg_dir
           FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core"
+
+          if [ -f "target/${{ matrix.platform.target }}/release/wuther-core.exe" ]; then
+            FILE_PATH="target/${{ matrix.platform.target}}/release/wuther-core.exe"
+          fi
           
           if [ -f "$FILE_PATH" ]; then
             cp "$FILE_PATH" ./pkg_dir/
