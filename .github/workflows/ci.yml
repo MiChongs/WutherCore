@@ -69,6 +69,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform.target }}
+          save-if: ${{ github.event_name == 'push' }}
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
