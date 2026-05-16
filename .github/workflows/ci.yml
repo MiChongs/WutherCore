@@ -63,7 +63,7 @@ jobs:
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
-          cargo ndk --target ${{ matrix.platform.target }} --android-platform 24 build --release
+          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release
       - name: Run Cross Build (Non-Android)
         if: matrix.platform.is_android != true
         run: |
