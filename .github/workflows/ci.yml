@@ -1,4 +1,4 @@
-Name: Build and Release (Cross Matrix)
+name: Build and Release (Cross Matrix)
 on:
   workflow_dispatch:
   push:
