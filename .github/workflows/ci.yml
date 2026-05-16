@@ -30,6 +30,9 @@ jobs:
           - target: aarch64-linux-android
             name: android-arm64
             is_android: true
+          - target: armv7-linux-androideabi
+            name: android-arm
+            is_android: true
           #- target: x86_64-pc-windows-gnu
           #  name: windows-amd64
           #  is_android: false
