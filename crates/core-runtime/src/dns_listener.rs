@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tracing::{debug, info, warn};
 
@@ -79,6 +79,24 @@ impl DnsListener {
         match &self.kind {
             ListenerKind::Active { tcp_addr, .. } => Some(*tcp_addr),
             ListenerKind::Disabled => None,
+        }
+    }
+
+    /// Stop both protocol listeners and wait until their sockets and all
+    /// per-query/per-connection tasks have been dropped.
+    ///
+    /// `Drop` remains a synchronous cancellation fallback, while lifecycle
+    /// owners that need to re-bind the same port should use this method.
+    pub async fn shutdown(mut self) {
+        let kind = std::mem::replace(&mut self.kind, ListenerKind::Disabled);
+        if let ListenerKind::Active {
+            udp_task, tcp_task, ..
+        } = kind
+        {
+            udp_task.abort();
+            tcp_task.abort();
+            let _ = udp_task.await;
+            let _ = tcp_task.await;
         }
     }
 }
@@ -157,10 +175,12 @@ pub async fn spawn_dns_listener(
 
 async fn run_udp(sock: UdpSocket, service: Arc<DnsService>) {
     let sock = Arc::new(sock);
+    let mut queries = JoinSet::new();
     // RFC 6891 §6.2.5：DNS over UDP 报文最大 EDNS0 4096，不带 EDNS 时 512。
     // 给 4096 足够；超大查询客户端会重试 TCP。
     let mut buf = vec![0u8; 4096];
     loop {
+        while queries.try_join_next().is_some() {}
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
@@ -175,7 +195,7 @@ async fn run_udp(sock: UdpSocket, service: Arc<DnsService>) {
         let sock_clone = sock.clone();
         let svc = service.clone();
         // 异步处理，避免 fake-ip 分配 / 上游查询阻塞下一个客户端。
-        tokio::spawn(async move {
+        queries.spawn(async move {
             let resp = svc.serve_packet(&req).await;
             if resp.is_empty() {
                 debug!(target: "dns::listener", peer = %peer, "udp empty response from service");
@@ -191,7 +211,9 @@ async fn run_udp(sock: UdpSocket, service: Arc<DnsService>) {
 }
 
 async fn run_tcp(listener: TcpListener, service: Arc<DnsService>) {
+    let mut connections = JoinSet::new();
     loop {
+        while connections.try_join_next().is_some() {}
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -200,7 +222,7 @@ async fn run_tcp(listener: TcpListener, service: Arc<DnsService>) {
             }
         };
         let svc = service.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(e) = handle_tcp_conn(stream, svc).await {
                 debug!(target: "dns::listener", peer = %peer, error = %e, "tcp conn ended");
             }
@@ -374,6 +396,21 @@ mod tests {
         assert_eq!(&resp[0..2], &[0xBE, 0xEF]);
         assert!(resp[2] & 0x80 != 0);
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_udp_and_tcp_port_for_immediate_restart() {
+        let svc = test_service();
+        let port = pick_free_port().await;
+        let listen = format!("127.0.0.1:{port}");
+        let listener = spawn_dns_listener(&listen, svc.clone()).await.unwrap();
+
+        listener.shutdown().await;
+
+        let rebound = spawn_dns_listener(&listen, svc).await.unwrap();
+        assert_eq!(rebound.addr().unwrap().port(), port);
+        assert_eq!(rebound.tcp_addr().unwrap().port(), port);
+        rebound.shutdown().await;
     }
 
     #[tokio::test]

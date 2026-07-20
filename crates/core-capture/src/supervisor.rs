@@ -66,6 +66,7 @@ enum Lifecycle {
     Starting = 1,
     Running = 2,
     Stopping = 3,
+    CleanupFailed = 4,
 }
 
 impl Lifecycle {
@@ -74,6 +75,7 @@ impl Lifecycle {
             1 => Self::Starting,
             2 => Self::Running,
             3 => Self::Stopping,
+            4 => Self::CleanupFailed,
             _ => Self::Stopped,
         }
     }
@@ -84,6 +86,7 @@ impl Lifecycle {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Stopping => "stopping",
+            Self::CleanupFailed => "cleanup_failed",
         }
     }
 }
@@ -96,28 +99,28 @@ impl Lifecycle {
 enum CleanupStep {
     NetworkListener,
     PurgeTask,
-    DnsTask,
     EventTask,
     Dispatcher,
     SystemProxy,
     Engine,
+    DnsListener,
 }
 
 const CLEANUP_ORDER: [CleanupStep; 7] = [
     CleanupStep::NetworkListener,
     CleanupStep::PurgeTask,
-    CleanupStep::DnsTask,
     CleanupStep::EventTask,
     CleanupStep::Dispatcher,
     CleanupStep::SystemProxy,
     CleanupStep::Engine,
+    CleanupStep::DnsListener,
 ];
 
 #[derive(Default)]
 struct SupervisorResources {
     event_stopper: Option<oneshot::Sender<()>>,
     event_handle: Option<JoinHandle<()>>,
-    dns_handle: Option<JoinHandle<()>>,
+    dns_listeners: Vec<core_runtime::DnsListener>,
     purge_handle: Option<JoinHandle<()>>,
     network_listener_handle: Option<JoinHandle<()>>,
     dispatcher: Option<DispatcherHandles>,
@@ -139,9 +142,6 @@ impl SupervisorResources {
                 CleanupStep::PurgeTask => {
                     abort_and_join(self.purge_handle.take()).await;
                 }
-                CleanupStep::DnsTask => {
-                    abort_and_join(self.dns_handle.take()).await;
-                }
                 CleanupStep::EventTask => {
                     if let Some(tx) = self.event_stopper.take() {
                         let _ = tx.send(());
@@ -162,6 +162,16 @@ impl SupervisorResources {
                     engine_result = engine.clone().stop().await;
                 }
                 CleanupStep::Engine => {}
+                CleanupStep::DnsListener => {
+                    // If platform rollback failed, keep the resolver live while
+                    // system DNS may still point at it. A later stop retry
+                    // closes these listeners after engine cleanup succeeds.
+                    if engine_result.is_ok() || !stop_engine {
+                        while let Some(listener) = self.dns_listeners.pop() {
+                            listener.shutdown().await;
+                        }
+                    }
+                }
             }
         }
         engine_result
@@ -173,7 +183,6 @@ impl SupervisorResources {
         for handle in [
             self.network_listener_handle.take(),
             self.purge_handle.take(),
-            self.dns_handle.take(),
         ]
         .into_iter()
         .flatten()
@@ -259,7 +268,23 @@ impl CleanupTransaction {
         self.stop_engine = false;
         self.armed = false;
         if let Some(owner) = self.owner.upgrade() {
-            owner.finish_transition(Lifecycle::Stopped);
+            if result.is_ok() {
+                owner.finish_transition(Lifecycle::Stopped);
+            } else {
+                let resources = self
+                    .resources
+                    .take()
+                    .expect("cleanup transaction resources already consumed");
+                {
+                    let mut slot = owner.resources.lock();
+                    debug_assert!(
+                        slot.is_none(),
+                        "failed cleanup resources must have a single owner"
+                    );
+                    *slot = Some(resources);
+                }
+                owner.finish_transition(Lifecycle::CleanupFailed);
+            }
         }
         result
     }
@@ -281,6 +306,11 @@ impl Drop for CleanupTransaction {
         if let Some(resources) = self.resources.as_mut() {
             resources.abort_sync();
         }
+        let dns_listeners = self
+            .resources
+            .as_mut()
+            .map(|resources| std::mem::take(&mut resources.dns_listeners))
+            .unwrap_or_default();
 
         let owner = self.owner.clone();
         if self.stop_engine {
@@ -293,6 +323,21 @@ impl Drop for CleanupTransaction {
                             %error,
                             "cancelled lifecycle transition: engine rollback failed"
                         );
+                        if let Some(owner) = owner.upgrade() {
+                            let recovery = SupervisorResources {
+                                dns_listeners,
+                                ..SupervisorResources::default()
+                            };
+                            {
+                                let mut slot = owner.resources.lock();
+                                *slot = Some(recovery);
+                            }
+                            owner.finish_transition(Lifecycle::CleanupFailed);
+                        }
+                        return;
+                    }
+                    for listener in dns_listeners.into_iter().rev() {
+                        listener.shutdown().await;
                     }
                     if let Some(owner) = owner.upgrade() {
                         owner.finish_transition(Lifecycle::Stopped);
@@ -301,6 +346,7 @@ impl Drop for CleanupTransaction {
                 return;
             }
         }
+        drop(dns_listeners);
         if let Some(owner) = owner.upgrade() {
             owner.finish_transition(Lifecycle::Stopped);
         }
@@ -418,7 +464,7 @@ impl CaptureSupervisor {
 
     /// Claim the stopped -> starting transition. Concurrent callers wait for
     /// the active transition without holding a mutex across an await.
-    async fn begin_start(&self) -> bool {
+    async fn begin_start(self: &Arc<Self>) -> Result<bool, CaptureError> {
         loop {
             let notified = self.lifecycle_changed.notified();
             tokio::pin!(notified);
@@ -427,7 +473,7 @@ impl CaptureSupervisor {
             // and `.await` cannot be lost.
             notified.as_mut().enable();
             match self.lifecycle() {
-                Lifecycle::Running => return false,
+                Lifecycle::Running => return Ok(false),
                 Lifecycle::Stopped => {
                     if self
                         .lifecycle
@@ -439,7 +485,24 @@ impl CaptureSupervisor {
                         )
                         .is_ok()
                     {
-                        return true;
+                        return Ok(true);
+                    }
+                }
+                Lifecycle::CleanupFailed => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            Lifecycle::CleanupFailed as u8,
+                            Lifecycle::Stopping as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let resources = self.resources.lock().take().unwrap_or_default();
+                        let mut transaction = CleanupTransaction::new(self, resources);
+                        transaction.stop_engine = true;
+                        transaction.shutdown_to_stopped().await?;
                     }
                 }
                 Lifecycle::Starting | Lifecycle::Stopping => notified.await,
@@ -453,13 +516,14 @@ impl CaptureSupervisor {
             let notified = self.lifecycle_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.lifecycle() {
+            let lifecycle = self.lifecycle();
+            match lifecycle {
                 Lifecycle::Stopped => return false,
-                Lifecycle::Running => {
+                Lifecycle::Running | Lifecycle::CleanupFailed => {
                     if self
                         .lifecycle
                         .compare_exchange(
-                            Lifecycle::Running as u8,
+                            lifecycle as u8,
                             Lifecycle::Stopping as u8,
                             Ordering::AcqRel,
                             Ordering::Acquire,
@@ -485,7 +549,7 @@ impl CaptureSupervisor {
         runtime: Arc<Runtime>,
         failpoint: StartFailpoint,
     ) -> Result<(), CaptureError> {
-        if !self.begin_start().await {
+        if !self.begin_start().await? {
             // Idempotent start: an already-running supervisor is success.
             return Ok(());
         }
@@ -493,6 +557,27 @@ impl CaptureSupervisor {
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1024);
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let mut transaction = CleanupTransaction::new(self, SupervisorResources::default());
+        let dns_service = Arc::new(
+            core_resolver::DnsService::new(runtime.resolver.clone())
+                .with_fake_pool(self.fake_pool.clone()),
+        );
+        if self.plan.hijack_dns {
+            for &listen_addr in fake_dns_listen_addrs() {
+                let listener = core_runtime::spawn_dns_listener(listen_addr, dns_service.clone())
+                    .await
+                    .map_err(|error| {
+                        CaptureError::DeviceFailed(format!(
+                            "cannot start fake-DNS on {listen_addr}: {error}"
+                        ))
+                    })?;
+                if listener.is_disabled() {
+                    return Err(CaptureError::DeviceFailed(format!(
+                        "fake-DNS listener unexpectedly disabled for {listen_addr}"
+                    )));
+                }
+                transaction.resources_mut().dns_listeners.push(listener);
+            }
+        }
         transaction.mark_engine_started();
 
         let start_result: Result<(), CaptureError> = async {
@@ -507,11 +592,6 @@ impl CaptureSupervisor {
             if let Some(http_opts) = &self.plan.platform_http_proxy {
                 transaction.resources_mut().sys_proxy = Some(SystemProxyGuard::install(http_opts));
             }
-
-            let dns_service = Arc::new(
-                core_resolver::DnsService::new(runtime.resolver.clone())
-                    .with_fake_pool(self.fake_pool.clone()),
-            );
 
             // virtual_nic/TUN 的平台 packet_loop 只能发现流，不能转发 payload。
             // 必须由 dispatcher 独占 TUN 读写，否则只改路由不会有任何 TCP/UDP 出站。
@@ -569,15 +649,6 @@ impl CaptureSupervisor {
                 };
                 transaction.resources_mut().dispatcher = Some(handles);
             }
-
-            // Bind fake-DNS before publishing any task handles. A port conflict
-            // is a startup failure, not a background warning after success.
-            let dns_socket = if self.plan.hijack_dns {
-                let bind: SocketAddr = "127.0.0.1:5454".parse().expect("constant DNS bind");
-                Some(tokio::net::UdpSocket::bind(bind).await?)
-            } else {
-                None
-            };
 
             let pool = self.fake_pool.clone();
             let nat = self.nat.clone();
@@ -637,18 +708,6 @@ impl CaptureSupervisor {
             });
             transaction.resources_mut().event_handle = Some(handle);
             transaction.resources_mut().event_stopper = Some(stop_tx);
-
-            if let Some(dns_socket) = dns_socket {
-                let dns_service = dns_service.clone();
-                let dns_handle = tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::fakeip_dns::run_fake_dns_socket(dns_socket, dns_service).await
-                    {
-                        warn!(target: "capture::dns", error = %e, "fake-dns exited");
-                    }
-                });
-                transaction.resources_mut().dns_handle = Some(dns_handle);
-            }
 
             // NAT + EIM-NAT 周期性 purge：udp_timeout/2，下限 5s。
             let purge_period = std::cmp::max(Duration::from_secs(5), self.plan.udp_timeout / 2);
@@ -781,6 +840,17 @@ impl CaptureSupervisor {
             "host_pin_size": self.nat.host_pin.len(),
             "sys_proxy_active": sys_proxy_active,
         })
+    }
+}
+
+fn fake_dns_listen_addrs() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        // WindowsTun points both IPv4 and IPv6 resolver families at these
+        // loopback listeners.
+        &["127.0.0.1:53", "[::1]:53"]
+    } else {
+        // Preserve the existing private capture listener on Unix platforms.
+        &["127.0.0.1:5454"]
     }
 }
 
@@ -1023,13 +1093,22 @@ route:
             [
                 CleanupStep::NetworkListener,
                 CleanupStep::PurgeTask,
-                CleanupStep::DnsTask,
                 CleanupStep::EventTask,
                 CleanupStep::Dispatcher,
                 CleanupStep::SystemProxy,
                 CleanupStep::Engine,
+                CleanupStep::DnsListener,
             ]
         );
+    }
+
+    #[test]
+    fn windows_fake_dns_matches_system_dns_target() {
+        if cfg!(target_os = "windows") {
+            assert_eq!(fake_dns_listen_addrs(), ["127.0.0.1:53", "[::1]:53"]);
+        } else {
+            assert_eq!(fake_dns_listen_addrs(), ["127.0.0.1:5454"]);
+        }
     }
 
     #[tokio::test]
@@ -1064,7 +1143,7 @@ route:
     }
 
     #[tokio::test]
-    async fn engine_stop_error_still_leaves_stopped_retryable_state() {
+    async fn engine_stop_error_preserves_resources_for_direct_stop_retry() {
         let engine = Arc::new(LifecycleEngine::new(false));
         let sup = lifecycle_supervisor(engine.clone());
         let runtime = lifecycle_runtime();
@@ -1072,12 +1151,17 @@ route:
 
         engine.fail_stop_once.store(true, Ordering::SeqCst);
         assert!(sup.stop().await.is_err());
+        assert_eq!(sup.lifecycle(), Lifecycle::CleanupFailed);
+        assert!(sup.resources.lock().is_some());
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
+
+        sup.stop().await.expect("direct cleanup retry succeeds");
         assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
         assert!(sup.resources.lock().is_none());
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 2);
 
-        sup.start(runtime).await.expect("retry after stop error");
-        sup.stop().await.expect("second stop succeeds");
-        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        sup.start(runtime).await.expect("restart after cleanup");
+        sup.stop().await.expect("clean stop after restart");
     }
 
     #[tokio::test]

@@ -80,8 +80,24 @@ impl RouteTable {
 
     /// 退出时回滚所有由本管理器创建的路由（best-effort）。
     pub fn revert_all(&self) {
+        let _ = self.revert_all_impl(false);
+    }
+
+    /// Revert the full ledger while returning every unexpected backend error.
+    ///
+    /// Ordinary best-effort platform cleanup can keep using
+    /// [`Self::revert_all`]. Transactional callers use this variant so a
+    /// failed `route`/`netsh` deletion is not reported as a clean shutdown.
+    pub fn revert_all_checked(&self) -> Result<(), String> {
+        self.revert_all_impl(true)
+    }
+
+    fn revert_all_impl(&self, retain_failed: bool) -> Result<(), String> {
         let mut g = self.inner.lock();
-        for r in g.drain(..) {
+        let mut errors = Vec::new();
+        let mut failed = Vec::new();
+        let routes = std::mem::take(&mut *g);
+        for r in routes.into_iter().rev() {
             match self.backend.del(&r) {
                 Ok(()) => {
                     debug!(target: "capture::route", dest = %r.dest, iface = %r.interface, table = ?r.table, "route reverted");
@@ -91,9 +107,25 @@ impl RouteTable {
                         debug!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, "route already absent");
                     } else {
                         warn!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, "route revert failed");
+                        errors.push(format!(
+                            "{} via {} (table {:?}): {e}",
+                            r.dest, r.interface, r.table
+                        ));
+                        if retain_failed {
+                            failed.push(r);
+                        }
                     }
                 }
             }
+        }
+        // Deletion runs in reverse insertion order. Restore the ledger's
+        // original order so every subsequent retry is reversed as well.
+        failed.reverse();
+        g.extend(failed);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
@@ -208,45 +240,81 @@ fn platform_del(r: &ManagedRoute) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn platform_add(r: &ManagedRoute) -> Result<(), String> {
     // Windows 的 route 命令接受 IPv4 dotted mask；IPv6 用 netsh。
-    let metric = r.metric.to_string();
     if r.dest.addr().is_ipv6() {
-        let dest = r.dest.to_string();
-        let cmd = format!(
-            "interface ipv6 add route {dest} interface={iface} metric={metric}",
-            iface = r.interface,
-            metric = metric
-        );
-        run_cmd("netsh", &cmd.split_whitespace().collect::<Vec<_>>())
-    } else {
-        let dest = r.dest.network().to_string();
-        let mask = ipv4_mask(r.dest.prefix_len());
-        let gw = r
-            .gateway
-            .map(|g| g.to_string())
-            .unwrap_or_else(|| "0.0.0.0".into());
-        let mut args: Vec<&str> = vec!["ADD", &dest, "MASK", &mask, &gw, "METRIC", &metric];
-        let if_str;
-        if let Some(idx) = if_index_from_name(&r.interface) {
-            if_str = idx.to_string();
-            args.extend_from_slice(&["IF", &if_str]);
+        if r.gateway.is_some_and(|gateway| gateway.is_ipv4()) {
+            return Err("IPv6 route cannot use an IPv4 next hop".into());
         }
-        run_cmd("route", &args)
+        let args = windows_ipv6_route_args(r, true);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_cmd("netsh", &refs)
+    } else {
+        let interface_index = if_index_from_name(&r.interface)?;
+        let args = windows_ipv4_route_args(r, interface_index, true);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_cmd("route", &refs)
     }
 }
 
 #[cfg(target_os = "windows")]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
     if r.dest.addr().is_ipv6() {
-        let dest = r.dest.to_string();
-        let cmd = format!(
-            "interface ipv6 delete route {dest} interface={iface}",
-            iface = r.interface
-        );
-        run_cmd("netsh", &cmd.split_whitespace().collect::<Vec<_>>())
+        if r.gateway.is_some_and(|gateway| gateway.is_ipv4()) {
+            return Err("IPv6 route cannot use an IPv4 next hop".into());
+        }
+        let args = windows_ipv6_route_args(r, false);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_cmd("netsh", &refs)
     } else {
-        let dest = r.dest.network().to_string();
-        run_cmd("route", &["DELETE", &dest])
+        let interface_index = if_index_from_name(&r.interface)?;
+        let args = windows_ipv4_route_args(r, interface_index, false);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_cmd("route", &refs)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ipv4_route_args(route: &ManagedRoute, interface_index: u32, add: bool) -> Vec<String> {
+    let mut args = vec![
+        if add { "ADD" } else { "DELETE" }.into(),
+        route.dest.network().to_string(),
+        "MASK".into(),
+        ipv4_mask(route.dest.prefix_len()),
+        route
+            .gateway
+            .map(|gateway| gateway.to_string())
+            .unwrap_or_else(|| "0.0.0.0".into()),
+    ];
+    if add {
+        args.extend(["METRIC".into(), route.metric.to_string()]);
+    }
+    args.extend(["IF".into(), interface_index.to_string()]);
+    args
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ipv6_route_args(route: &ManagedRoute, add: bool) -> Vec<String> {
+    let mut args = vec![
+        "interface".into(),
+        "ipv6".into(),
+        if add { "add" } else { "delete" }.into(),
+        "route".into(),
+        format!("prefix={}", route.dest),
+        format!("interface={}", route.interface),
+        format!(
+            "nexthop={}",
+            route
+                .gateway
+                .map(|gateway| gateway.to_string())
+                .unwrap_or_else(|| "::".into())
+        ),
+    ];
+    if add {
+        args.push(format!("metric={}", route.metric));
+    }
+    // netsh defaults route mutations to PersistentStore. Capture routes must
+    // never survive a crash or reboot.
+    args.push("store=active".into());
+    args
 }
 
 #[cfg(not(any(
@@ -280,14 +348,27 @@ fn ipv4_mask(prefix: u8) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn if_index_from_name(name: &str) -> Option<u32> {
+fn if_index_from_name(name: &str) -> Result<u32, String> {
     // `netsh interface show interface` 的输出第 4 列是接口名；用 `netsh
     // interface ipv4 show interfaces` 拿索引（idx 在第 1 列）。
-    let out = std::process::Command::new("netsh")
+    let output = std::process::Command::new("netsh")
         .args(["interface", "ipv4", "show", "interfaces"])
         .output()
-        .ok()?;
-    let txt = String::from_utf8_lossy(&out.stdout);
+        .map_err(|error| format!("spawn netsh while resolving interface {name:?}: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(format!(
+            "netsh interface lookup failed (status={:?}): {detail}",
+            output.status.code()
+        ));
+    }
+    let txt = String::from_utf8_lossy(&output.stdout);
     for line in txt.lines().skip(3) {
         // 行格式：Idx     Met         MTU          State                Name
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -295,11 +376,18 @@ fn if_index_from_name(name: &str) -> Option<u32> {
             continue;
         }
         let if_name = parts[4..].join(" ");
-        if if_name == name {
-            return parts[0].parse().ok();
+        if if_name.eq_ignore_ascii_case(name) {
+            return parts[0].parse::<u32>().map_err(|error| {
+                format!(
+                    "invalid interface index {:?} for {name:?}: {error}",
+                    parts[0]
+                )
+            });
         }
     }
-    None
+    Err(format!(
+        "Windows interface {name:?} was not present in netsh interface list"
+    ))
 }
 
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(), String> {
@@ -313,10 +401,16 @@ fn run_cmd(prog: &str, args: &[&str]) -> Result<(), String> {
     if st.status.success() {
         Ok(())
     } else {
+        let stderr = String::from_utf8_lossy(&st.stderr);
+        let stdout = String::from_utf8_lossy(&st.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
         Err(format!(
-            "{prog} failed (status={:?}): {}",
+            "{prog} failed (status={:?}): {detail}",
             st.status.code(),
-            String::from_utf8_lossy(&st.stderr).trim()
         ))
     }
 }
@@ -463,6 +557,140 @@ mod tests {
             .unwrap();
         table.revert_all(); // best-effort，不能 panic
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn checked_revert_surfaces_backend_failure_and_retains_it_for_retry() {
+        #[derive(Debug, Default)]
+        struct FailBackend;
+        impl RouteBackend for FailBackend {
+            fn add(&self, _r: &ManagedRoute) -> Result<(), String> {
+                Ok(())
+            }
+            fn del(&self, _r: &ManagedRoute) -> Result<(), String> {
+                Err("injected delete failure".into())
+            }
+        }
+        let table = RouteTable::with_backend(Arc::new(FailBackend));
+        table
+            .add(ManagedRoute {
+                dest: "10.0.0.0/8".parse().unwrap(),
+                gateway: None,
+                interface: "test-tun".into(),
+                metric: 1,
+                table: None,
+            })
+            .unwrap();
+
+        let error = table.revert_all_checked().unwrap_err();
+
+        assert!(error.contains("injected delete failure"));
+        assert!(error.contains("10.0.0.0/8 via test-tun"));
+        assert_eq!(table.len(), 1, "failed deletion must remain retryable");
+    }
+
+    #[test]
+    fn checked_revert_retries_in_reverse_insertion_order() {
+        #[derive(Debug, Default)]
+        struct RecordingFailBackend {
+            deleted: Mutex<Vec<String>>,
+        }
+        impl RouteBackend for RecordingFailBackend {
+            fn add(&self, _r: &ManagedRoute) -> Result<(), String> {
+                Ok(())
+            }
+            fn del(&self, r: &ManagedRoute) -> Result<(), String> {
+                self.deleted.lock().push(r.dest.to_string());
+                Err("injected delete failure".into())
+            }
+        }
+
+        let backend = Arc::new(RecordingFailBackend::default());
+        let table = RouteTable::with_backend(backend.clone());
+        for dest in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+            table
+                .add(ManagedRoute {
+                    dest: dest.parse().unwrap(),
+                    gateway: None,
+                    interface: "test-tun".into(),
+                    metric: 1,
+                    table: None,
+                })
+                .unwrap();
+        }
+
+        assert!(table.revert_all_checked().is_err());
+        assert!(table.revert_all_checked().is_err());
+        assert_eq!(
+            *backend.deleted.lock(),
+            [
+                "192.168.0.0/16",
+                "172.16.0.0/12",
+                "10.0.0.0/8",
+                "192.168.0.0/16",
+                "172.16.0.0/12",
+                "10.0.0.0/8",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_ipv4_delete_targets_only_the_managed_interface() {
+        let route = ManagedRoute {
+            dest: "0.0.0.0/0".parse().unwrap(),
+            gateway: None,
+            interface: "WutherCoreTun".into(),
+            metric: 0,
+            table: None,
+        };
+
+        assert_eq!(
+            windows_ipv4_route_args(&route, 42, false),
+            [
+                "DELETE", "0.0.0.0", "MASK", "0.0.0.0", "0.0.0.0", "IF", "42",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_ipv6_routes_are_exact_and_active_only() {
+        let route = ManagedRoute {
+            dest: "::/0".parse().unwrap(),
+            gateway: Some("fe80::1".parse().unwrap()),
+            interface: "WutherCoreTun".into(),
+            metric: 7,
+            table: None,
+        };
+
+        assert_eq!(
+            windows_ipv6_route_args(&route, true),
+            [
+                "interface",
+                "ipv6",
+                "add",
+                "route",
+                "prefix=::/0",
+                "interface=WutherCoreTun",
+                "nexthop=fe80::1",
+                "metric=7",
+                "store=active",
+            ]
+        );
+        assert_eq!(
+            windows_ipv6_route_args(&route, false),
+            [
+                "interface",
+                "ipv6",
+                "delete",
+                "route",
+                "prefix=::/0",
+                "interface=WutherCoreTun",
+                "nexthop=fe80::1",
+                "store=active",
+            ]
+        );
     }
 
     #[test]
