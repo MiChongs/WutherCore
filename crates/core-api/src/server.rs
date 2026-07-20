@@ -57,6 +57,8 @@ pub struct ApiServer {
     pub clash_compat: bool,
     pub urltest: Arc<UrlTester>,
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
+    /// 统一组网监督器；提供只读运行状态，不暴露认证材料。
+    pub mesh: Option<Arc<core_mesh::MeshSupervisor>>,
     pub feeds: Option<Arc<core_feeds::FeedManager>>,
     /// CORS 允许 origin 列表。空 = 仅本机；`["*"]` = Any。
     /// 来自 `ui.cors` 配置。
@@ -76,6 +78,7 @@ impl ApiServer {
             secret: self.secret.clone(),
             urltest: self.urltest.clone(),
             capture: self.capture.clone(),
+            mesh: self.mesh.clone(),
             feeds: self.feeds.clone(),
             caches: caches.clone(),
             ws_hubs: ws_hubs.clone(),

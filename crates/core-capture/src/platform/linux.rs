@@ -779,9 +779,9 @@ fn install_auto_route(routes: &RouteTable, plan: &CapturePlan) {
     // 避免与已有 0.0.0.0/0 互相覆盖；同时统一使用自定义路由表 + ip rule。
     let table = plan.iproute2_table_index;
     let rule_idx = plan.iproute2_rule_index;
-    let mut cidrs: Vec<&str> = vec!["0.0.0.0/1", "128.0.0.0/1"];
+    let mut cidrs: Vec<&str> = crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V4.to_vec();
     if plan.tun_v6_cidr.is_some() && is_ipv6_available(&plan.interface_name) {
-        cidrs.extend_from_slice(&["::/1", "8000::/1"]);
+        cidrs.extend_from_slice(&crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V6);
     }
     for cidr in cidrs {
         if let Ok(net) = cidr.parse() {
@@ -948,9 +948,7 @@ fn install_auto_route(routes: &RouteTable, plan: &CapturePlan) {
 }
 
 fn tun_outbound_mark(plan: &CapturePlan) -> u32 {
-    plan.auto_redirect_marks
-        .output
-        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+    crate::resource_claims::tun_outbound_mark(plan)
 }
 
 fn outbound_bypass_rule_priority(rule_idx: u32) -> u32 {
@@ -1049,7 +1047,7 @@ fn route_rule_family(net: &ipnet::IpNet) -> &'static str {
 }
 
 fn auto_route_uses_catch_all_rule(plan: &CapturePlan) -> bool {
-    plan.route_addresses.is_empty() || !plan.route_address_set.is_empty()
+    crate::resource_claims::linux_auto_route_is_catch_all(plan)
 }
 
 fn should_cleanup_legacy_catch_all_rule(plan: &CapturePlan) -> bool {
@@ -1340,9 +1338,13 @@ const NFT_REDIRECT_TABLE: &str = "wuthercore_redirect";
 
 fn install_auto_redirect(plan: &CapturePlan) -> Result<(), CaptureError> {
     let marks = &plan.auto_redirect_marks;
-    let in_mark = marks.input.unwrap_or(0x2023);
+    let in_mark = marks
+        .input
+        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK);
     let out_mark = tun_outbound_mark(plan);
-    let reset_mark = marks.reset.unwrap_or(0x2025);
+    let reset_mark = marks
+        .reset
+        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK);
 
     let mut script = String::new();
     use std::fmt::Write;
@@ -2008,7 +2010,12 @@ fn revert_auto_redirect(plan: &CapturePlan) {
     // ip rule 撤销
     if ip_rule_supported() {
         let table_s = plan.iproute2_table_index.to_string();
-        let mark_s = format!("{:#x}", plan.auto_redirect_marks.input.unwrap_or(0x2023));
+        let mark_s = format!(
+            "{:#x}",
+            plan.auto_redirect_marks
+                .input
+                .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK)
+        );
         for fam in ["", "-6"] {
             let _ = run_ip_quiet(fam, &["rule", "del", "fwmark", &mark_s, "lookup", &table_s]);
         }

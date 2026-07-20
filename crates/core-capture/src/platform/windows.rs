@@ -143,7 +143,7 @@ impl CaptureEngine for WindowsTun {
                 })?;
             }
 
-            for dest in desired_tun_routes(&self.plan) {
+            for dest in crate::resource_claims::windows_tun_route_nets(&self.plan) {
                 self.routes
                     .add(ManagedRoute {
                         dest,
@@ -233,36 +233,6 @@ impl CaptureEngine for WindowsTun {
         info!(target: "capture", iface = %self.plan.interface_name, "windows tun stopped");
         Ok(())
     }
-}
-
-fn desired_tun_routes(plan: &CapturePlan) -> Vec<ipnet::IpNet> {
-    if !plan.auto_route {
-        return Vec::new();
-    }
-
-    let mut routes = if plan.route_addresses.is_empty() || !plan.route_address_set.is_empty() {
-        let mut defaults = vec![
-            "0.0.0.0/0"
-                .parse::<ipnet::IpNet>()
-                .expect("constant IPv4 default route"),
-        ];
-        if plan.ipv6_enabled && plan.tun_v6_cidr.is_some() {
-            defaults.push(
-                "::/0"
-                    .parse::<ipnet::IpNet>()
-                    .expect("constant IPv6 default route"),
-            );
-        }
-        defaults
-    } else {
-        plan.route_addresses.clone()
-    };
-    routes.retain(|route| {
-        route.addr().is_ipv4() || (plan.ipv6_enabled && plan.tun_v6_cidr.is_some())
-    });
-    let mut seen = HashSet::with_capacity(routes.len());
-    routes.retain(|route| seen.insert(*route));
-    routes
 }
 
 /* ---------------- DNS hijack helpers ---------------- */
@@ -636,9 +606,11 @@ mod tests {
 
     #[test]
     fn desired_routes_respect_auto_route_ipv6_and_explicit_prefixes() {
-        assert!(desired_tun_routes(&route_plan(false, true)).is_empty());
+        assert!(
+            crate::resource_claims::windows_tun_route_nets(&route_plan(false, true)).is_empty()
+        );
         assert_eq!(
-            desired_tun_routes(&route_plan(true, true)),
+            crate::resource_claims::windows_tun_route_nets(&route_plan(true, true)),
             [
                 "0.0.0.0/0".parse::<ipnet::IpNet>().unwrap(),
                 "::/0".parse::<ipnet::IpNet>().unwrap(),
@@ -648,7 +620,7 @@ mod tests {
         let mut ipv4_only = route_plan(true, true);
         ipv4_only.ipv6_enabled = false;
         assert_eq!(
-            desired_tun_routes(&ipv4_only),
+            crate::resource_claims::windows_tun_route_nets(&ipv4_only),
             ["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()]
         );
 
@@ -659,7 +631,7 @@ mod tests {
             "2001:db8::/32".parse().unwrap(),
         ];
         assert_eq!(
-            desired_tun_routes(&explicit),
+            crate::resource_claims::windows_tun_route_nets(&explicit),
             [
                 "10.0.0.0/8".parse::<ipnet::IpNet>().unwrap(),
                 "2001:db8::/32".parse::<ipnet::IpNet>().unwrap(),

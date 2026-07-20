@@ -6,7 +6,7 @@ pub(crate) const TPROXY_FWMARK: u32 = 0x2d0;
 pub(crate) const TPROXY_PORT: u16 = 7894;
 pub(crate) const TPROXY_ROUTE_IFACE: &str = "lo";
 
-const TPROXY_ROUTE_TABLE: u32 = 0x2d0;
+pub(crate) const TPROXY_ROUTE_TABLE: u32 = 0x2d0;
 const TPROXY_PREROUTING_CHAIN: &str = "WUTHERCORE_PREROUTING";
 const TPROXY_OUTPUT_CHAIN: &str = "WUTHERCORE_OUTPUT";
 const TPROXY_DIVERT_CHAIN: &str = "WUTHERCORE_DIVERT";

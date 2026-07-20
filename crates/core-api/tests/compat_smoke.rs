@@ -1,7 +1,14 @@
 //! Clash 兼容层关键端点的 smoke 测试 —— 直接打 axum router 验证响应形状。
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -37,6 +44,110 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
+struct AdversarialMeshBackend {
+    descriptor: core_mesh::BackendDescriptor,
+    calls: Arc<AtomicUsize>,
+}
+
+impl AdversarialMeshBackend {
+    fn new(calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            descriptor: core_mesh::BackendDescriptor::new(
+                core_mesh::BackendId::new("malicious-backend").unwrap(),
+                core_mesh::BackendKind::Other("vendor\ncontrolled".to_owned()),
+                core_mesh::BackendOwnership::AttachExternal,
+            ),
+            calls,
+        }
+    }
+
+    fn status_value(&self) -> core_mesh::BackendStatus {
+        let mut status = core_mesh::BackendStatus::new(
+            self.descriptor.id().clone(),
+            self.descriptor.kind().clone(),
+            self.descriptor.ownership(),
+        );
+        status.phase = core_mesh::BackendPhase::Ready;
+        status.version = Some(format!("v1\r\n{}", "版".repeat(100)));
+        status.attachments = vec![
+            core_mesh::Attachment::Endpoint(core_mesh::EndpointAttachment {
+                purpose: core_mesh::EndpointPurpose::Health,
+                address: core_mesh::EndpointAddress::Url(
+                    "https://example.com:8443/health/check".to_owned(),
+                ),
+            }),
+            core_mesh::Attachment::Endpoint(core_mesh::EndpointAttachment {
+                purpose: core_mesh::EndpointPurpose::Control,
+                address: core_mesh::EndpointAddress::Url(
+                    "https://alice:password-secret@example.com:9443/private/path\
+                     ?token=query-secret#fragment-secret"
+                        .replace(' ', ""),
+                ),
+            }),
+            core_mesh::Attachment::Endpoint(core_mesh::EndpointAttachment {
+                purpose: core_mesh::EndpointPurpose::Other("invalid\nurl".to_owned()),
+                address: core_mesh::EndpointAddress::Url("not a url invalid-url-secret".to_owned()),
+            }),
+            core_mesh::Attachment::Endpoint(core_mesh::EndpointAttachment {
+                purpose: core_mesh::EndpointPurpose::Management,
+                address: core_mesh::EndpointAddress::Opaque("opaque-secret".to_owned()),
+            }),
+        ];
+        status.resource_claims.push(
+            core_mesh::ResourceClaim::coordinated(
+                core_mesh::SystemResource::Interface {
+                    name: "mesh\ninterface".to_owned(),
+                },
+                "coordination-secret",
+            )
+            .unwrap(),
+        );
+        status.diagnostics.push(core_mesh::Diagnostic::new(
+            core_mesh::DiagnosticLevel::Error,
+            "unsafe\ncode",
+            "diagnostic-secret",
+        ));
+        status
+    }
+
+    fn record_call(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl core_mesh::NetworkBackend for AdversarialMeshBackend {
+    fn descriptor(&self) -> core_mesh::BackendDescriptor {
+        self.descriptor.clone()
+    }
+
+    async fn probe(&self) -> core_mesh::BackendResult<core_mesh::BackendObservation> {
+        self.record_call();
+        Ok(self.status_value())
+    }
+
+    async fn reconcile(
+        &self,
+        _observation: &core_mesh::BackendObservation,
+    ) -> core_mesh::BackendResult<core_mesh::BackendStatus> {
+        self.record_call();
+        Ok(self.status_value())
+    }
+
+    async fn status(&self) -> core_mesh::BackendResult<core_mesh::BackendStatus> {
+        self.record_call();
+        Ok(self.status_value())
+    }
+}
+
+#[async_trait]
+impl core_mesh::ExternalNetworkBackend for AdversarialMeshBackend {
+    async fn detach(&self) -> core_mesh::BackendResult<()> {
+        self.record_call();
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn version_advertises_meta() {
     let app = core_api::compat::router(build_state());
@@ -53,6 +164,133 @@ async fn version_advertises_meta() {
     let v = body_json(resp).await;
     assert_eq!(v["meta"], Value::Bool(true));
     assert_eq!(v["premium"], Value::Bool(true));
+}
+
+#[tokio::test]
+async fn mesh_status_is_explicit_when_supervisor_is_not_injected() {
+    let app = core_api::native::router(build_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/mesh/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let value = body_json(resp).await;
+    assert_eq!(value["code"], "mesh_supervisor_unavailable");
+}
+
+#[tokio::test]
+async fn mesh_status_returns_a_redacted_snapshot_without_backend_calls() {
+    let mut state = build_state();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = core_mesh::BackendRegistry::new();
+    registry
+        .register_external(Arc::new(AdversarialMeshBackend::new(calls.clone())))
+        .expect("backend registration");
+    let mesh = Arc::new(core_mesh::MeshSupervisor::with_options(
+        registry,
+        Vec::new(),
+        core_mesh::SupervisorOptions {
+            monitor_interval: Duration::ZERO,
+            ..core_mesh::SupervisorOptions::default()
+        },
+    ));
+    mesh.start().await.expect("supervisor starts");
+    let calls_after_start = calls.load(Ordering::SeqCst);
+    assert_eq!(calls_after_start, 2, "start must probe and reconcile once");
+    state.mesh = Some(mesh.clone());
+
+    let app = core_api::native::router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/mesh/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let value = body_json(resp).await;
+    assert_eq!(value["running"], true);
+    assert_eq!(value["supervisor_phase"], "running");
+    let generation = value["generation"].clone();
+    let status = &value["statuses"]["malicious-backend"];
+    assert_eq!(status["kind"]["other"], "vendor controlled");
+    let version = status["version"].as_str().expect("public version");
+    assert!(version.len() <= 128);
+    assert!(!version.chars().any(char::is_control));
+
+    let attachments = status["attachments"].as_array().expect("attachments");
+    assert_eq!(
+        attachments[0]["details"]["address"]["value"],
+        "https://example.com:8443/"
+    );
+    assert_eq!(
+        attachments[1]["details"]["address"]["value"],
+        "https://example.com:9443/"
+    );
+    for hidden in [&attachments[2], &attachments[3]] {
+        assert_eq!(hidden["details"]["address"]["type"], "hidden");
+        assert!(hidden["details"]["address"].get("value").is_none());
+    }
+    assert_eq!(status["diagnostics"][0]["code"], "mesh.backend_diagnostic");
+    assert_eq!(
+        status["diagnostics"][0]["message"],
+        "diagnostic details are available in local process logs"
+    );
+
+    let serialized = serde_json::to_string(&value).unwrap();
+    for secret in [
+        "alice",
+        "password-secret",
+        "query-secret",
+        "fragment-secret",
+        "health/check",
+        "private/path",
+        "invalid-url-secret",
+        "opaque-secret",
+        "coordination-secret",
+        "coordination_key",
+        "diagnostic-secret",
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "mesh API leaked {secret}: {serialized}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_after_start,
+        "GET must not invoke a backend"
+    );
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri("/mesh/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(second).await["generation"],
+        generation,
+        "read-only status requests must not publish a new generation"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_after_start,
+        "repeated GET must remain snapshot-only"
+    );
+    mesh.stop().await.expect("supervisor stops");
 }
 
 #[tokio::test]
