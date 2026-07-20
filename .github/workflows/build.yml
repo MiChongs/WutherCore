@@ -10,6 +10,7 @@ on:
       - '.github/workflows/build.yml'
 permissions:
   contents: read
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
