@@ -1663,6 +1663,13 @@ impl HttpRequestHead {
                     "only a single chunked transfer coding is supported",
                 ));
             }
+            for trailer in self
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("trailer"))
+            {
+                validate_http_trailer_declaration(&trailer.value)?;
+            }
             return Ok(HttpBodyFraming::chunked());
         }
         if self.header("trailer").is_some() {
@@ -2258,28 +2265,98 @@ fn parse_http_chunk_trailer(line: &[u8]) -> io::Result<bool> {
     {
         return Err(invalid_data("invalid HTTP chunk trailer field"));
     }
-    let name = std::str::from_utf8(name)
-        .map_err(|_| invalid_data("HTTP chunk trailer name must be ASCII"))?;
-    if [
-        "content-length",
-        "transfer-encoding",
-        "host",
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "trailer",
-        "te",
-        "upgrade",
+    validate_http_trailer_name(name)?;
+    Ok(true)
+}
+
+fn validate_http_trailer_declaration(value: &[u8]) -> io::Result<()> {
+    let mut fields = value.split(|byte| *byte == b',').peekable();
+    if fields.peek().is_none() {
+        return Err(invalid_data("Trailer header field list is empty"));
+    }
+    for field in fields {
+        let field = trim_http_ows(field);
+        if field.is_empty() || !field.iter().copied().all(is_http_token_byte) {
+            return Err(invalid_data("invalid field name in Trailer header"));
+        }
+        validate_http_trailer_name(field)?;
+    }
+    Ok(())
+}
+
+fn validate_http_trailer_name(name: &[u8]) -> io::Result<()> {
+    // RFC 9110 section 6.5.1 prohibits fields whose semantics must be known
+    // before the content: framing, routing, authentication, request controls,
+    // response controls, and content format. Unknown extension fields remain
+    // available because their own specifications can explicitly permit
+    // trailers (integrity/signature metadata is a common example).
+    const FORBIDDEN: &[&str] = &[
+        "accept",
+        "accept-charset",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "age",
+        "allow",
+        "authentication-info",
         "authorization",
-        "proxy-authorization",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-location",
+        "content-range",
+        "content-type",
+        "cookie",
+        "early-data",
+        "expect",
+        "expires",
+        "forwarded",
+        "from",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "keep-alive",
+        "location",
+        "max-forwards",
+        "origin",
+        "pragma",
+        "prefer",
+        "priority",
         "proxy-authenticate",
-    ]
-    .iter()
-    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        "proxy-authentication-info",
+        "proxy-authorization",
+        "proxy-connection",
+        "range",
+        "referer",
+        "retry-after",
+        "server",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "vary",
+        "via",
+        "warning",
+        "www-authenticate",
+    ];
+    if FORBIDDEN
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden.as_bytes()))
     {
         return Err(invalid_data("forbidden HTTP chunk trailer field"));
     }
-    Ok(true)
+    Ok(())
 }
 
 async fn write_http_control(sock: &mut TcpStream, response: &[u8]) -> io::Result<()> {
@@ -2627,6 +2704,8 @@ route:
             b"POST / HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
                 .as_slice(),
             b"POST / HTTP/1.1\r\nHost: example.com\r\nTrailer: Digest\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: Digest, Content-Type\r\n\r\n"
+                .as_slice(),
         ] {
             let request = parse_http_request_head(ambiguous).unwrap();
             assert_eq!(
@@ -2717,6 +2796,13 @@ route:
             b"1\r\naX".as_slice(),
             b"0\r\nContent-Length: 4\r\n\r\n".as_slice(),
             b"0\r\nProxy-Connection: keep-alive\r\n\r\n".as_slice(),
+            b"0\r\nCookie: session=secret\r\n\r\n".as_slice(),
+            b"0\r\nExpect: 100-continue\r\n\r\n".as_slice(),
+            b"0\r\nContent-Encoding: gzip\r\n\r\n".as_slice(),
+            b"0\r\nContent-Type: application/json\r\n\r\n".as_slice(),
+            b"0\r\nContent-Range: bytes 0-3/4\r\n\r\n".as_slice(),
+            b"0\r\nRange: bytes=0-3\r\n\r\n".as_slice(),
+            b"0\r\nIf-None-Match: \"tag\"\r\n\r\n".as_slice(),
             b"0\n\n".as_slice(),
         ] {
             assert!(
