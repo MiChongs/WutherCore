@@ -8,6 +8,9 @@ on:
       - 'Cargo.toml'
       - 'Cross.toml'
       - '.github/workflows/build.yml'
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 jobs:
