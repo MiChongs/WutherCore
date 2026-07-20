@@ -1,108 +1,46 @@
-name: Build and Release (Cross Matrix)
+name: CI
+
 on:
-  workflow_dispatch:
-  push:
-    branches: ["main"]
-    paths:
-      - 'crates/**'
-      - '.github/workflows/ci.yml'
   pull_request:
     branches: ["main"]
-    paths:
-      - 'crates/**'
-      - '.github/workflows/ci.yml'
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+
 jobs:
-  build:
-    name: Build (${{ matrix.platform.name }})
+  required-ci:
+    name: Required CI
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - target: x86_64-unknown-linux-gnu
-            name: linux-amd64
-            is_android: false
-          - target: aarch64-unknown-linux-gnu
-            name: linux-arm64
-            is_android: false
-          - target: aarch64-linux-android
-            name: android-arm64
-            is_android: true
-          - target: armv7-linux-androideabi
-            name: android-arm
-            is_android: true
-          - target: i686-unknown-linux-gnu
-            name: linux-i686
-            is_android: false
-          - target: s390x-unknown-linux-gnu
-            name: linux-s390x
-            is_android: false
-          - target: x86_64-pc-windows-gnu
-            name: windows-amd64
-            is_android: false
+    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Setup Rust toolchain
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.platform.target }}
-          components: rust-src
-      - name: Setup Android NDK
-        if: matrix.platform.is_android == true
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r29
-          add-to-path: true
-      - name: Install cargo-ndk
-        if: matrix.platform.is_android == true
-        run: |
-          cargo install cargo-ndk --locked
-      - name: Install Cross
-        if: matrix.platform.is_android != true
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross.git --rev v0.2.5 --locked
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.platform.target }}
-          save-if: ${{ github.event_name == 'push' }}
-      - name: Run Cargo NDK Build (Android)
-        if: matrix.platform.is_android == true
-        run: |
-          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release
-      - name: Run Cross Build (Non-Android)
-        if: matrix.platform.is_android != true
-        run: |
-          cross build --release --target ${{ matrix.platform.target }}
-      - name: Package Artifacts
-        run: |
-          mkdir -p ./dist
-          mkdir -p ./pkg_dir
-          FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core"
+          components: rustfmt
 
-          if [ -f "target/${{ matrix.platform.target }}/release/wuther-core.exe" ]; then
-            FILE_PATH="target/${{ matrix.platform.target}}/release/wuther-core.exe"
-          fi
-          
-          if [ -f "$FILE_PATH" ]; then
-            cp "$FILE_PATH" ./pkg_dir/
-          else
-            echo "Error: Failed to find artifacts $FILE_PATH"
-            exit 1
-          fi
-          
-          cd ./pkg_dir
-          zip -r ../dist/wuther-core-${{ matrix.platform.name }}.zip ./*
-          cd ..
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wuther-core-${{ matrix.platform.name }}
-          path: ./dist/*
-          archive: false
-          retention-days: 1
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace
