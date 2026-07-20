@@ -1403,7 +1403,8 @@ mod tests {
     #[test]
     fn tuic_construct() {
         let u = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
-        let mut ob = TuicOutbound::new("t", "1.2.3.4", 443, u, "pass");
+        let password = Uuid::new_v4().to_string();
+        let mut ob = TuicOutbound::new("t", "1.2.3.4", 443, u, &password);
         assert_eq!(ob.protocol(), "tuic");
         assert_eq!(ob.uuid, u);
         assert!(ob.capabilities().udp);
