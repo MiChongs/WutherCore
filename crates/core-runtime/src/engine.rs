@@ -427,6 +427,7 @@ impl Runtime {
             port,
             network,
             process: None,
+            ruleset: Default::default(),
             protocol: None,
         };
         self.pick_outbound_for_context(ctx)
@@ -517,6 +518,7 @@ impl Runtime {
             port,
             network,
             process: None,
+            ruleset: Default::default(),
             protocol: None,
         };
         self.dial_with_context(ctx).await
@@ -765,6 +767,7 @@ impl Runtime {
             port,
             network: NetworkKind::Udp,
             process: None,
+            ruleset: Default::default(),
             protocol: None,
         };
         self.dial_udp_with_context(ctx).await

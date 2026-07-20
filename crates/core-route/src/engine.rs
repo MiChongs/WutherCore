@@ -6,7 +6,7 @@
 use std::{net::IpAddr, sync::Arc};
 
 use core_config::runtime_plan::{RouteAction, RouteMatcher, RoutePlan};
-use core_ruleset::{RulesetIndex, RulesetMatchContext};
+use core_ruleset::{RulesetIndex, RulesetInterfaceAddress, RulesetMatchContext};
 use ipnet::IpNet;
 
 use crate::builtin;
@@ -26,6 +26,45 @@ impl NetworkKind {
     }
 }
 
+/// sing-box 规则集可选元数据。
+///
+/// 这些值只在调用方确实掌握时填写；`None`/空集合不会回退到连接协议、
+/// 目标地址或其他近似字段，对应 predicate 会安全地返回 false。
+#[derive(Debug, Clone)]
+pub struct FlowRulesetMetadata {
+    pub source_ip: Option<IpAddr>,
+    pub source_port: Option<u16>,
+    pub query_type: Option<u16>,
+    pub process_path: Option<String>,
+    pub package_names: Vec<String>,
+    pub wifi_ssid: Option<String>,
+    pub wifi_bssid: Option<String>,
+    pub network_type: Option<u8>,
+    pub network_is_expensive: Option<bool>,
+    pub network_is_constrained: Option<bool>,
+    pub network_interface_addresses: Vec<RulesetInterfaceAddress>,
+    pub default_interface_addresses: Vec<IpNet>,
+}
+
+impl Default for FlowRulesetMetadata {
+    fn default() -> Self {
+        Self {
+            source_ip: None,
+            source_port: None,
+            query_type: None,
+            process_path: None,
+            package_names: Vec::new(),
+            wifi_ssid: None,
+            wifi_bssid: None,
+            network_type: None,
+            network_is_expensive: None,
+            network_is_constrained: None,
+            network_interface_addresses: Vec::new(),
+            default_interface_addresses: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FlowContext {
     pub host: String,
@@ -33,6 +72,8 @@ pub struct FlowContext {
     pub port: u16,
     pub network: NetworkKind,
     pub process: Option<String>,
+    /// sing-box 规则集专用的、可选的系统/连接元数据。
+    pub ruleset: FlowRulesetMetadata,
     /// L7 协议指纹 —— 由 inbound/capture 嗅探首包后写入；用于 `proto:` 规则。
     pub protocol: Option<crate::sniff::L7Proto>,
 }
@@ -45,6 +86,7 @@ impl FlowContext {
             port,
             network,
             process: None,
+            ruleset: FlowRulesetMetadata::default(),
             protocol: None,
         }
     }
@@ -56,7 +98,30 @@ impl FlowContext {
             port,
             network,
             process: None,
+            ruleset: FlowRulesetMetadata::default(),
             protocol: None,
+        }
+    }
+
+    fn ruleset_match_context(&self) -> RulesetMatchContext<'_> {
+        RulesetMatchContext {
+            dst_host: &self.host,
+            dst_ip: self.ip,
+            dst_port: Some(self.port),
+            src_ip: self.ruleset.source_ip,
+            src_port: self.ruleset.source_port,
+            network: Some(self.network.as_str()),
+            process_name: self.process.as_deref(),
+            query_type: self.ruleset.query_type,
+            process_path: self.ruleset.process_path.as_deref(),
+            package_names: &self.ruleset.package_names,
+            wifi_ssid: self.ruleset.wifi_ssid.as_deref(),
+            wifi_bssid: self.ruleset.wifi_bssid.as_deref(),
+            network_type: self.ruleset.network_type,
+            network_is_expensive: self.ruleset.network_is_expensive,
+            network_is_constrained: self.ruleset.network_is_constrained,
+            network_interface_addresses: &self.ruleset.network_interface_addresses,
+            default_interface_addresses: &self.ruleset.default_interface_addresses,
         }
     }
 
@@ -192,17 +257,7 @@ fn step_matches(
         RouteMatcher::Set(name) => match rulesets {
             Some(idx) => idx
                 .get(name)
-                .map(|m| {
-                    m.matches_context(&RulesetMatchContext {
-                        dst_host: &ctx.host,
-                        dst_ip: ctx.ip,
-                        dst_port: Some(ctx.port),
-                        src_ip: None,
-                        src_port: None,
-                        network: Some(ctx.network.as_str()),
-                        process_name: ctx.process.as_deref(),
-                    })
-                })
+                .map(|m| m.matches_context(&ctx.ruleset_match_context()))
                 .unwrap_or(false),
             None => false,
         },
@@ -343,6 +398,52 @@ mod tests {
     fn host_suffix_case_insensitive() {
         assert!(super::host_suffix("Mail.QQ.com", "qq.com"));
         assert!(!super::host_suffix("noqq.com", "qq.com"));
+    }
+
+    #[test]
+    fn flow_ruleset_metadata_is_mapped_without_loss() {
+        let interface_address = RulesetInterfaceAddress {
+            interface_type: 3,
+            address: "192.168.0.0/16".parse().unwrap(),
+            is_own: false,
+        };
+        let default_address: IpNet = "10.0.0.0/8".parse().unwrap();
+        let mut flow = FlowContext::for_domain("dns.example", 53, NetworkKind::Udp);
+        flow.ip = Some("203.0.113.8".parse().unwrap());
+        flow.process = Some("resolver".into());
+        flow.ruleset = FlowRulesetMetadata {
+            source_ip: Some("192.0.2.7".parse().unwrap()),
+            source_port: Some(53000),
+            query_type: Some(28),
+            process_path: Some("/usr/bin/resolver".into()),
+            package_names: vec!["com.example.resolver".into()],
+            wifi_ssid: Some("office".into()),
+            wifi_bssid: Some("00:11:22:33:44:55".into()),
+            network_type: Some(3),
+            network_is_expensive: Some(true),
+            network_is_constrained: Some(false),
+            network_interface_addresses: vec![interface_address.clone()],
+            default_interface_addresses: vec![default_address],
+        };
+
+        let ruleset = flow.ruleset_match_context();
+        assert_eq!(ruleset.dst_host, "dns.example");
+        assert_eq!(ruleset.dst_ip, flow.ip);
+        assert_eq!(ruleset.dst_port, Some(53));
+        assert_eq!(ruleset.src_ip, flow.ruleset.source_ip);
+        assert_eq!(ruleset.src_port, Some(53000));
+        assert_eq!(ruleset.network, Some("udp"));
+        assert_eq!(ruleset.process_name, Some("resolver"));
+        assert_eq!(ruleset.query_type, Some(28));
+        assert_eq!(ruleset.process_path, Some("/usr/bin/resolver"));
+        assert_eq!(ruleset.package_names, ["com.example.resolver"]);
+        assert_eq!(ruleset.wifi_ssid, Some("office"));
+        assert_eq!(ruleset.wifi_bssid, Some("00:11:22:33:44:55"));
+        assert_eq!(ruleset.network_type, Some(3));
+        assert_eq!(ruleset.network_is_expensive, Some(true));
+        assert_eq!(ruleset.network_is_constrained, Some(false));
+        assert_eq!(ruleset.network_interface_addresses, [interface_address]);
+        assert_eq!(ruleset.default_interface_addresses, [default_address]);
     }
 
     /// `Or([Port(53), Port(5353)])` 应该在端口为 53 或 5353 时命中，其它时不命中。

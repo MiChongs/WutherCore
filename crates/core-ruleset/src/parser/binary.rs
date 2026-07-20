@@ -6,8 +6,8 @@
 //! 现 trie wildcard 语义**。生产路径请改走 [`crate::parser::parse_ruleset_compiled`]，
 //! 它会保留 `RulesetCompiled::Mrs` 以零拷贝挂到 matcher。
 //!
-//! **SRS**：sing-box 二进制规则集，结构与 MRS 完全不同（gob-like + 自定义版本协议），
-//! 暂未实现。等上游 spec 稳定再补。
+//! **SRS**：生产路径由 [`crate::parser::srs`] 严格解码为共享语义 IR。老 API
+//! 无法保留 logical AND / OR / invert，因此在这里明确拒绝有损展开。
 
 use crate::{
     matcher::ClassicalEntry,
@@ -59,9 +59,10 @@ pub fn parse_mrs(body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
 
 pub fn parse_srs(body: &[u8]) -> Result<Vec<ClassicalEntry>, ParseError> {
     let _ = body;
-    Err(ParseError::UnsupportedBinary(
-        "sing-box SRS 二进制规则集尚未完整解码。请用 \
-         `sing-box rule-set decompile xxx.srs` 转换为 json，或在配置中改 format: json 指向源 JSON。",
+    Err(ParseError::InvalidRule(
+        "sing-box SRS 含复合布尔语义，不能无损转换为 Vec<ClassicalEntry>；请使用 \
+         parse_ruleset_compiled"
+            .into(),
     ))
 }
 

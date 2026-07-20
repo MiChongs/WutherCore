@@ -15,8 +15,11 @@
 
 use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
-    time::Instant,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use core_config::model::{Capture, Mesh};
@@ -24,7 +27,7 @@ use core_resolver::fake_ip::FakeIpPool;
 use core_runtime::Runtime;
 use parking_lot::RwLock;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::JoinHandle,
 };
 use tracing::{debug, info, warn};
@@ -56,6 +59,261 @@ impl DispatcherHandles {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Lifecycle {
+    Stopped = 0,
+    Starting = 1,
+    Running = 2,
+    Stopping = 3,
+}
+
+impl Lifecycle {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Starting,
+            2 => Self::Running,
+            3 => Self::Stopping,
+            _ => Self::Stopped,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+        }
+    }
+}
+
+/// Resource teardown is deliberately the exact reverse of startup.
+///
+/// Keeping the order as data makes rollback and ordinary stop share the same
+/// implementation, and gives tests a stable contract to assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupStep {
+    NetworkListener,
+    PurgeTask,
+    DnsTask,
+    EventTask,
+    Dispatcher,
+    SystemProxy,
+    Engine,
+}
+
+const CLEANUP_ORDER: [CleanupStep; 7] = [
+    CleanupStep::NetworkListener,
+    CleanupStep::PurgeTask,
+    CleanupStep::DnsTask,
+    CleanupStep::EventTask,
+    CleanupStep::Dispatcher,
+    CleanupStep::SystemProxy,
+    CleanupStep::Engine,
+];
+
+#[derive(Default)]
+struct SupervisorResources {
+    event_stopper: Option<oneshot::Sender<()>>,
+    event_handle: Option<JoinHandle<()>>,
+    dns_handle: Option<JoinHandle<()>>,
+    purge_handle: Option<JoinHandle<()>>,
+    network_listener_handle: Option<JoinHandle<()>>,
+    dispatcher: Option<DispatcherHandles>,
+    sys_proxy: Option<SystemProxyGuard>,
+}
+
+impl SupervisorResources {
+    async fn shutdown(
+        &mut self,
+        engine: Arc<dyn CaptureEngine>,
+        stop_engine: bool,
+    ) -> Result<(), CaptureError> {
+        let mut engine_result = Ok(());
+        for step in CLEANUP_ORDER {
+            match step {
+                CleanupStep::NetworkListener => {
+                    abort_and_join(self.network_listener_handle.take()).await;
+                }
+                CleanupStep::PurgeTask => {
+                    abort_and_join(self.purge_handle.take()).await;
+                }
+                CleanupStep::DnsTask => {
+                    abort_and_join(self.dns_handle.take()).await;
+                }
+                CleanupStep::EventTask => {
+                    if let Some(tx) = self.event_stopper.take() {
+                        let _ = tx.send(());
+                    }
+                    stop_and_join(self.event_handle.take()).await;
+                }
+                CleanupStep::Dispatcher => {
+                    if let Some(dispatcher) = self.dispatcher.take() {
+                        dispatcher.stop();
+                    }
+                }
+                CleanupStep::SystemProxy => {
+                    if let Some(proxy) = self.sys_proxy.take() {
+                        proxy.revert();
+                    }
+                }
+                CleanupStep::Engine if stop_engine => {
+                    engine_result = engine.clone().stop().await;
+                }
+                CleanupStep::Engine => {}
+            }
+        }
+        engine_result
+    }
+
+    /// Cancellation fallback for a dropped start/stop future. Async engine
+    /// cleanup is scheduled separately by [`CleanupTransaction::drop`].
+    fn abort_sync(&mut self) {
+        for handle in [
+            self.network_listener_handle.take(),
+            self.purge_handle.take(),
+            self.dns_handle.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+        }
+        if let Some(tx) = self.event_stopper.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.event_handle.take() {
+            handle.abort();
+        }
+        if let Some(dispatcher) = self.dispatcher.take() {
+            dispatcher.stop();
+        }
+        if let Some(proxy) = self.sys_proxy.take() {
+            proxy.revert();
+        }
+    }
+}
+
+async fn abort_and_join(handle: Option<JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+async fn stop_and_join(handle: Option<JoinHandle<()>>) {
+    let Some(mut handle) = handle else {
+        return;
+    };
+    if tokio::time::timeout(Duration::from_secs(1), &mut handle)
+        .await
+        .is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// Owns all not-yet-committed (or being-stopped) resources. If the caller
+/// future is cancelled, `Drop` still aborts supervisor tasks and schedules the
+/// engine cleanup instead of leaving the machine's routes/proxy half applied.
+struct CleanupTransaction {
+    owner: Weak<CaptureSupervisor>,
+    engine: Arc<dyn CaptureEngine>,
+    resources: Option<SupervisorResources>,
+    stop_engine: bool,
+    armed: bool,
+}
+
+impl CleanupTransaction {
+    fn new(owner: &Arc<CaptureSupervisor>, resources: SupervisorResources) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            engine: owner.engine.clone(),
+            resources: Some(resources),
+            stop_engine: false,
+            armed: true,
+        }
+    }
+
+    fn resources_mut(&mut self) -> &mut SupervisorResources {
+        self.resources
+            .as_mut()
+            .expect("cleanup transaction resources already consumed")
+    }
+
+    fn mark_engine_started(&mut self) {
+        // Set before awaiting engine.start: even an engine that returns an
+        // error may have applied a subset of platform state.
+        self.stop_engine = true;
+    }
+
+    async fn shutdown_to_stopped(mut self) -> Result<(), CaptureError> {
+        let result = self
+            .resources
+            .as_mut()
+            .expect("cleanup transaction resources already consumed")
+            .shutdown(self.engine.clone(), self.stop_engine)
+            .await;
+        self.stop_engine = false;
+        self.armed = false;
+        if let Some(owner) = self.owner.upgrade() {
+            owner.finish_transition(Lifecycle::Stopped);
+        }
+        result
+    }
+
+    fn commit(mut self) -> SupervisorResources {
+        self.stop_engine = false;
+        self.armed = false;
+        self.resources
+            .take()
+            .expect("cleanup transaction resources already consumed")
+    }
+}
+
+impl Drop for CleanupTransaction {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(resources) = self.resources.as_mut() {
+            resources.abort_sync();
+        }
+
+        let owner = self.owner.clone();
+        if self.stop_engine {
+            let engine = self.engine.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Err(error) = engine.stop().await {
+                        warn!(
+                            target: "capture",
+                            %error,
+                            "cancelled lifecycle transition: engine rollback failed"
+                        );
+                    }
+                    if let Some(owner) = owner.upgrade() {
+                        owner.finish_transition(Lifecycle::Stopped);
+                    }
+                });
+                return;
+            }
+        }
+        if let Some(owner) = owner.upgrade() {
+            owner.finish_transition(Lifecycle::Stopped);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartFailpoint {
+    Never,
+    AfterEngine,
+    AfterTasks,
+}
+
 pub struct CaptureSupervisor {
     pub plan: CapturePlan,
     pub engine: Arc<dyn CaptureEngine>,
@@ -63,15 +321,11 @@ pub struct CaptureSupervisor {
     pub nat: Arc<NatTable>,
     pub eim: Arc<EimNatTable>,
     ipset: RwLock<Arc<dyn IpSetProvider>>,
-    handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
-    stopper: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
-    dns_handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
-    purge_handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
-    /// engine 暴露 TunIo 后由 supervisor 选派的 dispatcher。
-    /// `stack=system` 走 [`SystemDispatcher`]（OS NAT），其余走 [`TunDispatcher`]（smoltcp）。
-    dispatcher: parking_lot::Mutex<Option<DispatcherHandles>>,
-    /// platform.http_proxy 启用时持有的系统 proxy 还原句柄。
-    sys_proxy: parking_lot::Mutex<Option<SystemProxyGuard>>,
+    lifecycle: AtomicU8,
+    lifecycle_changed: Notify,
+    /// Running resources are committed atomically only after every fallible
+    /// startup step succeeds.
+    resources: parking_lot::Mutex<Option<SupervisorResources>>,
 }
 
 impl CaptureSupervisor {
@@ -105,12 +359,9 @@ impl CaptureSupervisor {
             nat,
             eim,
             ipset: RwLock::new(noop()),
-            handle: parking_lot::Mutex::new(None),
-            stopper: parking_lot::Mutex::new(None),
-            dns_handle: parking_lot::Mutex::new(None),
-            purge_handle: parking_lot::Mutex::new(None),
-            dispatcher: parking_lot::Mutex::new(None),
-            sys_proxy: parking_lot::Mutex::new(None),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
         })))
     }
 
@@ -156,34 +407,127 @@ impl CaptureSupervisor {
         false
     }
 
+    fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::from_raw(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    fn finish_transition(&self, state: Lifecycle) {
+        self.lifecycle.store(state as u8, Ordering::Release);
+        self.lifecycle_changed.notify_waiters();
+    }
+
+    /// Claim the stopped -> starting transition. Concurrent callers wait for
+    /// the active transition without holding a mutex across an await.
+    async fn begin_start(&self) -> bool {
+        loop {
+            let notified = self.lifecycle_changed.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not retain a permit. Register the waiter
+            // before reading lifecycle so a transition between the state read
+            // and `.await` cannot be lost.
+            notified.as_mut().enable();
+            match self.lifecycle() {
+                Lifecycle::Running => return false,
+                Lifecycle::Stopped => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            Lifecycle::Stopped as u8,
+                            Lifecycle::Starting as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                Lifecycle::Starting | Lifecycle::Stopping => notified.await,
+            }
+        }
+    }
+
+    /// Claim the running -> stopping transition. `false` means already stopped.
+    async fn begin_stop(&self) -> bool {
+        loop {
+            let notified = self.lifecycle_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.lifecycle() {
+                Lifecycle::Stopped => return false,
+                Lifecycle::Running => {
+                    if self
+                        .lifecycle
+                        .compare_exchange(
+                            Lifecycle::Running as u8,
+                            Lifecycle::Stopping as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                Lifecycle::Starting | Lifecycle::Stopping => notified.await,
+            }
+        }
+    }
+
     /// 启动 capture：让 engine 就绪，并把事件转发给 runtime.dial。
     pub async fn start(self: &Arc<Self>, runtime: Arc<Runtime>) -> Result<(), CaptureError> {
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1024);
-        let (stop_tx, mut stop_rx) = oneshot::channel();
-        self.engine.clone().start(tx, runtime.clone()).await?;
+        self.start_with_failpoint(runtime, StartFailpoint::Never)
+            .await
+    }
 
-        // platform.http_proxy 透传 —— 系统级 HTTP/HTTPS proxy 写入。
-        if let Some(http_opts) = &self.plan.platform_http_proxy {
-            let guard = SystemProxyGuard::install(http_opts);
-            *self.sys_proxy.lock() = Some(guard);
+    async fn start_with_failpoint(
+        self: &Arc<Self>,
+        runtime: Arc<Runtime>,
+        failpoint: StartFailpoint,
+    ) -> Result<(), CaptureError> {
+        if !self.begin_start().await {
+            // Idempotent start: an already-running supervisor is success.
+            return Ok(());
         }
 
-        let dns_service = Arc::new(
-            core_resolver::DnsService::new(runtime.resolver.clone())
-                .with_fake_pool(self.fake_pool.clone()),
-        );
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(1024);
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let mut transaction = CleanupTransaction::new(self, SupervisorResources::default());
+        transaction.mark_engine_started();
 
-        // virtual_nic/TUN 的平台 packet_loop 只能发现流，不能转发 payload。
-        // 必须由 dispatcher 独占 TUN 读写，否则只改路由不会有任何 TCP/UDP 出站。
-        // 按 `plan.stack` 选派：
-        //   对标 sing-tun：
-        //   * `system` / `mixed` / `native` —— sing-tun 风格 OS NAT 栈：
-        //     TCP 走内核 listener + NAT 改写，UDP 走 udp_handle 转发。
-        //     sing-tun 的 Mixed = System(TCP) + gVisor(UDP)，WutherCore 没有 gVisor，
-        //     所以 Mixed 与 System 行为一致（TCP NAT + UDP forwarder）。
-        //   * `smoltcp` / `gvisor` —— smoltcp 用户态 TCP 栈（仅测试/备用）。
-        if self.plan.kind == EngineKind::Tun {
-            if let Some(tun_io) = self.engine.tun_io() {
+        let start_result: Result<(), CaptureError> = async {
+            self.engine.clone().start(tx, runtime.clone()).await?;
+            if failpoint == StartFailpoint::AfterEngine {
+                return Err(CaptureError::DeviceFailed(
+                    "injected supervisor failure after engine start".into(),
+                ));
+            }
+
+            // platform.http_proxy 透传 —— 系统级 HTTP/HTTPS proxy 写入。
+            if let Some(http_opts) = &self.plan.platform_http_proxy {
+                transaction.resources_mut().sys_proxy = Some(SystemProxyGuard::install(http_opts));
+            }
+
+            let dns_service = Arc::new(
+                core_resolver::DnsService::new(runtime.resolver.clone())
+                    .with_fake_pool(self.fake_pool.clone()),
+            );
+
+            // virtual_nic/TUN 的平台 packet_loop 只能发现流，不能转发 payload。
+            // 必须由 dispatcher 独占 TUN 读写，否则只改路由不会有任何 TCP/UDP 出站。
+            // 按 `plan.stack` 选派：
+            //   对标 sing-tun：
+            //   * `system` / `mixed` / `native` —— sing-tun 风格 OS NAT 栈：
+            //     TCP 走内核 listener + NAT 改写，UDP 走 udp_handle 转发。
+            //     sing-tun 的 Mixed = System(TCP) + gVisor(UDP)，WutherCore 没有 gVisor，
+            //     所以 Mixed 与 System 行为一致（TCP NAT + UDP forwarder）。
+            //   * `smoltcp` / `gvisor` —— smoltcp 用户态 TCP 栈（仅测试/备用）。
+            if self.plan.kind == EngineKind::Tun {
+                let tun_io = self.engine.tun_io().ok_or_else(|| {
+                    CaptureError::DeviceFailed(
+                        "TUN engine started without a packet I/O device".into(),
+                    )
+                })?;
                 use core_config::model::CaptureStack;
                 let use_system = matches!(
                     self.plan.stack,
@@ -223,124 +567,118 @@ impl CaptureSupervisor {
                     );
                     DispatcherHandles::Netstack(h)
                 };
-                *self.dispatcher.lock() = Some(handles);
-            } else {
-                warn!(
-                    target: "capture",
-                    stack = ?self.plan.stack,
-                    "virtual_nic engine has no TunIo; no TUN payload forwarder is available"
-                );
+                transaction.resources_mut().dispatcher = Some(handles);
             }
-        }
 
-        let pool = self.fake_pool.clone();
-        let nat = self.nat.clone();
-        let sup = self.clone();
-        let handle = tokio::spawn(async move {
-            // 本 loop 仅做 NAT 登记 + 调试日志：实际的 dial+splice 由
-            //   * TUN+user-stack:  `TunDispatcher::run_accept_consumer`
-            //   * TPROXY/Redirect: 平台 listener 自身（带 Arc<Runtime>，未来扩展）
-            // 负责。绝对不能在此处 `runtime.dial(..).drop(stream)` —— 之前那条
-            // 路径会建一条到代理服务器的 TCP，但永远不把它 splice 给真正的
-            // 入站连接，导致"拨号成功，应用却收不到任何数据"。
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => break,
-                    event = rx.recv() => {
-                        let Some(evt) = event else { break };
-                        if !sup.allow_ip(evt.original_dst.ip()) {
-                            tracing::debug!(
-                                target: "capture::dispatch",
-                                ip = %evt.original_dst.ip(),
-                                "skipped by route rules / loopback / ipset"
+            // Bind fake-DNS before publishing any task handles. A port conflict
+            // is a startup failure, not a background warning after success.
+            let dns_socket = if self.plan.hijack_dns {
+                let bind: SocketAddr = "127.0.0.1:5454".parse().expect("constant DNS bind");
+                Some(tokio::net::UdpSocket::bind(bind).await?)
+            } else {
+                None
+            };
+
+            let pool = self.fake_pool.clone();
+            let nat = self.nat.clone();
+            let sup = self.clone();
+            let handle = tokio::spawn(async move {
+                // 本 loop 仅做 NAT 登记 + 调试日志：实际的 dial+splice 由
+                //   * TUN+user-stack:  `TunDispatcher::run_accept_consumer`
+                //   * TPROXY/Redirect: 平台 listener 自身（带 Arc<Runtime>，未来扩展）
+                // 负责。绝对不能在此处 `runtime.dial(..).drop(stream)`。
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        event = rx.recv() => {
+                            let Some(evt) = event else { break };
+                            if !sup.allow_ip(evt.original_dst.ip()) {
+                                tracing::debug!(
+                                    target: "capture::dispatch",
+                                    ip = %evt.original_dst.ip(),
+                                    "skipped by route rules / loopback / ipset"
+                                );
+                                continue;
+                            }
+                            let now = Instant::now();
+                            let nat_id = nat.insert(NatEntry {
+                                source: evt.source,
+                                original_dst: evt.original_dst,
+                                fake_host: evt.fake_host.clone(),
+                                network: evt.network,
+                                created_at: now,
+                                last_seen: now,
+                            });
+                            let target = crate::dial_meta::build_dial_target(
+                                &pool,
+                                evt.original_dst,
+                                evt.fake_host.as_deref(),
                             );
-                            continue;
-                        }
-                        let now = Instant::now();
-                        let nat_id = nat.insert(NatEntry {
-                            source: evt.source,
-                            original_dst: evt.original_dst,
-                            fake_host: evt.fake_host.clone(),
-                            network: evt.network,
-                            created_at: now,
-                            last_seen: now,
-                        });
-                        // 与 tun_dispatch 同源：调 build_dial_target 走完整 mihomo
-                        // preHandleMetadata 等价语义（fake-IP 反查 + missing 检测）。
-                        let target = crate::dial_meta::build_dial_target(
-                            &pool,
-                            evt.original_dst,
-                            evt.fake_host.as_deref(),
-                        );
-                        if target.fake_ip_missing {
-                            tracing::warn!(
+                            if target.fake_ip_missing {
+                                tracing::warn!(
+                                    target: "capture::dispatch",
+                                    ip = %evt.original_dst.ip(),
+                                    "fake DNS record missing; skip dispatch"
+                                );
+                                continue;
+                            }
+                            let host = target.host;
+                            debug!(
                                 target: "capture::dispatch",
-                                ip = %evt.original_dst.ip(),
-                                "fake DNS record missing; skip dispatch"
+                                host = %host,
+                                port = evt.original_dst.port(),
+                                net = evt.network,
+                                nat_id,
+                                "flow seen (NAT registered; actual dial owned by stack/listener)"
                             );
-                            continue;
                         }
-                        let host = target.host;
+                    }
+                }
+            });
+            transaction.resources_mut().event_handle = Some(handle);
+            transaction.resources_mut().event_stopper = Some(stop_tx);
+
+            if let Some(dns_socket) = dns_socket {
+                let dns_service = dns_service.clone();
+                let dns_handle = tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::fakeip_dns::run_fake_dns_socket(dns_socket, dns_service).await
+                    {
+                        warn!(target: "capture::dns", error = %e, "fake-dns exited");
+                    }
+                });
+                transaction.resources_mut().dns_handle = Some(dns_handle);
+            }
+
+            // NAT + EIM-NAT 周期性 purge：udp_timeout/2，下限 5s。
+            let purge_period = std::cmp::max(Duration::from_secs(5), self.plan.udp_timeout / 2);
+            let nat_for_gc = self.nat.clone();
+            let eim_for_gc = self.eim.clone();
+            let purge_handle = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(purge_period);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let r1 = nat_for_gc.purge();
+                    let r2 = eim_for_gc.purge();
+                    if r1 + r2 > 0 {
                         debug!(
-                            target: "capture::dispatch",
-                            host = %host,
-                            port = evt.original_dst.port(),
-                            net = evt.network,
-                            nat_id,
-                            "flow seen (NAT registered; actual dial owned by stack/listener)"
+                            target: "capture::nat",
+                            nat_removed = r1,
+                            eim_removed = r2,
+                            nat_remaining = nat_for_gc.len(),
+                            eim_remaining = eim_for_gc.len(),
+                            "purge"
                         );
                     }
                 }
-            }
-        });
-        *self.handle.lock() = Some(handle);
-        *self.stopper.lock() = Some(stop_tx);
-
-        // 可选 fake-dns
-        if self.plan.hijack_dns {
-            let dns_service = dns_service.clone();
-            let dns_handle = tokio::spawn(async move {
-                let bind: SocketAddr = "127.0.0.1:5454".parse().unwrap();
-                if let Err(e) = crate::fakeip_dns::run_fake_dns(bind, dns_service).await {
-                    warn!(target: "capture::dns", error = %e, "fake-dns exited");
-                }
             });
-            *self.dns_handle.lock() = Some(dns_handle);
-        }
+            transaction.resources_mut().purge_handle = Some(purge_handle);
 
-        // NAT + EIM-NAT 周期性 purge：udp_timeout/2，下限 5s。
-        let purge_period =
-            std::cmp::max(std::time::Duration::from_secs(5), self.plan.udp_timeout / 2);
-        let nat_for_gc = self.nat.clone();
-        let eim_for_gc = self.eim.clone();
-        let purge_handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(purge_period);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let r1 = nat_for_gc.purge();
-                let r2 = eim_for_gc.purge();
-                if r1 + r2 > 0 {
-                    debug!(
-                        target: "capture::nat",
-                        nat_removed = r1,
-                        eim_removed = r2,
-                        nat_remaining = nat_for_gc.len(),
-                        eim_remaining = eim_for_gc.len(),
-                        "purge"
-                    );
-                }
-            }
-        });
-        *self.purge_handle.lock() = Some(purge_handle);
-
-        // Network change listener: reset all DNS connections on interface switch.
-        // 订阅 / 规则集拉取由 core-fetch 自管理（每次 fetch 都现做 socket，
-        // 自动取最新 outbound 全局态），不需要任何 client rebuild。
-        {
+            // Network change listener: reset all DNS connections on interface switch.
             let mut net_rx = crate::net_monitor::subscribe();
             let resolver = runtime.resolver.clone();
-            tokio::spawn(async move {
+            let network_listener_handle = tokio::spawn(async move {
                 while let Ok(event) = net_rx.recv().await {
                     info!(
                         target: "capture::net_monitor",
@@ -350,18 +688,47 @@ impl CaptureSupervisor {
                         v6_index = ?event.interface.v6_index,
                         "network changed: resetting DNS connections"
                     );
-                    // DNS 持久连接 (DoT pool, DoQ) 全部重建，用新的
-                    // SO_BINDTODEVICE / IP_UNICAST_IF / IP_BOUND_IF 走物理接口。
                     resolver.reset_connections().await;
                 }
             });
+            transaction.resources_mut().network_listener_handle = Some(network_listener_handle);
+
+            if failpoint == StartFailpoint::AfterTasks {
+                return Err(CaptureError::DeviceFailed(
+                    "injected supervisor failure after task startup".into(),
+                ));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = start_result {
+            if let Err(rollback_error) = transaction.shutdown_to_stopped().await {
+                warn!(
+                    target: "capture",
+                    %rollback_error,
+                    "capture startup rollback could not stop engine cleanly"
+                );
+            }
+            return Err(error);
         }
 
-        // 启动跨平台默认网卡监听 watcher —— 把 plan.interface_name + 常见
-        // TUN 前缀作为 exclude，防止 TUN 抢默认路由后被自己探到。
+        // This watcher is process-global and intentionally outlives a
+        // supervisor instance. Repeated starts only update its shared exclusion
+        // list. Run the synchronous initial probe while lifecycle is still
+        // `Starting`, so a concurrent stop cannot overtake the final commit.
         let exclude =
             crate::default_iface::ExcludeList::from_plan_iface(self.plan.interface_name.clone());
         crate::net_monitor::start_watcher(exclude);
+
+        let resources = transaction.commit();
+        {
+            let mut slot = self.resources.lock();
+            debug_assert!(slot.is_none(), "running resources must be committed once");
+            *slot = Some(resources);
+        }
+        self.finish_transition(Lifecycle::Running);
 
         info!(
             target: "capture",
@@ -376,31 +743,32 @@ impl CaptureSupervisor {
     }
 
     pub async fn stop(self: &Arc<Self>) -> Result<(), CaptureError> {
-        if let Some(g) = self.sys_proxy.lock().take() {
-            g.revert();
+        if !self.begin_stop().await {
+            return Ok(());
         }
-        if let Some(disp) = self.dispatcher.lock().take() {
-            disp.stop();
+
+        let resources = self.resources.lock().take().unwrap_or_default();
+        let transaction = CleanupTransaction::new(self, resources);
+        let result = {
+            let mut transaction = transaction;
+            transaction.stop_engine = true;
+            transaction.shutdown_to_stopped().await
+        };
+        if let Err(error) = &result {
+            warn!(target: "capture", %error, "capture engine stop failed after local cleanup");
         }
-        if let Some(tx) = self.stopper.lock().take() {
-            let _ = tx.send(());
-        }
-        if let Some(h) = self.handle.lock().take() {
-            h.abort();
-        }
-        if let Some(h) = self.dns_handle.lock().take() {
-            h.abort();
-        }
-        if let Some(h) = self.purge_handle.lock().take() {
-            h.abort();
-        }
-        self.engine.clone().stop().await?;
-        Ok(())
+        result
     }
 
     pub fn report(&self) -> serde_json::Value {
+        let sys_proxy_active = self
+            .resources
+            .lock()
+            .as_ref()
+            .is_some_and(|resources| resources.sys_proxy.is_some());
         serde_json::json!({
             "engine": self.engine.report(),
+            "lifecycle": self.lifecycle().as_str(),
             "fake_pool_size": self.fake_pool.len(),
             "nat_size": self.nat.len(),
             "eim_size": self.eim.len(),
@@ -411,7 +779,7 @@ impl CaptureSupervisor {
             "hijack_dns": self.plan.hijack_dns,
             "endpoint_independent_nat": self.plan.endpoint_independent_nat,
             "host_pin_size": self.nat.host_pin.len(),
-            "sys_proxy_active": self.sys_proxy.lock().is_some(),
+            "sys_proxy_active": sys_proxy_active,
         })
     }
 }
@@ -423,13 +791,17 @@ pub fn first_addr(s: &str) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use std::{
+        net::IpAddr,
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
 
     use core_config::model::{
         Capture, CaptureExclude, CaptureMethod, CaptureResolver, CaptureStack, CaptureTraffic,
         Mesh, TunInboundOptions,
     };
     use core_resolver::fake_ip::{AddressFamily, FakeIpConfig};
+    use tokio::sync::Semaphore;
 
     use super::*;
 
@@ -494,12 +866,9 @@ mod tests {
             nat: Arc::new(NatTable::default()),
             eim: Arc::new(EimNatTable::new(std::time::Duration::from_secs(60))),
             ipset: RwLock::new(noop()),
-            handle: parking_lot::Mutex::new(None),
-            stopper: parking_lot::Mutex::new(None),
-            dns_handle: parking_lot::Mutex::new(None),
-            purge_handle: parking_lot::Mutex::new(None),
-            dispatcher: parking_lot::Mutex::new(None),
-            sys_proxy: parking_lot::Mutex::new(None),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
         };
         assert!(!sup.allow_ip("10.7.0.1".parse().unwrap()));
         assert!(sup.allow_ip("8.8.8.8".parse().unwrap()));
@@ -521,12 +890,9 @@ mod tests {
             nat: Arc::new(NatTable::default()),
             eim: Arc::new(EimNatTable::new(std::time::Duration::from_secs(60))),
             ipset: RwLock::new(noop()),
-            handle: parking_lot::Mutex::new(None),
-            stopper: parking_lot::Mutex::new(None),
-            dns_handle: parking_lot::Mutex::new(None),
-            purge_handle: parking_lot::Mutex::new(None),
-            dispatcher: parking_lot::Mutex::new(None),
-            sys_proxy: parking_lot::Mutex::new(None),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
         };
         assert!(!sup.allow_ip("127.0.0.2".parse().unwrap()));
         assert!(!sup.allow_ip("::1".parse().unwrap()));
@@ -552,12 +918,9 @@ mod tests {
                 "geoip-cn".into(),
                 "114.114.114.114".parse().unwrap(),
             )]))),
-            handle: parking_lot::Mutex::new(None),
-            stopper: parking_lot::Mutex::new(None),
-            dns_handle: parking_lot::Mutex::new(None),
-            purge_handle: parking_lot::Mutex::new(None),
-            dispatcher: parking_lot::Mutex::new(None),
-            sys_proxy: parking_lot::Mutex::new(None),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
         };
         assert!(!sup.allow_ip("114.114.114.114".parse().unwrap()));
         assert!(sup.allow_ip("1.1.1.1".parse().unwrap()));
@@ -583,12 +946,9 @@ mod tests {
                 "geoip-cloudflare".into(),
                 "1.1.1.1".parse().unwrap(),
             )]))),
-            handle: parking_lot::Mutex::new(None),
-            stopper: parking_lot::Mutex::new(None),
-            dns_handle: parking_lot::Mutex::new(None),
-            purge_handle: parking_lot::Mutex::new(None),
-            dispatcher: parking_lot::Mutex::new(None),
-            sys_proxy: parking_lot::Mutex::new(None),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
         };
         assert!(sup.allow_ip("1.1.1.1".parse().unwrap()));
         assert!(!sup.allow_ip("8.8.8.8".parse().unwrap()));
@@ -625,12 +985,9 @@ mod tests {
                 nat: Arc::new(NatTable::default()),
                 eim: Arc::new(EimNatTable::new(std::time::Duration::from_secs(60))),
                 ipset: RwLock::new(noop()),
-                handle: parking_lot::Mutex::new(None),
-                stopper: parking_lot::Mutex::new(None),
-                dns_handle: parking_lot::Mutex::new(None),
-                purge_handle: parking_lot::Mutex::new(None),
-                dispatcher: parking_lot::Mutex::new(None),
-                sys_proxy: parking_lot::Mutex::new(None),
+                lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+                lifecycle_changed: Notify::new(),
+                resources: parking_lot::Mutex::new(None),
             });
             let runtime = Arc::new(core_runtime::Runtime::build(
                 core_config::loader::load_from_str(
@@ -649,11 +1006,301 @@ route:
             sup.start(runtime).await.unwrap();
 
             assert!(
-                sup.dispatcher.lock().is_some(),
+                sup.resources
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|resources| resources.dispatcher.is_some()),
                 "virtual_nic/{stack:?} must attach TunDispatcher; event-only packet loop cannot forward traffic"
             );
             sup.stop().await.unwrap();
         }
+    }
+
+    #[test]
+    fn cleanup_order_is_reverse_startup_order() {
+        assert_eq!(
+            CLEANUP_ORDER,
+            [
+                CleanupStep::NetworkListener,
+                CleanupStep::PurgeTask,
+                CleanupStep::DnsTask,
+                CleanupStep::EventTask,
+                CleanupStep::Dispatcher,
+                CleanupStep::SystemProxy,
+                CleanupStep::Engine,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_start_rolls_back_then_retry_and_repeated_stop_are_safe() {
+        let engine = Arc::new(LifecycleEngine::new(false));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+
+        let error = sup
+            .start_with_failpoint(runtime.clone(), StartFailpoint::AfterTasks)
+            .await
+            .expect_err("injected failure must escape start");
+        assert!(error.to_string().contains("injected supervisor failure"));
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+        assert_eq!(engine.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
+
+        sup.start(runtime).await.expect("retry after rollback");
+        assert_eq!(sup.lifecycle(), Lifecycle::Running);
+        assert_eq!(engine.starts.load(Ordering::SeqCst), 2);
+
+        sup.stop().await.expect("first stop");
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 2);
+        sup.stop().await.expect("idempotent repeated stop");
+        assert_eq!(
+            engine.stops.load(Ordering::SeqCst),
+            2,
+            "already-stopped engine must not be stopped twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_stop_error_still_leaves_stopped_retryable_state() {
+        let engine = Arc::new(LifecycleEngine::new(false));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+        sup.start(runtime.clone()).await.unwrap();
+
+        engine.fail_stop_once.store(true, Ordering::SeqCst);
+        assert!(sup.stop().await.is_err());
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+
+        sup.start(runtime).await.expect("retry after stop error");
+        sup.stop().await.expect("second stop succeeds");
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+    }
+
+    #[tokio::test]
+    async fn tun_start_without_packet_io_fails_closed_and_rolls_back() {
+        let engine = Arc::new(MissingTunIoEngine {
+            plan: CapturePlan::from_config(&capture()).unwrap(),
+            stops: AtomicUsize::new(0),
+        });
+        let sup = Arc::new(CaptureSupervisor {
+            plan: engine.plan.clone(),
+            engine: engine.clone(),
+            fake_pool: Arc::new(FakeIpPool::default()),
+            nat: Arc::new(NatTable::default()),
+            eim: Arc::new(EimNatTable::new(Duration::from_secs(60))),
+            ipset: RwLock::new(noop()),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
+        });
+
+        let error = sup
+            .start(lifecycle_runtime())
+            .await
+            .expect_err("missing TUN packet I/O must not publish a running supervisor");
+        assert!(error.to_string().contains("without a packet I/O device"));
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_start_transition_without_lost_wakeup() {
+        let engine = Arc::new(LifecycleEngine::new(true));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+
+        let start_task = {
+            let sup = sup.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move { sup.start(runtime).await })
+        };
+        engine
+            .entered
+            .acquire()
+            .await
+            .expect("start entry semaphore")
+            .forget();
+        assert_eq!(sup.lifecycle(), Lifecycle::Starting);
+
+        let stop_task = {
+            let sup = sup.clone();
+            tokio::spawn(async move { sup.stop().await })
+        };
+        engine.release.add_permits(1);
+
+        start_task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stop_task)
+            .await
+            .expect("stop waiter must be notified")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_schedules_engine_rollback_and_allows_retry() {
+        let engine = Arc::new(LifecycleEngine::new(true));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+
+        let start_task = {
+            let sup = sup.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move { sup.start(runtime).await })
+        };
+        engine
+            .entered
+            .acquire()
+            .await
+            .expect("start entry semaphore")
+            .forget();
+        start_task.abort();
+        let _ = start_task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sup.lifecycle() != Lifecycle::Stopped || engine.stops.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled start rollback must finish");
+
+        sup.start(runtime).await.expect("retry after cancellation");
+        sup.stop().await.unwrap();
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+    }
+
+    struct LifecycleEngine {
+        plan: CapturePlan,
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        fail_stop_once: AtomicBool,
+        block_start_once: AtomicBool,
+        entered: Semaphore,
+        release: Semaphore,
+    }
+
+    impl LifecycleEngine {
+        fn new(block_start_once: bool) -> Self {
+            let mut plan = CapturePlan::from_config(&capture()).unwrap();
+            // Lifecycle tests exercise supervisor ownership and rollback only;
+            // TUN dispatcher readiness is covered separately below.
+            plan.kind = EngineKind::Tproxy;
+            Self {
+                plan,
+                starts: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
+                fail_stop_once: AtomicBool::new(false),
+                block_start_once: AtomicBool::new(block_start_once),
+                entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CaptureEngine for LifecycleEngine {
+        fn kind(&self) -> EngineKind {
+            self.plan.kind
+        }
+
+        fn plan(&self) -> &CapturePlan {
+            &self.plan
+        }
+
+        async fn start(
+            self: Arc<Self>,
+            _events: mpsc::Sender<CaptureEvent>,
+            _runtime: Arc<core_runtime::Runtime>,
+        ) -> Result<(), CaptureError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if self.block_start_once.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("start release semaphore")
+                    .forget();
+            }
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stop_once.swap(false, Ordering::SeqCst) {
+                return Err(CaptureError::DeviceFailed(
+                    "injected engine stop failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    struct MissingTunIoEngine {
+        plan: CapturePlan,
+        stops: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CaptureEngine for MissingTunIoEngine {
+        fn kind(&self) -> EngineKind {
+            EngineKind::Tun
+        }
+
+        fn plan(&self) -> &CapturePlan {
+            &self.plan
+        }
+
+        async fn start(
+            self: Arc<Self>,
+            _events: mpsc::Sender<CaptureEvent>,
+            _runtime: Arc<core_runtime::Runtime>,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn lifecycle_supervisor(engine: Arc<LifecycleEngine>) -> Arc<CaptureSupervisor> {
+        let plan = engine.plan.clone();
+        Arc::new(CaptureSupervisor {
+            plan: plan.clone(),
+            engine,
+            fake_pool: Arc::new(FakeIpPool::default()),
+            nat: Arc::new(NatTable::new(plan.udp_timeout)),
+            eim: Arc::new(EimNatTable::new(plan.udp_timeout)),
+            ipset: RwLock::new(noop()),
+            lifecycle: AtomicU8::new(Lifecycle::Stopped as u8),
+            lifecycle_changed: Notify::new(),
+            resources: parking_lot::Mutex::new(None),
+        })
+    }
+
+    fn lifecycle_runtime() -> Arc<core_runtime::Runtime> {
+        Arc::new(core_runtime::Runtime::build(
+            core_config::loader::load_from_str(
+                r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  preset: direct
+"#,
+            )
+            .unwrap(),
+        ))
     }
 
     fn dummy_engine() -> Arc<dyn CaptureEngine> {

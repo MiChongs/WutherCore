@@ -1,0 +1,11 @@
+{
+  "version": 5,
+  "rules": [
+    {
+      "package_name_regex": [
+        "^com\\.google\\..+$",
+        "^org\\.mozilla\\.firefox$"
+      ]
+    }
+  ]
+}

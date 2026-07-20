@@ -16,6 +16,7 @@ use crate::{format::RulesetFormat, ir::RulesetProgram, matcher::ClassicalEntry};
 pub mod binary;
 pub mod mrs;
 pub mod sb_json;
+pub mod srs;
 pub mod txt;
 pub mod yaml;
 
@@ -81,6 +82,7 @@ pub fn parse_ruleset_compiled(
     match format {
         RulesetFormat::Mrs => mrs::parse(body).map(RulesetCompiled::Mrs),
         RulesetFormat::SingboxJson => sb_json::parse(body).map(RulesetCompiled::Semantic),
+        RulesetFormat::Srs => srs::parse(body).map(RulesetCompiled::Semantic),
         // 其它格式继续走 entries 路径
         _ => parse_ruleset(format, body).map(RulesetCompiled::Classical),
     }

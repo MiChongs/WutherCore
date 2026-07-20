@@ -7,6 +7,8 @@ use core_runtime::Runtime;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::oneshot,
+    time::timeout,
 };
 
 const CONFIG: &str = r#"
@@ -37,6 +39,81 @@ async fn spawn_echo() -> u16 {
     addr.port()
 }
 
+async fn spawn_http_origin() -> (std::net::SocketAddr, oneshot::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (captured_tx, captured_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            let size = sock.read(&mut chunk).await.unwrap();
+            assert_ne!(size, 0, "proxy closed before forwarding the HTTP header");
+            request.extend_from_slice(&chunk[..size]);
+            if let Some(start) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break start + 4;
+            }
+        };
+        let head = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = head
+            .split("\r\n")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let chunked = head.split("\r\n").any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+            })
+        });
+        let body_end = if chunked {
+            loop {
+                if let Some(start) = request[header_end..]
+                    .windows(5)
+                    .position(|window| window == b"0\r\n\r\n")
+                {
+                    break header_end + start + 5;
+                }
+                let size = sock.read(&mut chunk).await.unwrap();
+                assert_ne!(size, 0, "proxy dropped the chunked HTTP request body");
+                request.extend_from_slice(&chunk[..size]);
+            }
+        } else {
+            while request.len() < header_end + content_length {
+                let size = sock.read(&mut chunk).await.unwrap();
+                assert_ne!(size, 0, "proxy dropped the prefetched HTTP request body");
+                request.extend_from_slice(&chunk[..size]);
+            }
+            header_end + content_length
+        };
+        captured_tx.send(request[..body_end].to_vec()).unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    (addr, captured_rx)
+}
+
+async fn read_http_response_head(stream: &mut TcpStream) -> Vec<u8> {
+    timeout(Duration::from_secs(5), async {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                return head;
+            }
+        }
+    })
+    .await
+    .expect("HTTP proxy response header timed out")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_connect_through_mixed() {
     let echo_port = spawn_echo().await;
@@ -52,6 +129,7 @@ async fn http_connect_through_mixed() {
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
+        udp: true,
     };
     tokio::spawn(run_mixed(listener, runtime.clone()));
 
@@ -62,16 +140,20 @@ async fn http_connect_through_mixed() {
     let mut s = TcpStream::connect(("127.0.0.1", mixed_port)).await.unwrap();
     let target = format!("127.0.0.1:{echo_port}");
     let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut buf = [0u8; 256];
-    let n = s.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..n]).unwrap();
+    let mut first_flight = req.into_bytes();
+    // Real TLS clients can optimistically coalesce ClientHello with CONNECT.
+    // The mixed listener must not discard bytes already read past \r\n\r\n.
+    first_flight.extend_from_slice(b"hello");
+    s.write_all(&first_flight).await.unwrap();
+    let response = read_http_response_head(&mut s).await;
+    let resp = std::str::from_utf8(&response).unwrap();
     assert!(resp.contains("200"), "expected 200, got: {resp:?}");
 
-    // tunnel 已建立，echo 验证
-    s.write_all(b"hello").await.unwrap();
     let mut echoed = [0u8; 5];
-    s.read_exact(&mut echoed).await.unwrap();
+    timeout(Duration::from_secs(5), s.read_exact(&mut echoed))
+        .await
+        .expect("prefetched CONNECT payload was not relayed")
+        .unwrap();
     assert_eq!(&echoed, b"hello");
 
     let snapshot = runtime.connections.manager_snapshot();
@@ -102,6 +184,100 @@ async fn http_connect_through_mixed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_absolute_post_preserves_body_and_rewrites_hop_headers() {
+    let (origin, captured) = spawn_http_origin().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mixed_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
+    let plan = core_config::loader::load_from_str(&yaml).unwrap();
+    let runtime = Arc::new(Runtime::build(plan));
+    let listener = MixedListener {
+        listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
+        auth: None,
+        udp: true,
+    };
+    tokio::spawn(run_mixed(listener, runtime));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", mixed_port)).await.unwrap();
+    let request = format!(
+        "POST http://{origin}/upload?x=1 HTTP/1.1\r\n\
+         Host: wrong.invalid\r\n\
+         Content-Length: 4\r\n\
+         Proxy-Connection: keep-alive\r\n\
+         Connection: close\r\n\r\nbody"
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let captured = timeout(Duration::from_secs(5), captured)
+        .await
+        .expect("origin did not receive the request")
+        .expect("origin capture task stopped");
+    let captured = std::str::from_utf8(&captured).unwrap();
+    assert!(captured.starts_with("POST /upload?x=1 HTTP/1.1\r\n"));
+    assert!(captured.contains(&format!("\r\nHost: {origin}\r\n")));
+    assert!(!captured.contains("wrong.invalid"));
+    assert!(!captured.to_ascii_lowercase().contains("proxy-connection"));
+    assert!(captured.ends_with("\r\n\r\nbody"));
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+        .await
+        .expect("HTTP origin response timed out")
+        .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with(b"\r\n\r\nok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_absolute_chunked_post_stops_at_message_boundary() {
+    let (origin, captured) = spawn_http_origin().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mixed_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
+    let plan = core_config::loader::load_from_str(&yaml).unwrap();
+    let runtime = Arc::new(Runtime::build(plan));
+    let listener = MixedListener {
+        listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
+        auth: None,
+        udp: true,
+    };
+    tokio::spawn(run_mixed(listener, runtime));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut client = TcpStream::connect(("127.0.0.1", mixed_port)).await.unwrap();
+    let request = format!(
+        "POST http://{origin}/chunked HTTP/1.1\r\n\
+         Host: wrong.invalid\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Proxy-Connection: keep-alive\r\n\r\n\
+         4\r\nbody\r\n0\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let captured = timeout(Duration::from_secs(5), captured)
+        .await
+        .expect("origin did not receive the chunked request")
+        .expect("origin capture task stopped");
+    let captured = std::str::from_utf8(&captured).unwrap();
+    assert!(captured.starts_with("POST /chunked HTTP/1.1\r\n"));
+    assert!(captured.contains("\r\nTransfer-Encoding: chunked\r\n"));
+    assert!(captured.contains("\r\nConnection: close\r\n"));
+    assert!(captured.ends_with("\r\n\r\n4\r\nbody\r\n0\r\n\r\n"));
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+        .await
+        .expect("chunked HTTP origin response timed out")
+        .unwrap();
+    assert!(response.ends_with(b"\r\n\r\nok"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks5_connect_through_mixed() {
     let echo_port = spawn_echo().await;
 
@@ -115,6 +291,7 @@ async fn socks5_connect_through_mixed() {
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
+        udp: true,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;

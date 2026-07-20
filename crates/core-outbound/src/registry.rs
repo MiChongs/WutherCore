@@ -126,13 +126,16 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
 fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
     let method = node.method.as_deref().unwrap_or("aes-256-gcm");
     let pwd = node.password.as_deref().unwrap_or("");
-    if let Some(c) = Ss22Cipher::parse(method) {
-        if !pwd.is_empty() {
-            return match Ss2022Outbound::new(&node.name, &node.host, node.port, c, pwd) {
-                Ok(ob) => Arc::new(ob),
-                Err(_) => StubOutbound::new(node.name.clone(), "ss2022(invalid-psk)"),
-            };
-        }
+    if let Some(c) = Ss22Cipher::parse(method)
+        && !pwd.is_empty()
+    {
+        return match Ss2022Outbound::new(&node.name, &node.host, node.port, c, pwd) {
+            Ok(mut ob) => {
+                ob.udp = node.udp;
+                Arc::new(ob)
+            }
+            Err(_) => StubOutbound::new(node.name.clone(), "ss2022(invalid-psk)"),
+        };
     }
     match SsCipher::parse(method) {
         Some(c) if !pwd.is_empty() => {
@@ -873,5 +876,31 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
         NodeProtocol::Sudoku => "sudoku",
         NodeProtocol::TrustTunnel => "trusttunnel",
         _ => "stub",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+    use core_config::node_uri::{NodeProtocol, ParsedNode};
+
+    use super::build_outbound;
+
+    #[test]
+    fn ss2022_registry_preserves_udp_flag_and_eih_chain() {
+        let identity = base64::engine::general_purpose::STANDARD.encode([0x11u8; 16]);
+        let user = base64::engine::general_purpose::STANDARD.encode([0x22u8; 16]);
+        let mut node = ParsedNode::new("ss22", NodeProtocol::Shadowsocks, "127.0.0.1", 8388);
+        node.method = Some("2022-blake3-aes-128-gcm".into());
+        node.password = Some(format!("{identity}:{user}"));
+        node.udp = false;
+
+        let outbound = build_outbound(&node);
+        assert_eq!(outbound.protocol(), "ss2022");
+        assert!(!outbound.capabilities().udp);
+
+        node.udp = true;
+        let outbound = build_outbound(&node);
+        assert!(outbound.capabilities().udp);
     }
 }

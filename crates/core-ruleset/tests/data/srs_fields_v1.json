@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "query_type": ["A", "AAAA", 65],
+      "process_path": ["/usr/bin/curl"],
+      "process_path_regex": ["^/usr/(local/)?bin/curl$"],
+      "package_name": ["com.android.chrome"],
+      "wifi_ssid": ["Lab-5G"],
+      "wifi_bssid": ["AA-BB-CC-DD-EE-FF"]
+    }
+  ]
+}

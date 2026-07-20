@@ -14,6 +14,18 @@ use tracing::{debug, trace, warn};
 
 pub async fn run_fake_dns(bind: SocketAddr, service: Arc<DnsService>) -> std::io::Result<()> {
     let sock = UdpSocket::bind(bind).await?;
+    run_fake_dns_socket(sock, service).await
+}
+
+/// Serve fake-DNS on a socket that was bound by the caller.
+///
+/// `CaptureSupervisor` uses this entry point so bind failure is part of its
+/// startup transaction rather than an error from an already-detached task.
+pub(crate) async fn run_fake_dns_socket(
+    sock: UdpSocket,
+    service: Arc<DnsService>,
+) -> std::io::Result<()> {
+    let bind = sock.local_addr()?;
     debug!(target: "capture::dns", addr = %bind, "fake-dns listening");
     let mut buf = vec![0u8; 1500];
     loop {
