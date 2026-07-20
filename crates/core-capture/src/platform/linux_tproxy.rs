@@ -87,7 +87,8 @@ trait TransparentSocketOps {
 
     fn socket(&mut self, addr: SocketAddr, kind: TransparentSocketKind)
     -> io::Result<Self::Socket>;
-    fn set_ip_transparent(&mut self, socket: &Self::Socket) -> io::Result<()>;
+    fn set_ipv6_only(&mut self, socket: &Self::Socket) -> io::Result<()>;
+    fn set_ip_transparent(&mut self, socket: &Self::Socket, addr: SocketAddr) -> io::Result<()>;
     fn set_recv_original_dst(&mut self, socket: &Self::Socket, addr: SocketAddr) -> io::Result<()>;
     fn set_reuse_addr(&mut self, socket: &Self::Socket) -> io::Result<()>;
     fn bind(&mut self, socket: &Self::Socket, addr: SocketAddr) -> io::Result<()>;
@@ -100,7 +101,13 @@ fn configure_transparent_socket<O: TransparentSocketOps>(
     kind: TransparentSocketKind,
 ) -> io::Result<O::Socket> {
     let socket = ops.socket(addr, kind)?;
-    ops.set_ip_transparent(&socket)?;
+    if addr.is_ipv6() {
+        // Linux defaults this from net.ipv6.bindv6only (normally false).
+        // Make the listener's family explicit so a parallel 0.0.0.0 listener
+        // can own the same TPROXY port without an address-in-use race.
+        ops.set_ipv6_only(&socket)?;
+    }
+    ops.set_ip_transparent(&socket, addr)?;
     if kind == TransparentSocketKind::Udp {
         ops.set_recv_original_dst(&socket, addr)?;
     }
@@ -140,8 +147,12 @@ impl TransparentSocketOps for LibcTransparentSocketOps {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    fn set_ip_transparent(&mut self, socket: &Self::Socket) -> io::Result<()> {
-        set_ip_transparent(socket.as_raw_fd())
+    fn set_ipv6_only(&mut self, socket: &Self::Socket) -> io::Result<()> {
+        set_ipv6_only(socket.as_raw_fd())
+    }
+
+    fn set_ip_transparent(&mut self, socket: &Self::Socket, addr: SocketAddr) -> io::Result<()> {
+        set_transparent(socket.as_raw_fd(), addr)
     }
 
     fn set_recv_original_dst(&mut self, socket: &Self::Socket, addr: SocketAddr) -> io::Result<()> {
@@ -174,6 +185,18 @@ pub(crate) fn ipv4_tproxy_bind_addr(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
 }
 
+pub(crate) fn ipv6_tproxy_bind_addr(port: u16) -> SocketAddr {
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
+}
+
+fn tproxy_bind_addrs(port: u16, ipv6_enabled: bool) -> Vec<SocketAddr> {
+    let mut binds = vec![ipv4_tproxy_bind_addr(port)];
+    if ipv6_enabled {
+        binds.push(ipv6_tproxy_bind_addr(port));
+    }
+    binds
+}
+
 pub(crate) fn bind_tproxy_listeners(bind: SocketAddr) -> Result<TproxyListeners, CaptureError> {
     let mut ops = LibcTransparentSocketOps;
     let tcp_fd =
@@ -193,6 +216,24 @@ pub(crate) fn bind_tproxy_listeners(bind: SocketAddr) -> Result<TproxyListeners,
     let udp = UdpSocket::from_std(udp_std)?;
 
     Ok(TproxyListeners { tcp, udp, bind })
+}
+
+fn bind_tproxy_listener_set_with<L>(
+    port: u16,
+    ipv6_enabled: bool,
+    mut bind: impl FnMut(SocketAddr) -> Result<L, CaptureError>,
+) -> Result<Vec<L>, CaptureError> {
+    tproxy_bind_addrs(port, ipv6_enabled)
+        .into_iter()
+        .map(&mut bind)
+        .collect()
+}
+
+pub(crate) fn bind_tproxy_listener_set(
+    port: u16,
+    ipv6_enabled: bool,
+) -> Result<Vec<TproxyListeners>, CaptureError> {
+    bind_tproxy_listener_set_with(port, ipv6_enabled, bind_tproxy_listeners)
 }
 
 /// 启动一个 TPROXY TCP listener；accept 后立即 dial 出站并双向 splice，
@@ -237,12 +278,30 @@ pub(crate) async fn run_tcp_tproxy(
                 continue;
             }
         };
+        let accepted_local = match stream.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                warn!(
+                    target: "capture::tproxy",
+                    %peer,
+                    %error,
+                    "cannot read accepted TCP local address; closing inbound"
+                );
+                continue;
+            }
+        };
         let fd = stream.as_raw_fd();
-        let original_dst = match get_orig_dst_v4(fd) {
-            Ok(addr) => SocketAddr::V4(addr),
-            Err(e) => {
-                debug!(target: "capture::tproxy", error = %e, "SO_ORIGINAL_DST failed; using local_addr");
-                stream.local_addr()?
+        let original_dst = match resolve_tcp_original_dst(fd, accepted_local, bind) {
+            Ok(addr) => addr,
+            Err(error) => {
+                warn!(
+                    target: "capture::tproxy",
+                    %peer,
+                    local = %accepted_local,
+                    %error,
+                    "cannot determine TCP original destination; closing inbound"
+                );
+                continue;
             }
         };
         let evt = CaptureEvent {
@@ -635,8 +694,11 @@ fn bind_transparent_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
         return Err(std::io::Error::last_os_error());
     }
     let result = (|| {
+        if addr.is_ipv6() {
+            set_ipv6_only(fd)?;
+        }
         set_reuse_addr_port(fd)?;
-        set_ip_transparent(fd)?;
+        set_transparent(fd, addr)?;
         bind_socket_fd(fd, addr)?;
         Ok::<(), std::io::Error>(())
     })();
@@ -734,6 +796,32 @@ fn bind_socket_fd(fd: RawFd, addr: SocketAddr) -> std::io::Result<()> {
 }
 
 #[allow(unsafe_code)]
+fn set_ipv6_only(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn set_transparent(fd: RawFd, addr: SocketAddr) -> std::io::Result<()> {
+    set_ip_transparent(fd)?;
+    if addr.is_ipv6() {
+        set_ipv6_transparent(fd)?;
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
 fn set_ip_transparent(fd: RawFd) -> std::io::Result<()> {
     let one: libc::c_int = 1;
     // SAFETY: setsockopt 平凡；指针指向栈上 c_int。
@@ -742,6 +830,24 @@ fn set_ip_transparent(fd: RawFd) -> std::io::Result<()> {
             fd,
             libc::SOL_IP,
             libc::IP_TRANSPARENT,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_ipv6_transparent(fd: RawFd) -> std::io::Result<()> {
+    let one: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TRANSPARENT,
             &one as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -791,6 +897,9 @@ fn set_ip_recvorigdstaddr(fd: RawFd) -> std::io::Result<()> {
 }
 
 /// `recvmsg` + `IP_ORIGDSTADDR` / `IPV6_ORIGDSTADDR` cmsg 解析。
+#[repr(C, align(8))]
+struct OrigDstControlBuffer([u8; 128]);
+
 #[allow(unsafe_code)]
 fn recvmsg_with_origdst(
     fd: RawFd,
@@ -801,15 +910,16 @@ fn recvmsg_with_origdst(
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
     };
-    // 控制缓冲：足够装一个 IPv6 cmsg（IPv4 cmsg 更小）。
-    let mut control = [0u8; 128];
+    // 控制缓冲：足够装一个 IPv6 cmsg（IPv4 cmsg 更小），并按 cmsghdr
+    // 在 Linux 32/64-bit ABI 上的最大对齐要求显式对齐。
+    let mut control = OrigDstControlBuffer([0u8; 128]);
     let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
     hdr.msg_name = &mut name as *mut _ as *mut libc::c_void;
     hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
-    hdr.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    hdr.msg_controllen = control.len() as libc::size_t;
+    hdr.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = control.0.len() as libc::size_t;
 
     // SAFETY: msghdr 字段全部初始化；recvmsg 写入 name/iov/control 不超过提供长度。
     let n = unsafe { libc::recvmsg(fd, &mut hdr, 0) };
@@ -821,7 +931,11 @@ fn recvmsg_with_origdst(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad peer addr"))?;
 
     // 遍历 cmsg 找 IP_ORIGDSTADDR / IPV6_ORIGDSTADDR
-    let original_dst = unsafe { extract_origdst(&hdr) };
+    let original_dst = if hdr.msg_flags & libc::MSG_CTRUNC == 0 {
+        unsafe { extract_origdst(&hdr) }
+    } else {
+        None
+    };
 
     Ok((n as usize, peer, original_dst))
 }
@@ -833,19 +947,37 @@ unsafe fn extract_origdst(hdr: &libc::msghdr) -> Option<SocketAddr> {
     while !cmsg.is_null() {
         let level = unsafe { (*cmsg).cmsg_level };
         let typ = unsafe { (*cmsg).cmsg_type };
-        if level == libc::SOL_IP && typ == libc::IP_ORIGDSTADDR {
+        let cmsg_len = unsafe { (*cmsg).cmsg_len };
+        if level == libc::SOL_IP
+            && typ == libc::IP_ORIGDSTADDR
+            && cmsg_len
+                >= unsafe {
+                    libc::CMSG_LEN(std::mem::size_of::<libc::sockaddr_in>() as libc::c_uint)
+                } as usize
+        {
             let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in;
             let sa = unsafe { std::ptr::read_unaligned(data) };
             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
             let port = u16::from_be(sa.sin_port);
             return Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
         }
-        if level == libc::IPPROTO_IPV6 && typ == libc::IPV6_ORIGDSTADDR {
+        if level == libc::IPPROTO_IPV6
+            && typ == libc::IPV6_ORIGDSTADDR
+            && cmsg_len
+                >= unsafe {
+                    libc::CMSG_LEN(std::mem::size_of::<libc::sockaddr_in6>() as libc::c_uint)
+                } as usize
+        {
             let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in6;
             let sa = unsafe { std::ptr::read_unaligned(data) };
             let ip = Ipv6Addr::from(sa.sin6_addr.s6_addr);
             let port = u16::from_be(sa.sin6_port);
-            return Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
+            return Some(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                port,
+                sa.sin6_flowinfo,
+                sa.sin6_scope_id,
+            )));
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(hdr, cmsg) };
     }
@@ -870,12 +1002,65 @@ fn sockaddr_storage_to_socket_addr(s: &libc::sockaddr_storage) -> Option<SocketA
         Some(SocketAddr::V6(SocketAddrV6::new(
             ip,
             u16::from_be(v6.sin6_port),
-            0,
-            0,
+            v6.sin6_flowinfo,
+            v6.sin6_scope_id,
         )))
     } else {
         None
     }
+}
+
+fn resolve_tcp_original_dst(
+    fd: RawFd,
+    accepted_local: SocketAddr,
+    listener_bind: SocketAddr,
+) -> std::io::Result<SocketAddr> {
+    let socket_original = if accepted_local.is_ipv4() {
+        get_orig_dst_v4(fd).map(SocketAddr::V4)
+    } else {
+        get_orig_dst_v6(fd).map(SocketAddr::V6)
+    };
+    select_tcp_original_dst(socket_original, accepted_local, listener_bind)
+}
+
+fn select_tcp_original_dst(
+    socket_original: std::io::Result<SocketAddr>,
+    accepted_local: SocketAddr,
+    listener_bind: SocketAddr,
+) -> std::io::Result<SocketAddr> {
+    let option_failure = match socket_original {
+        Ok(addr)
+            if addr.is_ipv4() == listener_bind.is_ipv4()
+                && !addr.ip().is_unspecified()
+                && addr.port() != 0 =>
+        {
+            return Ok(addr);
+        }
+        Ok(addr) => format!("socket option returned unusable address {addr}"),
+        Err(error) => error.to_string(),
+    };
+
+    // A true TPROXY TCP socket normally exposes the intercepted destination as
+    // its accepted local address even when SO_ORIGINAL_DST is unavailable
+    // (that option is primarily associated with REDIRECT/NAT). Accept that
+    // kernel-provided address, but never fall back to the listener port: a
+    // directly reachable wildcard listener would otherwise proxy back into
+    // itself forever.
+    if accepted_local.is_ipv4() == listener_bind.is_ipv4()
+        && !accepted_local.ip().is_unspecified()
+        && accepted_local.port() != 0
+        && accepted_local.port() != listener_bind.port()
+    {
+        return Ok(accepted_local);
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "original-destination socket option failed ({option_failure}); \
+             accepted local address {accepted_local} is not a safe fallback"
+        ),
+    ))
 }
 
 #[allow(unsafe_code)]
@@ -895,18 +1080,62 @@ fn get_orig_dst_v4(fd: RawFd) -> std::io::Result<SocketAddrV4> {
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    if len < std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        || addr.sin_family as libc::c_int != libc::AF_INET
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SO_ORIGINAL_DST returned an invalid IPv4 sockaddr",
+        ));
+    }
     let ip = u32::from_be(addr.sin_addr.s_addr);
     let port = u16::from_be(addr.sin_port);
     Ok(SocketAddrV4::new(Ipv4Addr::from(ip), port))
 }
 
+#[allow(unsafe_code)]
+fn get_orig_dst_v6(fd: RawFd) -> std::io::Result<SocketAddrV6> {
+    // SAFETY: getsockopt writes at most `len` bytes into the initialized
+    // sockaddr_in6 storage, and `len` starts at the exact storage size.
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_IPV6,
+            libc::IP6T_SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len < std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        || addr.sin6_family as libc::c_int != libc::AF_INET6
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IP6T_SO_ORIGINAL_DST returned an invalid IPv6 sockaddr",
+        ));
+    }
+    Ok(SocketAddrV6::new(
+        Ipv6Addr::from(addr.sin6_addr.s6_addr),
+        u16::from_be(addr.sin6_port),
+        addr.sin6_flowinfo,
+        addr.sin6_scope_id,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SocketStep {
         Socket,
+        Ipv6Only,
         Transparent,
         RecvOriginalDst,
         ReuseAddr,
@@ -931,7 +1160,16 @@ mod tests {
             Ok(())
         }
 
-        fn set_ip_transparent(&mut self, _socket: &Self::Socket) -> io::Result<()> {
+        fn set_ipv6_only(&mut self, _socket: &Self::Socket) -> io::Result<()> {
+            self.steps.push(SocketStep::Ipv6Only);
+            Ok(())
+        }
+
+        fn set_ip_transparent(
+            &mut self,
+            _socket: &Self::Socket,
+            _addr: SocketAddr,
+        ) -> io::Result<()> {
             self.steps.push(SocketStep::Transparent);
             Ok(())
         }
@@ -976,7 +1214,15 @@ mod tests {
             self.inner.socket(addr, kind)
         }
 
-        fn set_ip_transparent(&mut self, _socket: &Self::Socket) -> io::Result<()> {
+        fn set_ipv6_only(&mut self, socket: &Self::Socket) -> io::Result<()> {
+            self.inner.set_ipv6_only(socket)
+        }
+
+        fn set_ip_transparent(
+            &mut self,
+            _socket: &Self::Socket,
+            _addr: SocketAddr,
+        ) -> io::Result<()> {
             Ok(())
         }
 
@@ -1045,6 +1291,71 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_only_and_transparent_options_are_set_before_bind() {
+        let mut ops = RecordingSocketOps::default();
+
+        configure_transparent_socket(
+            &mut ops,
+            ipv6_tproxy_bind_addr(7894),
+            TransparentSocketKind::Udp,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ops.steps,
+            [
+                SocketStep::Socket,
+                SocketStep::Ipv6Only,
+                SocketStep::Transparent,
+                SocketStep::RecvOriginalDst,
+                SocketStep::ReuseAddr,
+                SocketStep::Bind,
+            ]
+        );
+    }
+
+    #[test]
+    fn listener_set_contains_separate_ipv4_and_ipv6_wildcards() {
+        assert_eq!(
+            tproxy_bind_addrs(7894, true),
+            [
+                "0.0.0.0:7894".parse::<SocketAddr>().unwrap(),
+                "[::]:7894".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            tproxy_bind_addrs(7894, false),
+            ["0.0.0.0:7894".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn ipv6_bind_failure_drops_the_already_bound_ipv4_listener() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = dropped.clone();
+        let result = bind_tproxy_listener_set_with(7894, true, |addr| {
+            if addr.is_ipv4() {
+                Ok(DropProbe(probe.clone()))
+            } else {
+                Err(CaptureError::DeviceFailed(
+                    "injected IPv6 bind failure".into(),
+                ))
+            }
+        });
+
+        assert!(matches!(result, Err(CaptureError::DeviceFailed(_))));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn occupied_port_is_reported_without_requiring_transparent_socket_privileges() {
         let occupied = std::net::TcpListener::bind(ipv4_tproxy_bind_addr(0)).unwrap();
         let bind = occupied.local_addr().unwrap();
@@ -1066,6 +1377,41 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("original-destination"));
+    }
+
+    #[test]
+    fn tcp_ipv6_uses_accepted_local_destination_when_socket_option_is_unavailable() {
+        let accepted_local: SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+        let listener_bind = ipv6_tproxy_bind_addr(7894);
+
+        let selected = select_tcp_original_dst(
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no conntrack original destination",
+            )),
+            accepted_local,
+            listener_bind,
+        )
+        .unwrap();
+
+        assert_eq!(selected, accepted_local);
+    }
+
+    #[test]
+    fn tcp_local_fallback_rejects_the_listener_port_to_prevent_a_loop() {
+        let listener_bind = ipv6_tproxy_bind_addr(7894);
+        let error = select_tcp_original_dst(
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no conntrack original destination",
+            )),
+            "[::1]:7894".parse().unwrap(),
+            listener_bind,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("safe fallback"));
     }
 
     #[tokio::test]

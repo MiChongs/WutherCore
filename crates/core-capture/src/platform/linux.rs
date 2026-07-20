@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tracing::{debug, info, warn};
 
@@ -1063,7 +1063,7 @@ fn should_manage_linux_tun_config(device: &dyn TunIo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct TunConfigProbe {
         preconfigured: bool,
@@ -1279,6 +1279,35 @@ mod tests {
         assert!(matches!(result, Err(CaptureError::DeviceFailed(_))));
         assert!(!install_called.load(Ordering::SeqCst));
         assert!(!revert_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tproxy_stop_signals_and_joins_all_dual_stack_listener_tasks() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let mut stops = Vec::new();
+        let mut tasks = JoinSet::new();
+
+        // IPv4 TCP/UDP plus IPv6 TCP/UDP.
+        for _ in 0..4 {
+            let (stop_tx, stop_rx) = oneshot::channel();
+            stops.push(stop_tx);
+            let stopped = stopped.clone();
+            tasks.spawn(async move {
+                let _ = stop_rx.await;
+                stopped.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stop_tproxy_listener_tasks(&mut stops, &mut tasks),
+        )
+        .await
+        .expect("all listeners must stop promptly");
+
+        assert!(stops.is_empty());
+        assert!(tasks.is_empty());
+        assert_eq!(stopped.load(Ordering::SeqCst), 4);
     }
 }
 
@@ -2058,10 +2087,8 @@ pub struct LinuxTproxy {
 #[derive(Default)]
 struct TproxyState {
     on: bool,
-    tcp_handle: Option<JoinHandle<()>>,
-    udp_handle: Option<JoinHandle<()>>,
-    stop_tcp: Option<oneshot::Sender<()>>,
-    stop_udp: Option<oneshot::Sender<()>>,
+    listener_tasks: Option<JoinSet<()>>,
+    listener_stops: Vec<oneshot::Sender<()>>,
 }
 
 struct TproxyRuleCleanup<'a> {
@@ -2091,6 +2118,11 @@ impl LinuxTproxy {
                 "TPROXY 需要 iptables mangle/TPROXY 支持；当前找不到 iptables".into(),
             ));
         }
+        if plan.ipv6_enabled && !has_tool("ip6tables") {
+            return Err(CaptureError::Doctor(
+                "IPv6 TPROXY 需要 ip6tables mangle/TPROXY 支持；当前找不到 ip6tables".into(),
+            ));
+        }
         if !ip_rule_supported() {
             return Err(CaptureError::Doctor(
                 "TPROXY 需要 ip rule 支持，用于 fwmark local route".into(),
@@ -2109,7 +2141,8 @@ impl LinuxTproxy {
             target: "capture::tproxy::rules",
             proxy_mark = format_args!("{:#x}", tproxy_rules::TPROXY_FWMARK),
             outbound_mark = format_args!("{outbound_mark:#x}"),
-            "iptables TPROXY rules installed"
+            ipv6 = plan.ipv6_enabled,
+            "iptables/ip6tables TPROXY rules installed"
         );
         Ok(())
     }
@@ -2160,6 +2193,20 @@ fn prepare_tproxy_start<L>(
     Ok(listeners)
 }
 
+async fn stop_tproxy_listener_tasks(stops: &mut Vec<oneshot::Sender<()>>, tasks: &mut JoinSet<()>) {
+    // Signal every address-family/protocol listener before awaiting any one of
+    // them. If this future is cancelled while joining, JoinSet::drop aborts all
+    // remaining tasks and the caller's rule cleanup guard removes the routes.
+    for stop in stops.drain(..) {
+        let _ = stop.send(());
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            warn!(target: "capture::tproxy", %error, "tproxy listener task join failed");
+        }
+    }
+}
+
 #[async_trait]
 impl CaptureEngine for LinuxTproxy {
     fn kind(&self) -> EngineKind {
@@ -2182,53 +2229,78 @@ impl CaptureEngine for LinuxTproxy {
             .auto_redirect_marks
             .output
             .unwrap_or(tproxy_rules::TPROXY_FWMARK);
-        let bind = crate::platform::linux_tproxy::ipv4_tproxy_bind_addr(tproxy_rules::TPROXY_PORT);
         let listeners = prepare_tproxy_start(
-            || crate::platform::linux_tproxy::bind_tproxy_listeners(bind),
+            || {
+                crate::platform::linux_tproxy::bind_tproxy_listener_set(
+                    tproxy_rules::TPROXY_PORT,
+                    self.plan.ipv6_enabled,
+                )
+            },
             || Self::install_rules(&self.plan, outbound_mark),
             || Self::revert_rules(&self.plan),
         )?;
-        let (tcp_listener, udp_socket, bound) = listeners.into_parts();
-        let (stop_tcp_tx, stop_tcp_rx) = oneshot::channel::<()>();
-        let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
+        let mut listener_tasks = JoinSet::new();
+        let mut listener_stops = Vec::with_capacity(listeners.len() * 2);
+        let mut bound_addrs = Vec::with_capacity(listeners.len());
 
-        // TCP TPROXY listener —— accept 后由 listener 自身 dial+splice，不再
-        // 依赖 supervisor 的事件路径（旧逻辑会 dial 然后 drop stream）。
-        let evt_tcp = events.clone();
-        let rt_tcp = runtime.clone();
-        let tcp_handle = tokio::spawn(async move {
-            if let Err(e) = crate::platform::linux_tproxy::run_tcp_tproxy(
-                tcp_listener,
-                evt_tcp,
-                rt_tcp,
-                stop_tcp_rx,
-            )
-            .await
-            {
-                warn!(target: "capture::tproxy", error = %e, "tcp tproxy exited");
-            }
-        });
-        let evt_udp = events.clone();
-        let rt_udp = runtime.clone();
-        let udp_handle = tokio::spawn(async move {
-            if let Err(e) = crate::platform::linux_tproxy::run_udp_tproxy(
-                udp_socket,
-                evt_udp,
-                rt_udp,
-                stop_udp_rx,
-            )
-            .await
-            {
-                warn!(target: "capture::tproxy", error = %e, "udp tproxy exited");
-            }
-        });
+        for listeners in listeners {
+            let (tcp_listener, udp_socket, bound) = listeners.into_parts();
+            let family = if bound.is_ipv6() { "ipv6" } else { "ipv4" };
+            bound_addrs.push(bound);
 
-        g.tcp_handle = Some(tcp_handle);
-        g.udp_handle = Some(udp_handle);
-        g.stop_tcp = Some(stop_tcp_tx);
-        g.stop_udp = Some(stop_udp_tx);
+            let (stop_tcp_tx, stop_tcp_rx) = oneshot::channel::<()>();
+            listener_stops.push(stop_tcp_tx);
+            let evt_tcp = events.clone();
+            let rt_tcp = runtime.clone();
+            listener_tasks.spawn(async move {
+                if let Err(error) = crate::platform::linux_tproxy::run_tcp_tproxy(
+                    tcp_listener,
+                    evt_tcp,
+                    rt_tcp,
+                    stop_tcp_rx,
+                )
+                .await
+                {
+                    warn!(
+                        target: "capture::tproxy",
+                        family,
+                        %error,
+                        "tcp tproxy exited"
+                    );
+                }
+            });
+
+            let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
+            listener_stops.push(stop_udp_tx);
+            let evt_udp = events.clone();
+            let rt_udp = runtime.clone();
+            listener_tasks.spawn(async move {
+                if let Err(error) = crate::platform::linux_tproxy::run_udp_tproxy(
+                    udp_socket,
+                    evt_udp,
+                    rt_udp,
+                    stop_udp_rx,
+                )
+                .await
+                {
+                    warn!(
+                        target: "capture::tproxy",
+                        family,
+                        %error,
+                        "udp tproxy exited"
+                    );
+                }
+            });
+        }
+
+        g.listener_tasks = Some(listener_tasks);
+        g.listener_stops = listener_stops;
         g.on = true;
-        info!(target: "capture", addr = %bound, "linux tproxy started (TCP+UDP listeners ready)");
+        info!(
+            target: "capture",
+            addresses = ?bound_addrs,
+            "linux tproxy started (dual-protocol listeners ready)"
+        );
         Ok(())
     }
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
@@ -2243,25 +2315,10 @@ impl CaptureEngine for LinuxTproxy {
             plan: &self.plan,
             armed: true,
         };
-        if let Some(tx) = g.stop_tcp.take() {
-            let _ = tx.send(());
-        }
-        if let Some(tx) = g.stop_udp.take() {
-            let _ = tx.send(());
-        }
-        // No await has occurred yet, so both listeners have received stop
-        // before the externally visible state flips to off.
+        let mut listener_tasks = g.listener_tasks.take().unwrap_or_else(JoinSet::new);
+        let mut listener_stops = std::mem::take(&mut g.listener_stops);
         g.on = false;
-        if let Some(h) = g.tcp_handle.take() {
-            if let Err(e) = h.await {
-                warn!(target: "capture::tproxy", error = %e, "tcp tproxy task join failed");
-            }
-        }
-        if let Some(h) = g.udp_handle.take() {
-            if let Err(e) = h.await {
-                warn!(target: "capture::tproxy", error = %e, "udp tproxy task join failed");
-            }
-        }
+        stop_tproxy_listener_tasks(&mut listener_stops, &mut listener_tasks).await;
         Self::revert_rules(&self.plan);
         rule_cleanup.armed = false;
         info!(target: "capture", "linux tproxy stopped");
