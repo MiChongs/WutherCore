@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod grpc;
 pub mod listener;
 pub mod mixed;
 pub mod privilege;
@@ -17,6 +18,7 @@ mod xhttp_cors;
 pub mod xhttp_listener;
 mod xhttp_tls;
 
+pub use grpc::{GrpcListener, run_grpc, run_grpc_with_cancellation};
 pub use listener::{bind_with_fallback, select_bind_addr};
 pub use mixed::{MixedListener, run_mixed};
 pub use privilege::{

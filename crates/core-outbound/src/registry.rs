@@ -51,7 +51,9 @@ use crate::{
     },
     socks5::Socks5Outbound,
     stub::StubOutbound,
-    transport::{GrpcOptions, H2Options, HttpOptions, RealityOptions, WsOptions, XhttpOptions},
+    transport::{
+        GrpcOptions, H2Options, HttpOptions, RealityOptions, TlsOptions, WsOptions, XhttpOptions,
+    },
 };
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
@@ -426,10 +428,17 @@ fn build_vmess(node: &ParsedNode) -> Result<SharedOutbound, String> {
         if let Some(alpn) = node.params.get("alpn") {
             ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
         }
-        // VMess Legacy 也支持 ws transport
+        let tls_options =
+            build_node_tls_options(node, ob.tls, ob.sni.clone(), ob.insecure, ob.alpn.clone())?;
+        if ob.tls {
+            ob.tls_options = Some(tls_options);
+        }
+        // VMess Legacy uses the same outer transport stack as AEAD VMess.
         let net = resolve_network_string(node);
-        if VmessNetwork::parse(&net) == VmessNetwork::Ws {
-            ob.ws = Some(build_ws_options(node));
+        match VmessNetwork::parse(&net) {
+            VmessNetwork::Ws => ob.ws = Some(build_ws_options(node)),
+            VmessNetwork::Grpc => ob.grpc = Some(build_grpc_options(node)?),
+            _ => {}
         }
         return Ok(Arc::new(ob));
     }
@@ -463,6 +472,11 @@ fn build_vmess(node: &ParsedNode) -> Result<SharedOutbound, String> {
         .unwrap_or(false);
     if let Some(alpn) = node.params.get("alpn") {
         ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    let tls_options =
+        build_node_tls_options(node, ob.tls, ob.sni.clone(), ob.insecure, ob.alpn.clone())?;
+    if ob.tls {
+        ob.tls_options = Some(tls_options);
     }
     // VMess network 分发：tcp / ws / http / h2 / grpc / xhttp
     let network_str = resolve_network_string(node);
@@ -499,7 +513,7 @@ fn apply_vmess_network_options(node: &ParsedNode, ob: &mut VmessOutbound) -> Res
             ob.h2 = Some(build_h2_options(node));
         }
         VmessNetwork::Grpc => {
-            ob.grpc = Some(build_grpc_options(node));
+            ob.grpc = Some(build_grpc_options(node)?);
         }
         VmessNetwork::Xhttp => {
             ob.xhttp = Some(build_xhttp_options(
@@ -566,6 +580,15 @@ fn build_vless(node: &ParsedNode) -> Result<SharedOutbound, String> {
             },
         });
     }
+    if ob.reality.is_some() {
+        reject_ordinary_tls_with_reality(node)?;
+    } else {
+        let tls_options =
+            build_node_tls_options(node, ob.tls, ob.sni.clone(), ob.insecure, ob.alpn.clone())?;
+        if ob.tls {
+            ob.tls_options = Some(tls_options);
+        }
+    }
     let network_str = resolve_network_string(node);
     ob.network = VlessNetwork::parse(&network_str);
     apply_vless_network_options(node, &mut ob)?;
@@ -585,7 +608,7 @@ fn apply_vless_network_options(node: &ParsedNode, ob: &mut VlessOutbound) -> Res
             ob.h2 = Some(build_h2_options(node));
         }
         VlessNetwork::Grpc => {
-            ob.grpc = Some(build_grpc_options(node));
+            ob.grpc = Some(build_grpc_options(node)?);
         }
         VlessNetwork::Xhttp => {
             ob.xhttp = Some(build_xhttp_options(
@@ -651,22 +674,487 @@ fn build_h2_options(node: &ParsedNode) -> H2Options {
     }
 }
 
-fn build_grpc_options(node: &ParsedNode) -> GrpcOptions {
-    GrpcOptions {
+fn build_grpc_options(node: &ParsedNode) -> Result<GrpcOptions, &'static str> {
+    let authority = grpc_param(node, &["authority", "grpc-authority", "grpc_authority"])?
+        .unwrap_or_default()
+        .to_owned();
+    let service_name = grpc_param(
+        node,
+        &[
+            "serviceName",
+            "service_name",
+            "service-name",
+            "grpc-service-name",
+            "grpc_service_name",
+        ],
+    )?
+    .unwrap_or_default()
+    .to_owned();
+    let multi_mode = parse_grpc_bool(grpc_param(
+        node,
+        &["multiMode", "multi_mode", "multi-mode", "grpc-multi-mode"],
+    )?)?
+    .unwrap_or(false);
+    let idle_timeout = parse_grpc_duration(grpc_param(
+        node,
+        &[
+            "idle_timeout",
+            "idleTimeout",
+            "idle-timeout",
+            "grpc-idle-timeout",
+        ],
+    )?)?;
+    let health_check_timeout = parse_grpc_duration(grpc_param(
+        node,
+        &[
+            "health_check_timeout",
+            "healthCheckTimeout",
+            "health-check-timeout",
+            "grpc-health-check-timeout",
+        ],
+    )?)?;
+    let permit_without_stream = parse_grpc_bool(grpc_param(
+        node,
+        &[
+            "permit_without_stream",
+            "permitWithoutStream",
+            "permit-without-stream",
+            "grpc-permit-without-stream",
+        ],
+    )?)?
+    .unwrap_or(false);
+    let initial_window_size = parse_grpc_window(grpc_param(
+        node,
+        &[
+            "initial_windows_size",
+            "initial_window_size",
+            "initialWindowSize",
+            "initial-window-size",
+            "initial-windows-size",
+            "grpc-initial-window-size",
+        ],
+    )?)?;
+    let user_agent = grpc_param(
+        node,
+        &[
+            "user_agent",
+            "userAgent",
+            "user-agent",
+            "grpc-user-agent",
+            "grpc_user_agent",
+        ],
+    )?
+    .unwrap_or_default()
+    .to_owned();
+    let max_message_size = parse_grpc_positive_usize(
+        grpc_param(
+            node,
+            &[
+                "max_message_size",
+                "maxMessageSize",
+                "max-message-size",
+                "grpc-max-message-size",
+            ],
+        )?,
+        core_grpc::DEFAULT_MAX_MESSAGE_SIZE,
+        core_grpc::MIN_MESSAGE_SIZE,
+        core_grpc::MAX_MESSAGE_SIZE_LIMIT,
+    )?;
+    let queue_capacity = parse_grpc_positive_usize(
+        grpc_param(
+            node,
+            &[
+                "queue_capacity",
+                "queueCapacity",
+                "queue-capacity",
+                "grpc-queue-capacity",
+            ],
+        )?,
+        core_grpc::DEFAULT_QUEUE_CAPACITY,
+        1,
+        core_grpc::MAX_QUEUE_CAPACITY,
+    )?;
+
+    Ok(GrpcOptions {
         enabled: true,
-        service_name: node
-            .params
-            .get("serviceName")
-            .or_else(|| node.params.get("grpc-service-name"))
-            .cloned()
-            .unwrap_or_default(),
-        user_agent: node
-            .params
-            .get("grpc-user-agent")
-            .cloned()
-            .unwrap_or_default(),
+        authority,
+        service_name,
+        multi_mode,
+        idle_timeout,
+        health_check_timeout,
+        permit_without_stream,
+        initial_window_size,
+        user_agent,
+        max_message_size,
+        queue_capacity,
         host: node.params.get("host").cloned().unwrap_or_default(),
+    })
+}
+
+fn build_node_tls_options(
+    node: &ParsedNode,
+    enabled: bool,
+    fallback_sni: Option<String>,
+    fallback_insecure: bool,
+    fallback_alpn: Vec<String>,
+) -> Result<TlsOptions, String> {
+    const ADVANCED_KEYS: &[&str] = &[
+        "serverName",
+        "server-name",
+        "server_name",
+        "sni",
+        "alpn",
+        "allowInsecure",
+        "allow-insecure",
+        "allow_insecure",
+        "fingerprint",
+        "fp",
+        "utls",
+        "enableSessionResumption",
+        "enable-session-resumption",
+        "enable_session_resumption",
+        "disableSystemRoot",
+        "disable-system-root",
+        "disable_system_root",
+        "minVersion",
+        "min-version",
+        "min_version",
+        "maxVersion",
+        "max-version",
+        "max_version",
+        "cipherSuites",
+        "cipher-suites",
+        "cipher_suites",
+        "curvePreferences",
+        "curve-preferences",
+        "curve_preferences",
+        "masterKeyLog",
+        "master-key-log",
+        "master_key_log",
+        "pinnedPeerCertSha256",
+        "pinned-peer-cert-sha256",
+        "pinned_peer_cert_sha256",
+        "verifyPeerCertByName",
+        "verify-peer-cert-by-name",
+        "verify_peer_cert_by_name",
+        "echConfigList",
+        "ech-config-list",
+        "ech_config_list",
+    ];
+    let ech_toggle = first_param(node, &["ech"])
+        .map(|value| parse_bool_param("ech", value))
+        .transpose()?;
+    let has_complete_settings = node.tls_settings.is_some()
+        || ech_toggle == Some(true)
+        || ADVANCED_KEYS
+            .iter()
+            .any(|key| node.params.contains_key(*key));
+    if has_complete_settings && !enabled {
+        return Err("TLS/ECH settings are present while TLS is disabled".into());
     }
+    if !has_complete_settings {
+        return Ok(TlsOptions {
+            enabled,
+            sni: fallback_sni,
+            insecure: fallback_insecure,
+            alpn: fallback_alpn,
+            ..TlsOptions::default()
+        });
+    }
+
+    let mut settings = node.tls_settings.clone().unwrap_or_default();
+    let fingerprint = first_param(node, &["fingerprint", "fp"]);
+    let utls = first_param(node, &["utls"]);
+    if fingerprint
+        .zip(utls)
+        .is_some_and(|(fingerprint, utls)| !fingerprint.eq_ignore_ascii_case(utls))
+    {
+        return Err("TLS fingerprint conflicts with utls".into());
+    }
+    if let Some(value) = fingerprint.or(utls) {
+        if settings
+            .fingerprint
+            .as_deref()
+            .is_some_and(|typed| !typed.eq_ignore_ascii_case(value))
+        {
+            return Err("typed TLS fingerprint conflicts with URI fingerprint".into());
+        }
+        settings.fingerprint = Some(value.to_owned());
+    }
+
+    let explicit_server_name = node
+        .sni
+        .as_deref()
+        .or_else(|| first_param(node, &["serverName", "server-name", "server_name", "sni"]));
+    if let Some(explicit) = explicit_server_name {
+        if settings
+            .server_name
+            .as_ref()
+            .is_some_and(|typed| typed != explicit)
+        {
+            return Err("typed TLS serverName conflicts with protocol SNI".into());
+        }
+        settings.server_name = Some(explicit.to_owned());
+    } else if settings.server_name.is_none() {
+        settings.server_name = fallback_sni;
+    }
+    settings.server_name = merge_optional_string_param(
+        node,
+        &["serverName", "server-name", "server_name", "sni"],
+        "serverName",
+        settings.server_name,
+        true,
+    )?;
+    settings.allow_insecure = merge_optional_bool_param(
+        node,
+        &["allowInsecure", "allow-insecure", "allow_insecure"],
+        "allowInsecure",
+        settings.allow_insecure,
+    )?;
+    if fallback_insecure {
+        if settings.allow_insecure == Some(false) {
+            return Err("typed TLS allowInsecure conflicts with protocol setting".into());
+        }
+        settings.allow_insecure = Some(true);
+    }
+    settings.enable_session_resumption = merge_optional_bool_param(
+        node,
+        &[
+            "enableSessionResumption",
+            "enable-session-resumption",
+            "enable_session_resumption",
+        ],
+        "enableSessionResumption",
+        settings.enable_session_resumption,
+    )?;
+    settings.disable_system_root = merge_optional_bool_param(
+        node,
+        &[
+            "disableSystemRoot",
+            "disable-system-root",
+            "disable_system_root",
+        ],
+        "disableSystemRoot",
+        settings.disable_system_root,
+    )?;
+    settings.min_version = merge_optional_string_param(
+        node,
+        &["minVersion", "min-version", "min_version"],
+        "minVersion",
+        settings.min_version,
+        true,
+    )?;
+    settings.max_version = merge_optional_string_param(
+        node,
+        &["maxVersion", "max-version", "max_version"],
+        "maxVersion",
+        settings.max_version,
+        true,
+    )?;
+    settings.cipher_suites = merge_optional_string_param(
+        node,
+        &["cipherSuites", "cipher-suites", "cipher_suites"],
+        "cipherSuites",
+        settings.cipher_suites,
+        false,
+    )?;
+    settings.curve_preferences = merge_optional_string_list_param(
+        node,
+        &["curvePreferences", "curve-preferences", "curve_preferences"],
+        "curvePreferences",
+        settings.curve_preferences,
+    )?;
+    settings.master_key_log = merge_optional_string_param(
+        node,
+        &["masterKeyLog", "master-key-log", "master_key_log"],
+        "masterKeyLog",
+        settings.master_key_log,
+        false,
+    )?;
+    settings.pinned_peer_cert_sha256 = merge_optional_string_param(
+        node,
+        &[
+            "pinnedPeerCertSha256",
+            "pinned-peer-cert-sha256",
+            "pinned_peer_cert_sha256",
+        ],
+        "pinnedPeerCertSha256",
+        settings.pinned_peer_cert_sha256,
+        true,
+    )?;
+    settings.verify_peer_cert_by_name = merge_optional_string_param(
+        node,
+        &[
+            "verifyPeerCertByName",
+            "verify-peer-cert-by-name",
+            "verify_peer_cert_by_name",
+        ],
+        "verifyPeerCertByName",
+        settings.verify_peer_cert_by_name,
+        true,
+    )?;
+    settings.ech_config_list = merge_optional_string_param(
+        node,
+        &["echConfigList", "ech-config-list", "ech_config_list"],
+        "echConfigList",
+        settings.ech_config_list,
+        false,
+    )?;
+    if let Some(enabled) = ech_toggle {
+        if enabled != settings.ech_config_list.is_some() {
+            return Err(if enabled {
+                "ech=true requires a non-empty echConfigList".into()
+            } else {
+                "ech=false conflicts with echConfigList".into()
+            });
+        }
+    }
+    if !fallback_alpn.is_empty() {
+        if settings
+            .alpn
+            .as_ref()
+            .is_some_and(|typed| typed != &fallback_alpn)
+        {
+            return Err("typed TLS alpn conflicts with protocol ALPN".into());
+        }
+        settings.alpn = Some(fallback_alpn);
+    }
+
+    settings
+        .validate()
+        .map_err(|error| format!("TLS settings: {error}"))?;
+    TlsOptions::from_xray_settings(settings).map_err(|error| error.to_string())
+}
+
+fn reject_ordinary_tls_with_reality(node: &ParsedNode) -> Result<(), String> {
+    const TLS_ONLY_KEYS: &[&str] = &[
+        "enableSessionResumption",
+        "enable-session-resumption",
+        "enable_session_resumption",
+        "disableSystemRoot",
+        "disable-system-root",
+        "disable_system_root",
+        "minVersion",
+        "min-version",
+        "min_version",
+        "maxVersion",
+        "max-version",
+        "max_version",
+        "cipherSuites",
+        "cipher-suites",
+        "cipher_suites",
+        "curvePreferences",
+        "curve-preferences",
+        "curve_preferences",
+        "pinnedPeerCertSha256",
+        "pinned-peer-cert-sha256",
+        "pinned_peer_cert_sha256",
+        "verifyPeerCertByName",
+        "verify-peer-cert-by-name",
+        "verify_peer_cert_by_name",
+        "echConfigList",
+        "ech-config-list",
+        "ech_config_list",
+        "alpn",
+        "allowInsecure",
+        "allow-insecure",
+        "allow_insecure",
+        "utls",
+    ];
+    let ech_enabled = first_param(node, &["ech"])
+        .map(|value| parse_bool_param("ech", value))
+        .transpose()?
+        .unwrap_or(false);
+    if node.tls_settings.is_some()
+        || ech_enabled
+        || TLS_ONLY_KEYS
+            .iter()
+            .any(|key| node.params.contains_key(*key))
+    {
+        return Err("ordinary TLS/ECH settings cannot be combined with REALITY".into());
+    }
+    Ok(())
+}
+
+fn grpc_param<'a>(node: &'a ParsedNode, keys: &[&str]) -> Result<Option<&'a str>, &'static str> {
+    let mut value = None;
+    for key in keys {
+        let Some(candidate) = node.params.get(*key).map(String::as_str) else {
+            continue;
+        };
+        if let Some(existing) = value
+            && existing != candidate
+        {
+            return Err("grpc(conflicting-options)");
+        }
+        value = Some(candidate);
+    }
+    Ok(value)
+}
+
+fn parse_grpc_bool(value: Option<&str>) -> Result<Option<bool>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(Some(true)),
+        "false" | "0" | "no" | "off" => Ok(Some(false)),
+        _ => Err("grpc(invalid-boolean-option)"),
+    }
+}
+
+fn parse_grpc_duration(value: Option<&str>) -> Result<std::time::Duration, &'static str> {
+    let Some(value) = value else {
+        return Ok(std::time::Duration::ZERO);
+    };
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<i64>() {
+        if seconds > i64::from(i32::MAX) {
+            return Err("grpc(invalid-duration)");
+        }
+        return Ok(std::time::Duration::from_secs(seconds.max(0) as u64));
+    }
+    let duration = parse_tuic_duration(value).ok_or("grpc(invalid-duration)")?;
+    if duration.subsec_nanos() != 0 || duration.as_secs() > i32::MAX as u64 {
+        return Err("grpc(invalid-duration)");
+    }
+    Ok(duration)
+}
+
+fn parse_grpc_window(value: Option<&str>) -> Result<Option<u32>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| "grpc(invalid-initial-window-size)")?;
+    if value <= 0 {
+        return Ok(None);
+    }
+    if value > i64::from(i32::MAX) {
+        return Err("grpc(invalid-initial-window-size)");
+    }
+    Ok(Some(value as u32))
+}
+
+fn parse_grpc_positive_usize(
+    value: Option<&str>,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, &'static str> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "grpc(invalid-resource-limit)")?;
+    if !(minimum..=maximum).contains(&parsed) {
+        return Err("grpc(invalid-resource-limit)");
+    }
+    Ok(parsed)
 }
 
 fn build_xhttp_options(
@@ -1509,6 +1997,17 @@ fn overlay_range(target: &mut String, value: Option<TypedRange>) {
 fn build_trojan(node: &ParsedNode) -> Result<TrojanOutbound, String> {
     let pwd = node.password.clone().unwrap_or_default();
     let mut ob = TrojanOutbound::new(&node.name, &node.host, node.port, pwd);
+    if node
+        .params
+        .get("security")
+        .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+        || node
+            .params
+            .get("tls")
+            .is_some_and(|value| value.eq_ignore_ascii_case("false") || value == "0")
+    {
+        ob.tls = false;
+    }
     ob.udp = node.udp;
     ob.sni = node
         .sni
@@ -1523,17 +2022,25 @@ fn build_trojan(node: &ParsedNode) -> Result<TrojanOutbound, String> {
     if let Some(alpn) = node.params.get("alpn") {
         ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
     }
-    if matches!(
-        node.transport.to_ascii_lowercase().as_str(),
-        "xhttp" | "splithttp"
-    ) {
-        ob.xhttp = Some(build_xhttp_options_with_tls_requirement(
-            node,
-            ob.sni.clone(),
-            ob.insecure,
-            ob.alpn.clone(),
-            true,
-        )?);
+    let tls_options =
+        build_node_tls_options(node, ob.tls, ob.sni.clone(), ob.insecure, ob.alpn.clone())?;
+    if ob.tls {
+        ob.tls_options = Some(tls_options);
+    }
+    match resolve_network_string(node).to_ascii_lowercase().as_str() {
+        "xhttp" | "splithttp" => {
+            ob.xhttp = Some(build_xhttp_options_with_tls_requirement(
+                node,
+                ob.sni.clone(),
+                ob.insecure,
+                ob.alpn.clone(),
+                true,
+            )?);
+        }
+        "grpc" | "gun" => {
+            ob.grpc = Some(build_grpc_options(node)?);
+        }
+        _ => {}
     }
     Ok(ob)
 }
@@ -2647,7 +3154,7 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
 mod tests {
     use base64::Engine;
     use core_config::{
-        model::XhttpConfig as TypedXhttpConfig,
+        model::{XhttpConfig as TypedXhttpConfig, XhttpDownloadTlsSettings},
         node_uri::{NodeProtocol, ParsedNode},
     };
     use uuid::Uuid;
@@ -2710,6 +3217,176 @@ mod tests {
         node.udp = true;
         let outbound = build_outbound(&node).unwrap();
         assert!(outbound.capabilities().udp);
+    }
+
+    #[test]
+    fn grpc_registry_maps_every_xray_field_and_alias() {
+        let mut node = ParsedNode::new("grpc", NodeProtocol::Vless, "grpc.example", 443);
+        node.transport = "grpc".into();
+        node.params
+            .insert("grpc-authority".into(), "authority.example".into());
+        node.params
+            .insert("grpc-service-name".into(), "/pkg.Service/TunX".into());
+        node.params.insert("multiMode".into(), "true".into());
+        node.params.insert("idleTimeout".into(), "30".into());
+        node.params
+            .insert("health_check_timeout".into(), "5s".into());
+        node.params
+            .insert("permit-without-stream".into(), "1".into());
+        node.params
+            .insert("initialWindowSize".into(), "1048576".into());
+        node.params.insert("user_agent".into(), "golang".into());
+        node.params
+            .insert("max-message-size".into(), "8388608".into());
+        node.params.insert("queueCapacity".into(), "32".into());
+
+        let options = super::build_grpc_options(&node).unwrap();
+        assert_eq!(options.authority, "authority.example");
+        assert_eq!(options.service_name, "/pkg.Service/TunX");
+        assert!(options.multi_mode);
+        assert_eq!(options.idle_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            options.health_check_timeout,
+            std::time::Duration::from_secs(5)
+        );
+        assert!(options.permit_without_stream);
+        assert_eq!(options.initial_window_size, Some(1_048_576));
+        assert_eq!(options.user_agent, "golang");
+        assert_eq!(options.max_message_size, 8_388_608);
+        assert_eq!(options.queue_capacity, 32);
+    }
+
+    #[test]
+    fn grpc_registry_fails_closed_on_conflicts_and_invalid_limits() {
+        let mut node = ParsedNode::new("grpc", NodeProtocol::Vless, "grpc.example", 443);
+        node.transport = "grpc".into();
+        node.params.insert("serviceName".into(), "one".into());
+        node.params.insert("grpc-service-name".into(), "two".into());
+        assert_eq!(
+            super::build_grpc_options(&node).unwrap_err(),
+            "grpc(conflicting-options)"
+        );
+
+        node.params.remove("grpc-service-name");
+        node.params.insert("max-message-size".into(), "0".into());
+        assert_eq!(
+            super::build_grpc_options(&node).unwrap_err(),
+            "grpc(invalid-resource-limit)"
+        );
+
+        node.params.remove("max-message-size");
+        node.params.insert("multiMode".into(), "maybe".into());
+        let error = match super::build_outbound(&node) {
+            Ok(_) => panic!("invalid gRPC boolean must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "grpc(invalid-boolean-option)");
+
+        node.params.remove("multiMode");
+        node.params.insert("idleTimeout".into(), "500ms".into());
+        assert_eq!(
+            super::build_grpc_options(&node).unwrap_err(),
+            "grpc(invalid-duration)"
+        );
+
+        node.params
+            .insert("idleTimeout".into(), (i32::MAX as u64 + 1).to_string());
+        assert_eq!(
+            super::build_grpc_options(&node).unwrap_err(),
+            "grpc(invalid-duration)"
+        );
+
+        node.params.remove("idleTimeout");
+        node.params.insert(
+            "initialWindowSize".into(),
+            (i32::MAX as u64 + 1).to_string(),
+        );
+        assert_eq!(
+            super::build_grpc_options(&node).unwrap_err(),
+            "grpc(invalid-initial-window-size)"
+        );
+    }
+
+    #[test]
+    fn grpc_registry_preserves_complete_tls_settings_and_rejects_disabled_tls() {
+        let mut node = ParsedNode::new("grpc-tls", NodeProtocol::Vless, "grpc.example", 443);
+        node.uuid = Some("2dd61d93-75d8-4da4-ac0e-6aece7eac365".into());
+        node.transport = "grpc".into();
+        node.params.insert("serviceName".into(), "full-tls".into());
+        node.tls_settings = Some(XhttpDownloadTlsSettings {
+            server_name: Some("certificate.example".into()),
+            alpn: Some(vec!["h2".into()]),
+            enable_session_resumption: Some(true),
+            fingerprint: Some("chrome".into()),
+            min_version: Some("1.2".into()),
+            max_version: Some("1.3".into()),
+            cipher_suites: Some("TLS_AES_128_GCM_SHA256".into()),
+            curve_preferences: Some(vec!["X25519".into()]),
+            pinned_peer_cert_sha256: Some("11".repeat(32)),
+            verify_peer_cert_by_name: Some("certificate.example".into()),
+            ..Default::default()
+        });
+
+        let error = match build_outbound(&node) {
+            Ok(_) => panic!("advanced TLS fields must not be ignored while TLS is disabled"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "TLS/ECH settings are present while TLS is disabled");
+
+        let mut disabled = ParsedNode::new(
+            "grpc-disabled-tls",
+            NodeProtocol::Vless,
+            "grpc.example",
+            443,
+        );
+        disabled.uuid = node.uuid.clone();
+        disabled.transport = "grpc".into();
+        disabled
+            .params
+            .insert("sni".into(), "ignored.example".into());
+        assert!(build_outbound(&disabled).is_err());
+
+        node.tls = true;
+        node.sni = Some("certificate.example".into());
+        let options =
+            super::build_node_tls_options(&node, true, node.sni.clone(), false, vec!["h2".into()])
+                .unwrap();
+        assert_eq!(options.sni.as_deref(), Some("certificate.example"));
+        assert_eq!(options.alpn, ["h2"]);
+        assert_eq!(options.fingerprint, "chrome");
+        assert!(options.enable_session_resumption);
+        assert_eq!(options.pinned_peer_cert_sha256, [[0x11; 32]]);
+        assert_eq!(options.verify_peer_cert_by_name, ["certificate.example"]);
+        let settings = options.xray_settings.unwrap();
+        assert_eq!(settings.min_version.as_deref(), Some("1.2"));
+        assert_eq!(settings.max_version.as_deref(), Some("1.3"));
+        assert_eq!(
+            settings.cipher_suites.as_deref(),
+            Some("TLS_AES_128_GCM_SHA256")
+        );
+        assert_eq!(settings.curve_preferences.unwrap(), ["X25519"]);
+
+        node.tls_settings = None;
+        node.params.insert("ech".into(), "true".into());
+        assert_eq!(
+            super::build_node_tls_options(&node, true, node.sni.clone(), false, vec!["h2".into()])
+                .unwrap_err(),
+            "ech=true requires a non-empty echConfigList"
+        );
+    }
+
+    #[test]
+    fn trojan_uses_registered_grpc_carrier_without_forcing_direct_tls() {
+        let mut node = ParsedNode::new("trojan-grpc", NodeProtocol::Trojan, "grpc.example", 443);
+        node.password = Some("secret".into());
+        node.transport = "grpc".into();
+        node.params.insert("security".into(), "none".into());
+        node.params.insert("serviceName".into(), "trojan".into());
+        node.params.insert("multiMode".into(), "true".into());
+
+        let concrete = super::build_trojan(&node).unwrap();
+        assert!(!concrete.tls);
+        assert!(concrete.grpc.as_ref().is_some_and(|grpc| grpc.multi_mode));
     }
 
     #[test]

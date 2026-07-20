@@ -6,6 +6,7 @@ members = [
     "crates/core-runtime",
     "crates/core-inbound",
     "crates/core-outbound",
+    "crates/core-grpc",
     "crates/core-feeds",
     "crates/core-store",
     "crates/core-ruleset",
@@ -93,6 +94,9 @@ hyper            = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util       = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 http             = "1"
 http-body-util   = "0.1"
+prost            = "=0.13.5"
+tonic            = { version = "=0.13.1", default-features = false, features = ["prost"] }
+tokio-stream     = { version = "=0.1.18", features = ["sync"] }
 flate2           = "1"
 brotli           = "7"
 redb = "2.2"
@@ -156,6 +160,7 @@ core-fetch    = { path = "crates/core-fetch" }
 core-runtime  = { path = "crates/core-runtime" }
 core-inbound  = { path = "crates/core-inbound" }
 core-outbound = { path = "crates/core-outbound" }
+core-grpc     = { path = "crates/core-grpc" }
 core-feeds    = { path = "crates/core-feeds" }
 core-store    = { path = "crates/core-store" }
 core-ruleset  = { path = "crates/core-ruleset" }

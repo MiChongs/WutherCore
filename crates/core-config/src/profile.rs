@@ -18,6 +18,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         reality: vec![],
         wireguard: vec![],
         young: vec![],
+        grpc: vec![],
     });
     if listen.local.is_none() {
         listen.local = match profile {

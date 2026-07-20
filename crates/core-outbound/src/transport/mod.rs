@@ -9,7 +9,7 @@
 //! * [`tls::TlsTransport`]      —— TLS over TCP（rustls + ring + webpki-roots）
 //! * [`ws::WsTransport`]        —— WebSocket，可选叠加 TLS（即 wss）
 
-use std::io;
+use std::{fmt, io};
 
 use async_trait::async_trait;
 use core_config::model::XhttpDownloadTlsSettings;
@@ -17,6 +17,7 @@ use core_config::model::XhttpDownloadTlsSettings;
 use crate::adapter::BoxedStream;
 
 pub(crate) mod boring_tls;
+mod browser_identity;
 pub(crate) mod ech;
 pub mod grpc_transport;
 pub mod h2_transport;
@@ -42,7 +43,7 @@ pub trait Transport: Send + Sync {
 }
 
 /// 公共 TLS 选项。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct TlsOptions {
     pub enabled: bool,
     pub sni: Option<String>,
@@ -61,18 +62,39 @@ pub struct TlsOptions {
     /// Xray `verifyPeerCertByName`：非空时不使用拨号 SNI 做名称验证，而是
     /// 依次尝试这里的 DNS/IP 名称。
     pub verify_peer_cert_by_name: Vec<String>,
-    /// 完整 Xray TLS 配置。仅 XHTTP 使用此对象；保留完整值可保证 TCP 与
-    /// QUIC 后端在能力选择时不会丢字段或静默忽略高级配置。
+    /// 完整 Xray TLS 配置。XHTTP、gRPC 及其他叠加在 TLS 上的载体共用此
+    /// 对象；保留完整值可保证 TCP 与 QUIC 后端不会丢字段或静默忽略高级配置。
     pub xray_settings: Option<XhttpDownloadTlsSettings>,
     /// `echConfigList` 为 DNS URL 时由异步解析器写入；不参与用户配置序列化。
     pub(crate) resolved_ech_config_list: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for TlsOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsOptions")
+            .field("enabled", &self.enabled)
+            .field("sni", &self.sni)
+            .field("insecure", &self.insecure)
+            .field("alpn", &self.alpn)
+            .field("enable_session_resumption", &self.enable_session_resumption)
+            .field("fingerprint", &self.fingerprint)
+            .field("pin_count", &self.pinned_peer_cert_sha256.len())
+            .field("verify_peer_cert_by_name", &self.verify_peer_cert_by_name)
+            .field("has_xray_settings", &self.xray_settings.is_some())
+            .field(
+                "has_resolved_ech_config",
+                &self.resolved_ech_config_list.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl TlsOptions {
     /// Compile one complete, strongly typed Xray TLS object into executable
     /// transport options. Callers only pass the source settings; certificates,
     /// pins, name overrides, ALPN, resumption, fingerprint and ECH stay on one
-    /// validation/parsing path shared by XHTTP, Realm and stacked transports.
+    /// validation/parsing path shared by XHTTP, REALITY and stacked transports.
     pub fn from_xray_settings(settings: XhttpDownloadTlsSettings) -> io::Result<Self> {
         settings
             .validate()

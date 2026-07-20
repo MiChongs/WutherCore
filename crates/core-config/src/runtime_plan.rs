@@ -48,6 +48,7 @@ pub struct ListenPlan {
     #[serde(default)]
     pub wireguard: Vec<WireGuardListenPlan>,
     pub young: Vec<YoungListen>,
+    pub grpc: Vec<GrpcListen>,
     pub panel: Option<PanelListen>,
     pub xhttp: Vec<XhttpListenPlan>,
     pub share: Share,
@@ -343,6 +344,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         reality: vec![],
         wireguard: vec![],
         young: vec![],
+        grpc: vec![],
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -421,12 +423,14 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
     let reality = compile_reality_listeners(&listen.reality)?;
     let wireguard = compile_wireguard_listeners(&listen.wireguard)?;
     let young = compile_young_listeners(&listen.young)?;
+    let grpc = compile_grpc_listeners(&listen.grpc)?;
 
     Ok(ListenPlan {
         mixed,
         reality,
         wireguard,
         young,
+        grpc,
         panel,
         xhttp,
         share,
@@ -657,6 +661,244 @@ fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungL
         output.push(listener.clone());
     }
     Ok(output)
+}
+
+fn compile_grpc_listeners(listeners: &[GrpcListen]) -> ConfigResult<Vec<GrpcListen>> {
+    const MIN_MESSAGE_SIZE: usize = 3;
+    const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+    const MAX_QUEUE_CAPACITY: usize = 1024;
+
+    let mut out = Vec::with_capacity(listeners.len());
+    let mut bound = HashSet::new();
+    for (index, source) in listeners.iter().enumerate() {
+        let location = format!("listen.grpc[{index}]");
+        if source.port == 0 {
+            return Err(ConfigError::invalid("gRPC 监听端口不能为 0").at(location));
+        }
+        let host = source.host.trim();
+        if host.is_empty() {
+            return Err(ConfigError::invalid("gRPC 监听地址不能为空").at(location));
+        }
+        let address = parse_listener_address(host, source.port).map_err(|error| {
+            ConfigError::invalid(format!("非法 gRPC 监听地址 `{host}`: {error}"))
+                .at(format!("{location}.host"))
+        })?;
+        if !bound.insert(address) {
+            return Err(ConfigError::invalid("重复的 gRPC 监听地址").at(location));
+        }
+        if !source.protocol.eq_ignore_ascii_case("vless") {
+            return Err(ConfigError::invalid(format!(
+                "gRPC 入站目前只接受完整实现的 VLESS 内层协议，收到 `{}`",
+                source.protocol
+            ))
+            .at(format!("{location}.protocol")));
+        }
+        if source.users.is_empty() {
+            return Err(
+                ConfigError::invalid("gRPC VLESS 入站至少需要一个 users UUID").at(location),
+            );
+        }
+        let mut users = HashSet::with_capacity(source.users.len());
+        for (user_index, user) in source.users.iter().enumerate() {
+            let parsed = uuid::Uuid::parse_str(user).map_err(|error| {
+                ConfigError::invalid(format!("非法 VLESS UUID: {error}"))
+                    .at(format!("{location}.users[{user_index}]"))
+            })?;
+            if !users.insert(parsed) {
+                return Err(ConfigError::invalid("gRPC VLESS users 中存在重复 UUID")
+                    .at(format!("{location}.users[{user_index}]")));
+            }
+        }
+        if source.handshake_timeout.is_zero() {
+            return Err(ConfigError::invalid("handshakeTimeout 必须大于 0")
+                .at(format!("{location}.handshakeTimeout")));
+        }
+        if source.max_mux_sessions == 0 || source.max_mux_sessions > u16::MAX as usize {
+            return Err(ConfigError::invalid("maxMuxSessions 必须在 1..=65535")
+                .at(format!("{location}.maxMuxSessions")));
+        }
+        if source.max_connections == 0 || source.max_connections > u16::MAX as usize {
+            return Err(ConfigError::invalid("maxConnections 必须在 1..=65535")
+                .at(format!("{location}.maxConnections")));
+        }
+        if source.max_concurrent_streams == 0 {
+            return Err(ConfigError::invalid("maxConcurrentStreams 必须大于 0")
+                .at(format!("{location}.maxConcurrentStreams")));
+        }
+        if source.max_header_list_size == 0 {
+            return Err(ConfigError::invalid("maxHeaderListSize 必须大于 0")
+                .at(format!("{location}.maxHeaderListSize")));
+        }
+
+        let settings = &source.grpc_settings;
+        for (name, value) in [
+            ("idle_timeout", settings.idle_timeout.as_ref()),
+            (
+                "health_check_timeout",
+                settings.health_check_timeout.as_ref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                let duration = value.duration();
+                if duration.subsec_nanos() != 0 || duration.as_secs() > i32::MAX as u64 {
+                    return Err(ConfigError::invalid(format!(
+                        "{name} 必须是 0..={} 范围内的整数秒",
+                        i32::MAX
+                    ))
+                    .at(format!("{location}.grpcSettings.{name}")));
+                }
+            }
+        }
+        if settings
+            .initial_window_size
+            .is_some_and(|value| value > i32::MAX as u32)
+        {
+            return Err(
+                ConfigError::invalid("initial_windows_size 超出 Xray int32 范围")
+                    .at(format!("{location}.grpcSettings.initial_windows_size")),
+            );
+        }
+        if let Some(value) = settings.max_message_size
+            && !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&value)
+        {
+            return Err(ConfigError::invalid(format!(
+                "max_message_size 必须在 {MIN_MESSAGE_SIZE}..={MAX_MESSAGE_SIZE}"
+            ))
+            .at(format!("{location}.grpcSettings.max_message_size")));
+        }
+        if let Some(value) = settings.queue_capacity
+            && (value == 0 || value > MAX_QUEUE_CAPACITY)
+        {
+            return Err(ConfigError::invalid(format!(
+                "queue_capacity 必须在 1..={MAX_QUEUE_CAPACITY}"
+            ))
+            .at(format!("{location}.grpcSettings.queue_capacity")));
+        }
+        if settings
+            .authority
+            .as_deref()
+            .is_some_and(|value| has_header_injection(value))
+        {
+            return Err(ConfigError::invalid("authority 含非法控制字符")
+                .at(format!("{location}.grpcSettings.authority")));
+        }
+        if settings
+            .user_agent
+            .as_deref()
+            .is_some_and(has_header_injection)
+        {
+            return Err(ConfigError::invalid("user_agent 含非法控制字符")
+                .at(format!("{location}.grpcSettings.user_agent")));
+        }
+        for (header_index, header) in source.trusted_x_forwarded_for.iter().enumerate() {
+            if !is_http_header_name(header) {
+                return Err(
+                    ConfigError::invalid("trustedXForwardedFor 含非法 HTTP 头名称")
+                        .at(format!("{location}.trustedXForwardedFor[{header_index}]")),
+                );
+            }
+        }
+
+        let mut normalized = source.clone();
+        normalized.host = host.to_owned();
+        normalized.protocol = "vless".into();
+        match source.security {
+            GrpcListenSecurity::None => {
+                if source.tls_settings.is_some()
+                    || source.reality_settings.is_some()
+                    || source.require_client_certificate
+                {
+                    return Err(ConfigError::invalid(
+                        "security=none 不能同时配置 tlsSettings、realitySettings 或 requireClientCertificate",
+                    )
+                    .at(format!("{location}.security")));
+                }
+            }
+            GrpcListenSecurity::Tls => {
+                if source.reality_settings.is_some() {
+                    return Err(
+                        ConfigError::invalid("security=tls 不能同时配置 realitySettings")
+                            .at(format!("{location}.realitySettings")),
+                    );
+                }
+                let mut tls = source.tls_settings.clone().ok_or_else(|| {
+                    ConfigError::invalid("security=tls 必须配置 tlsSettings")
+                        .at(format!("{location}.tlsSettings"))
+                })?;
+                match tls.alpn.as_mut() {
+                    None => tls.alpn = Some(vec!["h2".into()]),
+                    Some(alpn) if !alpn.iter().any(|value| value == "h2") => {
+                        return Err(ConfigError::invalid(
+                            "gRPC TLS 的 alpn 必须包含 h2，禁止静默回退到 HTTP/1.1",
+                        )
+                        .at(format!("{location}.tlsSettings.alpn")));
+                    }
+                    Some(_) => {}
+                }
+                tls.validate().map_err(|error| {
+                    ConfigError::invalid(format!("gRPC TLS 配置非法：{error}"))
+                        .at(format!("{location}.tlsSettings"))
+                })?;
+                normalized.tls_settings = Some(tls);
+            }
+            GrpcListenSecurity::Reality => {
+                if source.tls_settings.is_some() || source.require_client_certificate {
+                    return Err(ConfigError::invalid(
+                        "security=reality 不能同时配置 tlsSettings 或 requireClientCertificate",
+                    )
+                    .at(format!("{location}.security")));
+                }
+                let mut reality = source.reality_settings.as_deref().cloned().ok_or_else(|| {
+                    ConfigError::invalid("security=reality 必须配置 realitySettings")
+                        .at(format!("{location}.realitySettings"))
+                })?;
+                reality.host = normalized.host.clone();
+                reality.port = normalized.port;
+                reality.protocol = "vless".into();
+                reality.users = normalized.users.clone();
+                let mut validated = compile_reality_listeners(&[reality])?;
+                normalized.reality_settings = Some(Box::new(validated.remove(0)));
+            }
+        }
+        out.push(normalized);
+    }
+    Ok(out)
+}
+
+fn parse_listener_address(host: &str, port: u16) -> Result<SocketAddr, std::net::AddrParseError> {
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, port))
+}
+
+fn has_header_injection(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
+}
+
+fn is_http_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
@@ -1404,7 +1646,19 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
                 d.name
             )));
         }
-        let explicit_tls = secure.tls.unwrap_or(false);
+        let tls_material = !reality_enabled
+            && (secure.tls_settings.is_some()
+                || secure.sni.is_some()
+                || secure.fingerprint.is_some()
+                || secure.utls.is_some()
+                || secure.ech == Some(true));
+        if secure.tls == Some(false) && tls_material {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 显式禁用 TLS，但仍提供了 TLS/ECH 配置",
+                d.name
+            )));
+        }
+        let explicit_tls = secure.tls.unwrap_or(tls_material);
         if explicit_tls && reality_enabled {
             return Err(ConfigError::bad_node(format!(
                 "node {} 不能同时启用普通 TLS 与 REALITY",
@@ -1474,7 +1728,27 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
             node.params.insert("utls".into(), utls.clone());
         }
         if let Some(ech) = secure.ech {
-            node.params.insert("ech".into(), ech.to_string());
+            if ech && reality_enabled {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 不能同时启用 ECH 与 REALITY",
+                    d.name
+                )));
+            }
+            if ech && tls_settings.ech_config_list.is_none() {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.ech=true 必须同时提供 tlsSettings.echConfigList",
+                    d.name
+                )));
+            }
+            if !ech && tls_settings.ech_config_list.is_some() {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.ech=false 与 tlsSettings.echConfigList 冲突",
+                    d.name
+                )));
+            }
+            if ech {
+                node.params.insert("ech".into(), "true".into());
+            }
         }
 
         if reality_enabled {
@@ -1588,6 +1862,87 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
             node.xhttp = Some(xhttp.clone());
             node.transport = "xhttp".into();
         }
+        if let Some(grpc) = transport.grpc_settings.as_ref() {
+            if transport.kind.as_deref().is_some_and(|kind| {
+                !kind.eq_ignore_ascii_case("grpc") && !kind.eq_ignore_ascii_case("gun")
+            }) {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 配置了 grpcSettings，但 transport.kind 不是 grpc/gun",
+                    d.name
+                )));
+            }
+            if transport.xhttp.is_some() {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 不能同时配置 XHTTP 与 gRPC 传输",
+                    d.name
+                )));
+            }
+            node.transport = "grpc".into();
+            insert_optional_param(&mut node, "authority", grpc.authority.as_ref())?;
+            insert_optional_param(&mut node, "serviceName", grpc.service_name.as_ref())?;
+            insert_optional_param(
+                &mut node,
+                "multiMode",
+                grpc.multi_mode.as_ref().map(bool::to_string).as_ref(),
+            )?;
+            insert_grpc_duration_param(&mut node, "idle_timeout", grpc.idle_timeout.as_ref())?;
+            insert_grpc_duration_param(
+                &mut node,
+                "health_check_timeout",
+                grpc.health_check_timeout.as_ref(),
+            )?;
+            insert_optional_param(
+                &mut node,
+                "permit_without_stream",
+                grpc.permit_without_stream
+                    .as_ref()
+                    .map(bool::to_string)
+                    .as_ref(),
+            )?;
+            insert_optional_param(
+                &mut node,
+                "initial_windows_size",
+                grpc.initial_window_size
+                    .as_ref()
+                    .map(u32::to_string)
+                    .as_ref(),
+            )?;
+            if grpc
+                .initial_window_size
+                .is_some_and(|value| value > i32::MAX as u32)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 gRPC initial_windows_size 超出 int32 范围",
+                    d.name
+                )));
+            }
+            insert_optional_param(&mut node, "user_agent", grpc.user_agent.as_ref())?;
+            if grpc
+                .max_message_size
+                .is_some_and(|value| !(3..=64 * 1024 * 1024).contains(&value))
+                || grpc
+                    .queue_capacity
+                    .is_some_and(|value| value == 0 || value > 1024)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 gRPC 资源上限非法",
+                    d.name
+                )));
+            }
+            insert_optional_param(
+                &mut node,
+                "max_message_size",
+                grpc.max_message_size
+                    .as_ref()
+                    .map(usize::to_string)
+                    .as_ref(),
+            )?;
+            insert_optional_param(
+                &mut node,
+                "queue_capacity",
+                grpc.queue_capacity.as_ref().map(usize::to_string).as_ref(),
+            )?;
+        }
     }
     if let Some(network) = &d.network {
         if let Some(udp) = network.udp {
@@ -1635,6 +1990,43 @@ fn parse_node_address(name: &str, address: &str) -> ConfigResult<(String, u16)> 
         host.trim_matches(|c| c == '[' || c == ']').to_string(),
         port,
     ))
+}
+
+fn insert_optional_param(
+    node: &mut ParsedNode,
+    key: &str,
+    value: Option<&String>,
+) -> ConfigResult<()> {
+    if let Some(value) = value {
+        if let Some(existing) = node.params.get(key)
+            && existing != value
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 的 transport.{key} 配置冲突：`{existing}` 与 `{value}`",
+                node.name
+            )));
+        }
+        node.params.insert(key.to_string(), value.clone());
+    }
+    Ok(())
+}
+
+fn insert_grpc_duration_param(
+    node: &mut ParsedNode,
+    key: &str,
+    value: Option<&CompatDuration>,
+) -> ConfigResult<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let duration = value.duration();
+    if duration.subsec_nanos() != 0 || duration.as_secs() > i32::MAX as u64 {
+        return Err(ConfigError::bad_node(format!(
+            "node {} 的 gRPC {key} 必须是 int32 范围内的整秒数",
+            node.name
+        )));
+    }
+    insert_optional_param(node, key, Some(&duration.as_secs().to_string()))
 }
 
 fn compile_groups(
@@ -2522,6 +2914,9 @@ mod tests {
     use super::*;
     use crate::profile::apply_defaults;
 
+    const TEST_ECH_CONFIG_LIST: &str =
+        "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA==";
+
     fn base64url_bytes(byte: u8, len: usize) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![byte; len])
@@ -3014,7 +3409,7 @@ master_key_log: none
 
     #[test]
     fn structured_xhttp_is_preserved_without_string_map_loss() {
-        let plan = compile_cfg(
+        let plan = compile_cfg(&format!(
             r#"
 version: 1
 profile: desktop
@@ -3029,6 +3424,7 @@ nodes:
       tls: true
       sni: sni.example.com
       fingerprint: chrome
+      ech: true
       tls-settings:
         enable-session-resumption: true
         pinned-peer-cert-sha256: "11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11"
@@ -3053,8 +3449,8 @@ nodes:
       mptcp: true
       mark: 123
       ip_family: ipv4
-"#,
-        );
+"#
+        ));
         let node = &plan.nodes[0];
         assert_eq!(node.transport, "xhttp");
         assert_eq!(node.transport_host.as_deref(), Some("cdn.example.com"));
@@ -3097,6 +3493,32 @@ nodes:
     }
 
     #[test]
+    fn structured_ech_toggle_requires_executable_settings_and_rejects_conflicts() {
+        let mut detail = NodeDetail {
+            name: "ech-client".into(),
+            protocol: Some("vless".into()),
+            address: Some("127.0.0.1:443".into()),
+            secure: Some(NodeSecure {
+                tls: Some(true),
+                ech: Some(true),
+                ..NodeSecure::default()
+            }),
+            ..NodeDetail::default()
+        };
+        assert!(detail_to_parsed(&detail).is_err());
+
+        let secure = detail.secure.as_mut().unwrap();
+        secure.tls_settings = Some(XhttpDownloadTlsSettings {
+            ech_config_list: Some(TEST_ECH_CONFIG_LIST.into()),
+            ..XhttpDownloadTlsSettings::default()
+        });
+        assert!(detail_to_parsed(&detail).is_ok());
+
+        detail.secure.as_mut().unwrap().ech = Some(false);
+        assert!(detail_to_parsed(&detail).is_err());
+    }
+
+    #[test]
     fn structured_fields_explicitly_override_link() {
         let plan = compile_cfg(
             r#"
@@ -3111,7 +3533,6 @@ nodes:
       uuid: 22222222-2222-2222-2222-222222222222
     secure:
       tls: false
-      sni: new-sni.example.com
     transport:
       kind: xhttp
       host: new-cdn.example.com
@@ -3132,7 +3553,7 @@ nodes:
             Some("22222222-2222-2222-2222-222222222222")
         );
         assert!(!node.tls);
-        assert_eq!(node.sni.as_deref(), Some("new-sni.example.com"));
+        assert!(node.sni.is_none());
         assert_eq!(node.transport, "xhttp");
         assert_eq!(
             node.params.get("host").map(String::as_str),

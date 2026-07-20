@@ -10,8 +10,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use core_config::model::RealityListen as RealityListenConfig;
 use core_reality::{
-    ClientHelloLimits, FallbackLimit, ProxyProtocolVersion, RealityServer, RealityServerConfig,
-    RealityServerError, RealityServerLimits, decode_private_key, decode_short_id,
+    AcceptedRealityStream, ClientHelloLimits, FallbackLimit, ProxyProtocolVersion, RealityServer,
+    RealityServerConfig, RealityServerError, RealityServerLimits, decode_private_key,
+    decode_short_id,
 };
 use core_runtime::Runtime;
 use tokio::net::{TcpListener, TcpStream};
@@ -174,6 +175,52 @@ impl RealityListener {
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen
     }
+
+    /// Authenticate one already-accepted TCP stream and return the reusable
+    /// REALITY carrier. Higher transports such as gRPC and XHTTP consume this
+    /// API before running their own framing.
+    pub async fn accept_carrier(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+        local: SocketAddr,
+        cancellation: CancellationToken,
+    ) -> anyhow::Result<AcceptedRealityStream> {
+        let accepted = match &self.target {
+            CamouflageTarget::Tcp(address) => {
+                let target = tokio::time::timeout(
+                    self.server.config().limits.target_handshake_timeout,
+                    TcpStream::connect(address),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "camouflage target timeout")
+                })??;
+                self.server
+                    .accept_with_target(stream, target, peer, local, cancellation)
+                    .await?
+            }
+            #[cfg(unix)]
+            CamouflageTarget::Unix(path) => {
+                let target = tokio::time::timeout(
+                    self.server.config().limits.target_handshake_timeout,
+                    tokio::net::UnixStream::connect(path),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "camouflage target timeout")
+                })??;
+                self.server
+                    .accept_with_target(stream, target, peer, local, cancellation)
+                    .await?
+            }
+        };
+        Ok(accepted)
+    }
+
+    pub fn vless_config(&self) -> Arc<VlessInboundConfig> {
+        self.vless.clone()
+    }
 }
 
 fn target_address(target: &CamouflageTarget) -> &str {
@@ -236,33 +283,9 @@ async fn authenticate_and_serve(
     cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let inner_cancellation = cancellation.clone();
-    let accepted = match &listener.target {
-        CamouflageTarget::Tcp(address) => {
-            let target = tokio::time::timeout(
-                listener.server.config().limits.target_handshake_timeout,
-                TcpStream::connect(address),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "camouflage target timeout"))??;
-            listener
-                .server
-                .accept_with_target(stream, target, peer, local, cancellation)
-                .await?
-        }
-        #[cfg(unix)]
-        CamouflageTarget::Unix(path) => {
-            let target = tokio::time::timeout(
-                listener.server.config().limits.target_handshake_timeout,
-                tokio::net::UnixStream::connect(path),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "camouflage target timeout"))??;
-            listener
-                .server
-                .accept_with_target(stream, target, peer, local, cancellation)
-                .await?
-        }
-    };
+    let accepted = listener
+        .accept_carrier(stream, peer, local, cancellation)
+        .await?;
     serve_vless_stream(
         accepted,
         VlessConnectionContext {

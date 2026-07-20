@@ -33,7 +33,8 @@ use crate::{
     adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
     proto::vmess::{VMESS_OPTION_CHUNK_STREAM, VmessSecurity, build_legacy_header_payload},
     transport::{
-        TlsOptions, Transport, WsOptions, tcp::TcpTransport, tls::TlsTransport, ws::WsTransport,
+        GrpcOptions, TlsOptions, Transport, WsOptions, grpc_transport::GrpcTransport,
+        tcp::TcpTransport, tls::TlsTransport, ws::WsTransport,
     },
 };
 
@@ -51,7 +52,9 @@ pub struct VmessLegacyOutbound {
     pub sni: Option<String>,
     pub insecure: bool,
     pub alpn: Vec<String>,
+    pub tls_options: Option<TlsOptions>,
     pub ws: Option<WsOptions>,
+    pub grpc: Option<GrpcOptions>,
 }
 
 impl VmessLegacyOutbound {
@@ -73,7 +76,9 @@ impl VmessLegacyOutbound {
             sni: None,
             insecure: false,
             alpn: vec![],
+            tls_options: None,
             ws: None,
+            grpc: None,
         }
     }
 }
@@ -96,30 +101,36 @@ impl OutboundAdapter for VmessLegacyOutbound {
     }
 
     async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream: BoxedStream = if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
-            WsTransport::new(ws.clone(), self.tls)
-                .connect(&self.host, self.port)
-                .await?
-        } else if self.tls {
-            TlsTransport::new(TlsOptions {
-                enabled: true,
-                sni: self.sni.clone(),
-                insecure: self.insecure,
-                alpn: self.alpn.clone(),
-                fingerprint: String::new(),
-                enable_session_resumption: false,
-                pinned_peer_cert_sha256: Vec::new(),
-                verify_peer_cert_by_name: Vec::new(),
-                xray_settings: None,
-                resolved_ech_config_list: None,
-            })
-            .connect(&self.host, self.port)
-            .await?
-        } else {
-            TcpTransport::default()
-                .connect(&self.host, self.port)
-                .await?
-        };
+        let tls_options = self.tls_options.clone().unwrap_or_else(|| TlsOptions {
+            enabled: self.tls,
+            sni: self.sni.clone(),
+            insecure: self.insecure,
+            alpn: self.alpn.clone(),
+            fingerprint: String::new(),
+            enable_session_resumption: false,
+            pinned_peer_cert_sha256: Vec::new(),
+            verify_peer_cert_by_name: Vec::new(),
+            xray_settings: None,
+            resolved_ech_config_list: None,
+        });
+        let mut stream: BoxedStream =
+            if let Some(grpc) = self.grpc.as_ref().filter(|grpc| grpc.enabled) {
+                GrpcTransport::new(grpc.clone(), tls_options.clone())
+                    .connect(&self.host, self.port)
+                    .await?
+            } else if let Some(ws) = self.ws.as_ref().filter(|w| w.enabled) {
+                WsTransport::new(ws.clone(), self.tls)
+                    .connect(&self.host, self.port)
+                    .await?
+            } else if self.tls {
+                TlsTransport::new(tls_options)
+                    .connect(&self.host, self.port)
+                    .await?
+            } else {
+                TcpTransport::default()
+                    .connect(&self.host, self.port)
+                    .await?
+            };
 
         // 1) Compute AuthInfo + cmd_key + header_iv
         let now = chrono::Utc::now().timestamp() as u64;

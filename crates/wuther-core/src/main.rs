@@ -17,8 +17,8 @@ use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
 use core_inbound::{
-    MixedListener, XhttpListenerHandle, ensure_best_effort_privilege, run_mixed,
-    start_xhttp_listeners,
+    GrpcListener, MixedListener, XhttpListenerHandle, ensure_best_effort_privilege, run_grpc,
+    run_mixed, start_xhttp_listeners,
 };
 use core_outbound::proto::wireguard::{
     WireGuardServer, WireGuardServerConfig, WireGuardServerPeerConfig,
@@ -1185,6 +1185,22 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         info!(addr = %addr, udp = mixed.udp, "mixed inbound: HTTP+SOCKS5 ready");
     } else {
         info!("listen.local 未配置，跳过 Mixed 入站");
+    }
+
+    // Xray gRPC（gun）入站。core-grpc 负责真实 tonic/prost Tun/TunMulti
+    // framing，core-inbound 负责 VLESS TCP/UDP/mux 与统一路由运行时。
+    for config in &plan.listen.grpc {
+        let listener = GrpcListener::from_config(config)
+            .map_err(|error| anyhow::anyhow!("gRPC listener configuration failed: {error}"))?;
+        let address = listener.listen_addr();
+        let service = listener.server_config().service_name.clone();
+        let rt = runtime.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(error) = run_grpc(listener, rt).await {
+                warn!(target: "inbound::grpc", %address, %error, "gRPC listener exited");
+            }
+        }));
+        info!(addr = %address, %service, "VLESS-over-gRPC inbound ready");
     }
 
     // 控制面板/API

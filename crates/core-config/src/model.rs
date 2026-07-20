@@ -227,6 +227,23 @@ pub struct Listen {
     /// Young 原生入站。传输层是 Firefox 使用的 Mozilla Neqo HTTP/3/WebTransport。
     #[serde(default, alias = "young-inbounds", alias = "young_inbounds")]
     pub young: Vec<YoungListen>,
+    /// Xray gRPC (`gun`) 入站。每个条目独立监听，并把 Tun/TunMulti
+    /// 双向流交给 `protocol` 指定的内层代理协议。
+    #[serde(default, alias = "grpc-inbounds", alias = "grpc_inbounds")]
+    pub grpc: Vec<GrpcListen>,
+}
+
+/// 完整的 Xray gRPC 服务端监听配置。
+///
+/// `grpcSettings` 沿用 Xray 字段名；本地资源上限单独注册，所有未知字段
+/// 均拒绝，避免拼写错误导致无界队列或静默使用默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GrpcListenSecurity {
+    #[default]
+    None,
+    Tls,
+    Reality,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -412,6 +429,126 @@ impl std::fmt::Debug for YoungListen {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcListen {
+    #[serde(default = "default_grpc_listen_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_grpc_inner_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(
+        default,
+        rename = "grpcSettings",
+        alias = "grpc",
+        alias = "grpc_settings",
+        alias = "grpc-settings"
+    )]
+    pub grpc_settings: GrpcTransportSettings,
+    /// 底层安全载波。省略时是明文 h2c；TLS 与 REALITY 必须显式选择，
+    /// 防止密钥配置存在但因拼写或遗漏而静默降级。
+    #[serde(default)]
+    pub security: GrpcListenSecurity,
+    /// 与 Xray `tlsSettings` 同构的完整 TLS 对象。gRPC 会强制协商 h2，
+    /// 其余证书、ECH、mTLS、版本、密码套件与曲线字段不做裁剪。
+    #[serde(
+        default,
+        rename = "tlsSettings",
+        alias = "tls_settings",
+        alias = "tls-settings"
+    )]
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    #[serde(
+        default,
+        rename = "requireClientCertificate",
+        alias = "require_client_certificate",
+        alias = "require-client-certificate"
+    )]
+    pub require_client_certificate: bool,
+    /// REALITY 服务端设置复用完整的监听模型。嵌套对象的 host、port、
+    /// protocol 与 users 由外层 gRPC 监听统一覆盖，避免重复配置冲突。
+    #[serde(
+        default,
+        rename = "realitySettings",
+        alias = "reality_settings",
+        alias = "reality-settings"
+    )]
+    pub reality_settings: Option<Box<RealityListen>>,
+    #[serde(
+        default = "default_grpc_vless_handshake_timeout",
+        with = "humantime_serde",
+        rename = "handshakeTimeout",
+        alias = "handshake_timeout",
+        alias = "handshake-timeout"
+    )]
+    pub handshake_timeout: Duration,
+    #[serde(
+        default = "default_grpc_max_mux_sessions",
+        rename = "maxMuxSessions",
+        alias = "max_mux_sessions",
+        alias = "max-mux-sessions"
+    )]
+    pub max_mux_sessions: usize,
+    #[serde(
+        default = "default_grpc_max_connections",
+        rename = "maxConnections",
+        alias = "max_connections",
+        alias = "max-connections"
+    )]
+    pub max_connections: usize,
+    #[serde(
+        default = "default_grpc_max_concurrent_streams",
+        rename = "maxConcurrentStreams",
+        alias = "max_concurrent_streams",
+        alias = "max-concurrent-streams"
+    )]
+    pub max_concurrent_streams: u32,
+    #[serde(
+        default = "default_grpc_max_header_list_size",
+        rename = "maxHeaderListSize",
+        alias = "max_header_list_size",
+        alias = "max-header-list-size"
+    )]
+    pub max_header_list_size: u32,
+    /// 与 Xray 一致：这里存放“信任标记请求头”的名称；仅当请求中至少
+    /// 存在一个标记头时，才采用 X-Forwarded-For 的第一个地址。
+    #[serde(
+        default,
+        rename = "trustedXForwardedFor",
+        alias = "trusted_x_forwarded_for",
+        alias = "trusted-x-forwarded-for"
+    )]
+    pub trusted_x_forwarded_for: Vec<String>,
+}
+
+impl std::fmt::Debug for GrpcListen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrpcListen")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("user_count", &self.users.len())
+            .field("grpc_settings", &self.grpc_settings)
+            .field("security", &self.security)
+            .field("has_tls_settings", &self.tls_settings.is_some())
+            .field(
+                "require_client_certificate",
+                &self.require_client_certificate,
+            )
+            .field("reality_settings", &self.reality_settings)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("max_mux_sessions", &self.max_mux_sessions)
+            .field("max_connections", &self.max_connections)
+            .field("max_concurrent_streams", &self.max_concurrent_streams)
+            .field("max_header_list_size", &self.max_header_list_size)
+            .field("trusted_x_forwarded_for", &self.trusted_x_forwarded_for)
+            .finish()
+    }
+}
+
 /// Xray REALITY 服务端监听配置。
 ///
 /// 字段名同时接受 Xray 的 camelCase 与本项目常用的 snake/kebab 写法；
@@ -421,6 +558,7 @@ impl std::fmt::Debug for YoungListen {
 pub struct RealityListen {
     #[serde(default = "default_reality_listen_host")]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
     #[serde(default = "default_reality_inner_protocol")]
     pub protocol: String,
@@ -1162,6 +1300,93 @@ pub struct NodeTransport {
         alias = "splithttp-settings"
     )]
     pub xhttp: Option<XhttpConfig>,
+    /// Xray-compatible gRPC transport settings. Keeping these settings typed
+    /// prevents misspelled fields from being silently discarded before the
+    /// runtime plan is built.
+    #[serde(
+        default,
+        rename = "grpcSettings",
+        alias = "grpc",
+        alias = "grpc_settings",
+        alias = "grpc-settings"
+    )]
+    pub grpc_settings: Option<GrpcTransportSettings>,
+}
+
+/// Complete Xray gRPC (`gun`) stream settings plus bounded local resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcTransportSettings {
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(
+        default,
+        rename = "serviceName",
+        alias = "service_name",
+        alias = "service-name"
+    )]
+    pub service_name: Option<String>,
+    #[serde(
+        default,
+        rename = "multiMode",
+        alias = "multi_mode",
+        alias = "multi-mode"
+    )]
+    pub multi_mode: Option<bool>,
+    #[serde(
+        default,
+        rename = "idle_timeout",
+        alias = "idleTimeout",
+        alias = "idle-timeout"
+    )]
+    pub idle_timeout: Option<CompatDuration>,
+    #[serde(
+        default,
+        rename = "health_check_timeout",
+        alias = "healthCheckTimeout",
+        alias = "health-check-timeout"
+    )]
+    pub health_check_timeout: Option<CompatDuration>,
+    #[serde(
+        default,
+        rename = "permit_without_stream",
+        alias = "permitWithoutStream",
+        alias = "permit-without-stream"
+    )]
+    pub permit_without_stream: Option<bool>,
+    #[serde(
+        default,
+        rename = "initial_windows_size",
+        alias = "initialWindowSize",
+        alias = "initial_window_size",
+        alias = "initial-window-size",
+        alias = "initial-windows-size"
+    )]
+    pub initial_window_size: Option<u32>,
+    #[serde(
+        default,
+        rename = "user_agent",
+        alias = "userAgent",
+        alias = "user-agent"
+    )]
+    pub user_agent: Option<String>,
+    /// Local defensive limit for the encoded protobuf message;
+    /// Xray/grpc-go defaults to four MiB.
+    #[serde(
+        default,
+        rename = "max_message_size",
+        alias = "maxMessageSize",
+        alias = "max-message-size"
+    )]
+    pub max_message_size: Option<usize>,
+    /// Number of protobuf messages allowed to wait for transport backpressure.
+    #[serde(
+        default,
+        rename = "queue_capacity",
+        alias = "queueCapacity",
+        alias = "queue-capacity"
+    )]
+    pub queue_capacity: Option<usize>,
 }
 
 /// Xray `Int32Range` 的无损配置表示。
@@ -3878,7 +4103,7 @@ pub struct MihomoRuleProviderSpec {
 }
 
 /// 上游刷新周期兼容表示：Mihomo 使用整数秒，sing-box 使用 duration 字符串。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompatDuration {
     Seconds(u64),
@@ -4783,6 +5008,27 @@ pub struct TailscaleUserspaceProxy {
 
 fn default_localhost() -> String {
     "127.0.0.1".into()
+}
+fn default_grpc_listen_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_grpc_inner_protocol() -> String {
+    "vless".into()
+}
+fn default_grpc_vless_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_grpc_max_mux_sessions() -> usize {
+    1024
+}
+fn default_grpc_max_connections() -> usize {
+    4096
+}
+fn default_grpc_max_concurrent_streams() -> u32 {
+    1024
+}
+fn default_grpc_max_header_list_size() -> u32 {
+    64 * 1024
 }
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()

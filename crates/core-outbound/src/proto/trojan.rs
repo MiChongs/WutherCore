@@ -23,7 +23,8 @@ use crate::{
     adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
     proto::addr::encode_socks_addr,
     transport::{
-        TlsOptions, Transport, XhttpOptions, tls::TlsTransport, xhttp_transport::XhttpTransport,
+        GrpcOptions, GrpcTransport, TlsOptions, Transport, XhttpOptions, tcp::TcpTransport,
+        tls::TlsTransport, xhttp_transport::XhttpTransport,
     },
 };
 
@@ -37,11 +38,14 @@ pub struct TrojanOutbound {
     pub host: String,
     pub port: u16,
     pub password: String,
+    pub tls: bool,
     pub sni: Option<String>,
     pub insecure: bool,
     pub alpn: Vec<String>,
+    pub tls_options: Option<TlsOptions>,
     pub udp: bool,
     pub xhttp: Option<XhttpOptions>,
+    pub grpc: Option<GrpcOptions>,
 }
 
 impl TrojanOutbound {
@@ -56,17 +60,20 @@ impl TrojanOutbound {
             host: host.into(),
             port,
             password: password.into(),
+            tls: true,
             sni: None,
             insecure: false,
             alpn: vec![],
+            tls_options: None,
             udp: true,
             xhttp: None,
+            grpc: None,
         }
     }
 
-    async fn connect_tls(&self) -> std::io::Result<BoxedStream> {
-        let tls = TlsTransport::new(TlsOptions {
-            enabled: true,
+    async fn connect_transport(&self) -> std::io::Result<BoxedStream> {
+        let tls = self.tls_options.clone().unwrap_or_else(|| TlsOptions {
+            enabled: self.tls,
             sni: self.sni.clone(),
             insecure: self.insecure,
             alpn: self.alpn.clone(),
@@ -77,7 +84,15 @@ impl TrojanOutbound {
             xray_settings: None,
             resolved_ech_config_list: None,
         });
-        tls.connect(&self.host, self.port).await
+        if let Some(grpc) = self.grpc.as_ref() {
+            GrpcTransport::new(grpc.clone(), tls)
+                .connect(&self.host, self.port)
+                .await
+        } else if self.tls {
+            TlsTransport::new(tls).connect(&self.host, self.port).await
+        } else {
+            TcpTransport::default().connect(&self.host, self.port).await
+        }
     }
 
     async fn dial_transport(&self) -> std::io::Result<BoxedStream> {
@@ -86,7 +101,7 @@ impl TrojanOutbound {
                 .connect(&self.host, self.port)
                 .await
         } else {
-            self.connect_tls().await
+            self.connect_transport().await
         }
     }
 

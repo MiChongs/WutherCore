@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 core-config   = { workspace = true }
+core-grpc     = { workspace = true }
 core-route    = { workspace = true }
 core-resolver = { workspace = true }
 core-outbound = { workspace = true }

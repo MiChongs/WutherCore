@@ -1,5 +1,23 @@
 # 第三方组件声明
 
+## tonic 0.13.1
+
+- 上游：`https://github.com/hyperium/tonic`
+- 用途：gRPC 客户端/服务端 codec、状态码与双向流语义。
+- 许可证：MIT。
+
+## prost 0.13.5
+
+- 上游：`https://github.com/tokio-rs/prost`
+- 用途：Xray `Hunk` / `MultiHunk` protobuf 消息编解码。
+- 许可证：Apache-2.0。
+
+## tokio-stream 0.1.18
+
+- 上游：`https://github.com/tokio-rs/tokio`
+- 用途：有界异步消息通道的 `Stream` 适配。
+- 许可证：MIT。
+
 ## shaped-rustls
 
 - 上游：`https://github.com/aimalygin/shaped-rustls`
