@@ -8,7 +8,7 @@
 //!   纯 Rust，零 unsafe；自带 checksum / fragment 支持。
 //!
 //! 使用：
-//! ```ignore
+//! ```text
 //! match parse_ip_packet(&buf[..n]) {
 //!     Ok(ParsedPacket { ip, l4: L4::Tcp(tcp), .. }) => { … }
 //!     Ok(ParsedPacket { ip, l4: L4::Udp(udp), .. }) => { … }

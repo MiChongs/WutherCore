@@ -27,7 +27,7 @@
 //!
 //! ## 缓存
 //!
-//! [`CachedFinder`] 给任何 `ProcessFinder` 加 LRU + TTL 包装。默认 1024 条 / 10s。
+//! `CachedFinder` 给任何 `ProcessFinder` 加 LRU + TTL 包装。默认 1024 条 / 10s。
 //! TTL 不能太长 —— 同一 (proto, ip, port) 在 10s 内可能被另一个进程重用（apps
 //! 关闭后 socket 进入 TIME_WAIT，30s 后端口可重用；mihomo 也用 ~10s）。
 
@@ -111,7 +111,7 @@ impl ProcessFinder for NoopFinder {
     }
 }
 
-/// 工厂：按当前 target_os 选择对应实现。返回的 finder 已经包了 [`CachedFinder`]
+/// 工厂：按当前 target_os 选择对应实现。返回的 finder 已经包了 `CachedFinder`
 /// （1024 条 / 10s TTL），调用方不必再加 cache。
 pub fn create_finder() -> Arc<dyn ProcessFinder> {
     let inner = create_finder_uncached();

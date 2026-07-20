@@ -5,7 +5,7 @@
 //! 算法对齐 sing-tun `tun_offload_linux.go`：`handleTCPGRO` + `tcpPacketsCanCoalesce`
 //! + `coalesceTCPPackets`。差异：
 //! - sing-tun 用"原地扩展外部 buffer"模式（依赖 outBufs 的可变借用）；
-//! - 我们用"GRO 表持有 owned Vec<u8>"模式：`push(pkt: Vec<u8>)` → `drain()` 输出最终段，
+//! - 我们用“GRO 表持有 owned `Vec<u8>`”模式：`push(pkt: Vec<u8>)` → `drain()` 输出最终段，
 //!   更符合 Rust 所有权模型。
 //!
 //! ## 合并条件（与 sing-tun 一致）

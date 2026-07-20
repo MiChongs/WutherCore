@@ -3,7 +3,7 @@
 //!
 //! 设计要点（§8.2 TUN / virtual_nic）：
 //! * 读 / 写都基于 IP 包（不是 ethernet frame）；
-//! * MTU 由 [`TunConfig`] 控制，read buffer 自动按 MTU + 16B 余量分配；
+//! * MTU 由 `TunConfig` 控制，read buffer 自动按 MTU + 16B 余量分配；
 //! * 平台后端在 `open` 中完成"创建设备 + 配置地址 + 绑定 fd"原子动作；
 //! * Drop 时自动 stop & cleanup。
 //!
@@ -43,7 +43,7 @@ pub enum TunIoError {
 ///
 /// # 批量 I/O
 /// 阶段 3.4 起新增 [`read_batch`](TunIo::read_batch)，允许一次系统级唤醒消费
-/// 多个 IP 包以摊销 wakeup/select 开销。trait 提供默认实现退化到 [`read_packet`]，
+/// 多个 IP 包以摊销 wakeup/select 开销。trait 提供默认实现退化到 `read_packet`，
 /// 因此所有平台后端无需修改即可获得 API；性能敏感的后端（Linux）可重写以做
 /// drain-on-ready / GSO 切分。
 #[async_trait]

@@ -8,8 +8,8 @@
 //! * Tailscale：默认排除 100.64.0.0/10、fd7a:115c:a1e0::/48 与 tailscale0。
 //!
 //! 这个模块负责 *接管*（drag traffic into the kernel），抓到的连接交给
-//! [`Runtime::dial`]。本实现遵循 §11.7：所有平台具体细节封装在
-//! [`Engine`] trait 后面，跨平台代码用 [`CaptureSupervisor`] 协调。
+//! `Runtime::dial`。本实现遵循 §11.7：所有平台具体细节封装在
+//! `Engine` trait 后面，跨平台代码用 [`CaptureSupervisor`] 协调。
 //!
 //! ## unsafe 政策
 //!

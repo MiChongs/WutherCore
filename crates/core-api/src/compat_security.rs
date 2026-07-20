@@ -3,7 +3,7 @@
 //! ## 提供的能力
 //!
 //! 1. **CORS allowlist** ([`build_cors`])：默认仅放行本机 origin（http(s)://
-//!    localhost / 127.0.0.1 / [::1]）；用户可在 `ui.cors` 配置允许的来源；
+//!    localhost / 127.0.0.1 / `[::1]`）；用户可在 `ui.cors` 配置允许的来源；
 //!    显式 `["*"]` 才用 `Any`（与旧行为兼容）。
 //!
 //! 2. **Body 大小限制** ([`body_limit_layer`])：默认 1 MiB。Clash 配置类

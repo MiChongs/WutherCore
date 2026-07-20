@@ -1,6 +1,6 @@
 //! 配置数据模型 —— 直接对应 §5 字段完整说明。
 //!
-//! 所有 field 默认值通过 [`profile::Profile::apply_defaults`] 注入，
+//! 所有 field 默认值通过 `Profile::apply_defaults` 注入，
 //! 模型本身只负责"原样反序列化 + 短写法/长写法兼容"。
 
 use std::{collections::BTreeMap, time::Duration};
@@ -412,7 +412,7 @@ pub struct Route {
     #[serde(default)]
     pub steps: Vec<RouteStepEntry>,
     /// 外部规则集 —— mihomo / sing-box / 自定义 payload。
-    /// 在 [`steps`] 中通过 `set:<name> -> <action>` 引用。
+    /// 在 `steps` 中通过 `set:<name> -> <action>` 引用。
     #[serde(default)]
     pub sets: BTreeMap<String, RuleSetSpec>,
 }
@@ -431,7 +431,7 @@ pub struct Route {
 ///    ```
 ///    具名字段同时设置时按 AND 组合；列表值在单字段内按 OR 组合。
 ///
-/// 四种形式都在 `compile_route` 阶段编译为 [`RouteStep`]；object 形式不会经过
+/// 四种形式都在 `compile_route` 阶段编译为 `RouteStep`；object 形式不会经过
 /// DSL 字符串再解析，省掉一次 round-trip。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -487,7 +487,7 @@ pub struct RouteStepObject {
 }
 
 /// 单个或多个值的统一表示 —— 让 `port: 53`、`port: "53"`、`port: [53, "5353"]`
-/// 都能解析。列表值在编译阶段会被包裹成 [`RouteMatcher::Or`]，匹配时短路求值。
+/// 都能解析。列表值在编译阶段会被包裹成 `RouteMatcher::Or`，匹配时短路求值。
 ///
 /// 自实现 `Deserialize` 而非 `derive(untagged)`，是为了把整型 / 布尔自动转成字符串
 /// —— YAML 写 `port: 53` 时值是 i64，不会自动落到 `Single(String)` 上，
@@ -577,7 +577,7 @@ impl From<String> for RouteStepEntry {
     }
 }
 
-/// route.sets.<name> 配置 —— 与 [`core-ruleset::RulesetSpec`] 一一对应，
+/// `route.sets.<name>` 配置 —— 与 `core_ruleset::RulesetSpec` 一一对应，
 /// 这里只做 YAML 反序列化所需的最小字段；运行时由 core-ruleset 编译。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -782,7 +782,7 @@ pub struct Capture {
     pub offload: bool,
     #[serde(default)]
     pub exclude: CaptureExclude,
-    /// sing-box 兼容子配置（详见 https://sing-box.sagernet.org/configuration/inbound/tun/）。
+    /// sing-box 兼容子配置（详见 <https://sing-box.sagernet.org/configuration/inbound/tun/>）。
     #[serde(default)]
     pub tun: TunInboundOptions,
 }
@@ -897,7 +897,7 @@ pub const DEFAULT_AUTO_REDIRECT_NFQUEUE: u16 = 100;
 pub const DEFAULT_IPROUTE2_AUTO_REDIRECT_FALLBACK_RULE_INDEX: u32 = 32768;
 
 /// sing-box `inbounds[type=tun]` 全字段映射 —— 见
-/// https://sing-box.sagernet.org/configuration/inbound/tun/
+/// <https://sing-box.sagernet.org/configuration/inbound/tun/>
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunInboundOptions {

@@ -339,7 +339,7 @@ route:
 
   steps:
     # --- 1. 必须直连 ---
-    - "process: wuthercore,proxy-core -> direct"   # 自身流量
+    - "process: wuther-core,wuthercore,proxy-core -> direct"   # 当前与旧版进程名
     - "ip: 100.64.0.0/10 -> direct"              # Tailscale CGNAT
     - "ip: 192.168.0.0/16 -> direct"             # 家庭 LAN
     - "ip: 10.0.0.0/8 -> direct"

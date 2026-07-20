@@ -115,7 +115,7 @@ pub struct UidPacketFilter {
     rules: IdentityRules,
     /// UID → package name (refreshed from /data/system/packages.list)
     uid_to_pkg: RwLock<HashMap<u32, String>>,
-    /// UID → primary GID (cached lookup of /proc/<pid>/status)
+    /// UID → primary GID (cached lookup of `/proc/<pid>/status`)
     uid_to_gid: RwLock<HashMap<u32, u32>>,
     last_pkg_refresh: RwLock<Instant>,
     last_gid_refresh: RwLock<Instant>,

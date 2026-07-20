@@ -3,7 +3,7 @@
 //! 与 mihomo `transport/sudoku/obfs/sudoku/conn.go` + `encode.go` + `padding_prob.go` 等价。
 //!
 //! ## 编码（write 方向）
-//! 对每个明文字节 b，从 `table.encode_table[b]` 中随机选一个 hint 组合（[u8;4]），
+//! 对每个明文字节 b，从 `table.encode_table[b]` 中随机选一个 hint 组合（`[u8; 4]`），
 //! 然后随机选一个 24 个 perm4 排列之一，按该顺序写出 4 个 hint 字节。
 //! 在 hint 字节之间随机插入 padding pool 中的字节。
 //!

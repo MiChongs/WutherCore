@@ -62,15 +62,8 @@ pwsh -File scripts/build-all.ps1 -Backend zigbuild -Targets "x86_64-unknown-linu
 pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "x86_64-unknown-linux-gnu"
 ```
 
-> Android 不接受 `-Backend zigbuild/cross` 强制；总是按"NDK 优先 → cross 兜底"自动选择，
+> Android 不接受 `-Backend zigbuild/cross` 强制；总是按“NDK 优先 → cross 兜底”自动选择，
 > 因为 cross 0.2.5 + android 镜像缺 libunwind 是已知问题。
-
-强制指定后端：
-
-```powershell
-pwsh -File scripts/build-all.ps1 -Backend zigbuild -Targets "x86_64-unknown-linux-musl"
-pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "x86_64-unknown-linux-gnu"
-```
 
 ## 输出
 
@@ -78,17 +71,17 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "x86_64-unknown-linu
 
 ```
 dist/
-  proxy-core-0.3.0-x86_64-pc-windows-msvc.zip
-  proxy-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
-  proxy-core-0.3.0-x86_64-unknown-linux-musl.tar.gz
-  proxy-core-0.3.0-x86_64-unknown-linux-musl.tar.gz.sha256
+  wuther-core-0.3.0-x86_64-pc-windows-msvc.zip
+  wuther-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
+  wuther-core-0.3.0-x86_64-unknown-linux-musl.tar.gz
+  wuther-core-0.3.0-x86_64-unknown-linux-musl.tar.gz.sha256
   ...
 ```
 
 每个归档包含：
-- `proxy-core[.exe]` —— 内核可执行文件
+- `wuther-core[.exe]` —— 内核可执行文件
 - `README.md`、`RP内核设计文档.md`
-- `examples/` —— 4 个开箱即用模板
+- `examples/` —— 桌面、路由器、Android、订阅和手动节点模板
 
 ## 平台支持矩阵
 
@@ -112,8 +105,8 @@ dist/
 
 ```cmd
 :: 验证
-certutil -hashfile dist\proxy-core-0.3.0-x86_64-pc-windows-msvc.zip SHA256
-type    dist\proxy-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
+certutil -hashfile dist\wuther-core-0.3.0-x86_64-pc-windows-msvc.zip SHA256
+type    dist\wuther-core-0.3.0-x86_64-pc-windows-msvc.zip.sha256
 ```
 
 ## 常见问题

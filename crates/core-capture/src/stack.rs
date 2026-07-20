@@ -1,6 +1,6 @@
 //! 用户态 TCP/UDP 栈 —— 把从 TUN 读到的 IP 包丢给 smoltcp，
-//! 终结 TCP 流后通过 [`Runtime::dial`] splice 到 outbound；UDP 包旁路到
-//! [`udp_forwarder`]（外部模块）。
+//! 终结 TCP 流后通过 `Runtime::dial` splice 到 outbound；UDP 包旁路到
+//! `udp_forwarder`（外部模块）。
 //!
 //! 架构：
 //! ```text

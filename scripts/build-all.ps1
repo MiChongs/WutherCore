@@ -55,7 +55,7 @@ $env:CROSS_NO_WARNINGS = "1"
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot    = Resolve-Path (Join-Path $ScriptDir "..")
 $DistDir     = Join-Path $RepoRoot "dist"
-$BinaryName  = "proxy-core"
+$BinaryName  = "wuther-core"
 $Version     = (Select-String -Path (Join-Path $RepoRoot "Cargo.toml") `
                               -Pattern '^version\s*=\s*"(.+)"' `
                               -List).Matches[0].Groups[1].Value

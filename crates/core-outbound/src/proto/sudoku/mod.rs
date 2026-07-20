@@ -26,7 +26,7 @@
 //!
 //! * Grid 生成 (288 网格)
 //! * Layout: ASCII / Entropy / Custom (8-char pattern: 2x+2p+4v)
-//! * Encode table: 256 字节 → 多个 [u8;4] 编码
+//! * Encode table: 256 字节 → 多个 `[u8; 4]` 编码
 //! * Decode map: sorted hints u32 → byte
 //! * Padding pool 随机插入
 //! * RecordConn: AEAD + epoch + seq + 自动密钥更新

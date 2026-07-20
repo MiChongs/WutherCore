@@ -1,6 +1,6 @@
 //! Endpoint-Independent Mapping (EIM) NAT —— 全锥 NAT。
 //!
-//! 与 [`NatTable`] 的 5-tuple 模型不同：EIM-NAT 把同一内部 `(src_ip, src_port)`
+//! 与 `NatTable` 的 5-tuple 模型不同：EIM-NAT 把同一内部 `(src_ip, src_port)`
 //! 映射到 *同一个* 出站 socket，无论目标 (dst_ip, dst_port) 如何变化；
 //! 反之，外部 *任意* 源都可以通过该出站 socket 给内部回包。
 //!
@@ -10,7 +10,7 @@
 //! 设计要点：
 //! * key = `(network, src_addr)`，与目标完全无关；
 //! * value 持有一个 `Arc<UdpSocket>` —— 外部源回包共用；
-//! * 老化使用与 [`NatTable`] 相同的 `udp_timeout`。
+//! * 老化使用与 `NatTable` 相同的 `udp_timeout`。
 
 use std::{
     net::SocketAddr,

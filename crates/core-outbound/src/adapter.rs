@@ -603,7 +603,7 @@ pub type SharedOutbound = Arc<dyn OutboundAdapter>;
    解决：所有 transport 在 connect 之前先调本 trait 走 WutherCore
    自己的 resolver（IP 直连 DoH，不经过 TUN），拿到 IP 字面再 connect。
 
-   主进程（proxy-core/main.rs 或 core-runtime engine.rs）启动时调
+   主进程（wuther-core/main.rs 或 core-runtime engine.rs）启动时调
    `set_global_dial_resolver(...)` 注入 Arc<dyn DialResolver>；
    未注入时 transport 退回 `TcpStream::connect((host, port))` 旧行为。
 */

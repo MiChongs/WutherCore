@@ -5,7 +5,7 @@
 //! * 本模块负责 *接管* TUN：读包 → 解析 → 按协议路由：
 //!   - TCP → 注入 [`UserSpaceStack`]，由其终结后通过 [`SpliceManager`] 与
 //!     `ListenerHandler` 的 outbound stream 双向 splice；
-//!   - UDP → 调 [`udp_send_one`] 发出，并 spawn [`run_return_loop`] 处理回包；
+//!   - UDP → 调 `udp_send_one` 发出，并 spawn `run_return_loop` 处理回包；
 //!   - 其它协议（ICMP）默认丢弃（M4 后续可选回环）。
 //!
 //! supervisor 决定启用哪种模式：当 `stack ∈ {gvisor, smoltcp, mixed}`

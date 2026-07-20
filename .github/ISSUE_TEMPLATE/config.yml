@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 阅读项目文档
+    url: https://github.com/MiChongs/WutherCore/tree/main/docs
+    about: 功能、配置、API、架构和排错说明集中在文档中心。
+  - name: 配置与使用讨论
+    url: https://github.com/MiChongs/WutherCore/discussions
+    about: 配置帮助、方案讨论和一般问题请使用 Discussions。
+  - name: 私下报告安全漏洞
+    url: https://github.com/MiChongs/WutherCore/security/advisories/new
+    about: 请勿在公开 Issue 中披露漏洞或敏感信息。

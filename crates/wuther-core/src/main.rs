@@ -1,4 +1,4 @@
-//! proxy-core —— WutherCore 顶层 CLI。
+//! wuther-core —— WutherCore 顶层 CLI。
 //!
 //! 子命令：
 //! * `run -c <yaml>`：启动内核（Mixed 入站 + API + capture 诊断）。
@@ -22,9 +22,9 @@ use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "proxy-core",
+    name = "wuther-core",
     version,
-    about = "WutherCore —— Friendly YAML 代理内核"
+    about = "Modular cross-platform proxy core"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -82,9 +82,9 @@ enum RulesetCmd {
     /// 双向转换：yaml/txt/list/json/rrs 互转（含 WutherCore 自研 RRS）。
     ///
     /// 例：
-    ///   proxy-core ruleset convert geosite-cn.yaml geosite-cn.rrs
-    ///   proxy-core ruleset convert ruleset.json ruleset.txt
-    ///   proxy-core ruleset convert input.rrs output.yaml --output-format yaml
+    ///   wuther-core ruleset convert geosite-cn.yaml geosite-cn.rrs
+    ///   wuther-core ruleset convert ruleset.json ruleset.txt
+    ///   wuther-core ruleset convert input.rrs output.yaml --output-format yaml
     Convert {
         /// 输入文件路径。
         input: PathBuf,

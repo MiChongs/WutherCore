@@ -26,7 +26,7 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct Table {
-    /// encode_table[byte] -> 该字节的所有合法编码（每个编码是 4 个 hint byte）
+    /// `encode_table[byte]` -> 该字节的所有合法编码（每个编码是 4 个 hint byte）
     pub encode_table: Vec<Vec<[u8; 4]>>,
     /// decode_map: packed sorted hints → 字节值
     pub decode_map: BTreeMap<u32, u8>,

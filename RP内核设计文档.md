@@ -1556,11 +1556,11 @@ nodes。
 运行时不接受 Mihomo
 字段作为本生态配置，但提供一次性迁移工具，把旧配置转换成 Friendly YAML。
 
-proxy-core migrate mihomo old-config.yaml -o friendly.yaml
+wuther-core migrate mihomo old-config.yaml -o friendly.yaml
 
-proxy-core check friendly.yaml
+wuther-core check friendly.yaml
 
-proxy-core explain friendly.yaml
+wuther-core explain friendly.yaml
 
   ----------------------- -----------------------------------------------
   **迁移内容**            **转换结果**

@@ -10,7 +10,7 @@
 //! 4. （可选）启动 fake-dns server；
 //! 5. 周期性 NAT / EIM purge（GC）。
 //!
-//! 通过 [`CaptureSupervisor::with_ip_set_provider`] 注入 `IpSetProvider`
+//! 通过 `CaptureSupervisor::with_ip_set_provider` 注入 `IpSetProvider`
 //! 后，supervisor 会按集合名查询 ruleset（动态 IP 集）。
 
 use std::{

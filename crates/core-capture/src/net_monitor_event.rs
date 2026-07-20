@@ -4,7 +4,7 @@
 //! ## 实现思路
 //! 三个平台都把 OS 路由 / 接口变化事件投递到一个 `tokio::sync::Notify`，
 //! 主任务 `notified().await` 之后简单去抖（100ms）→ 重新跑跨平台
-//! [`crate::default_iface::probe`] → [`crate::net_monitor::global().submit`].
+//! `crate::default_iface::probe` → `crate::net_monitor::global().submit`.
 //! 这样回调 / netlink 收包路径只做 notify_one，所有的解析与全局态更新都在
 //! 一个 tokio task 内顺序完成，不需要锁也没有竞争。
 //!

@@ -7,7 +7,7 @@
 //!
 //! 1. **WsHub Arc 循环**：spawned producer 协程持 `Arc<Self>`，hub owner 释放
 //!    后子任务仍持有，runtime drop 时挂起 → 测试进程不退出 / 生产内存泄漏。
-//! 2. **DashMap entry × len 同 shard 递归 RwLock**：[`crate::IpRateLimiter`] 旧
+//! 2. **DashMap entry × len 同 shard 递归 RwLock**：`IpRateLimiter` 旧
 //!    实现里把 entry RefMut 跨 `len()` 调用持有，同线程从 RwLock write→read
 //!    递归 → 死锁；表现为 API 卡死 + log bus 也卡（因为 broadcast 通道靠
 //!    runtime 推进）。
@@ -26,7 +26,7 @@
 //!
 //! ## 使用方式
 //!
-//! 在 `proxy-core/main.rs` 启动 tokio runtime 之前调用：
+//! 在 `wuther-core/main.rs` 启动 tokio runtime 之前调用：
 //!
 //! ```ignore
 //! use core_observe::watchdog::{Watchdog, WatchdogConfig};

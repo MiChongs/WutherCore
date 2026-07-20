@@ -119,9 +119,9 @@ Rust 1.95 stable 已部分启用，nightly 完整。
 |---|---|---|---|
 | 全量 `cargo build --workspace`（冷） | 78s | 65s | 1.2× |
 | 改一行 core-config 后 `cargo build` | 31s | 6s | 5.2× |
-| 改一行 proxy-core 后 `cargo build` | 22s | 4s | 5.5× |
+| 改一行 wuther-core 后 `cargo build` | 22s | 4s | 5.5× |
 | `cargo build --release --workspace` | 3m 12s | 1m 04s | 3.0× |
-| 链接器（proxy-core dev 末段） | 4.8s | 1.1s | 4.4× |
+| 链接器（wuther-core dev 末段） | 4.8s | 1.1s | 4.4× |
 
 主要收益来自：依赖 opt-level=1 + codegen-units=256 + rust-lld + line-tables-only。
 

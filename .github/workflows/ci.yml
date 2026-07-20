@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  actions: write
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,6 +27,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check repository presentation
+        run: python scripts/check-repository.py
+
+      - name: Review dependency changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,5 +52,15 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets
 
+      - name: Check CLI brand
+        run: |
+          cargo run --quiet -p wuther-core -- --help > /tmp/wuthercore-help.txt
+          grep -q '^Usage: wuther-core' /tmp/wuthercore-help.txt
+
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Build Rust documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
