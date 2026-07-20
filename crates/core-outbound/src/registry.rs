@@ -990,7 +990,8 @@ mod tests {
     fn tuic_registry_maps_sing_box_and_mihomo_options() {
         let mut node = ParsedNode::new("tuic", NodeProtocol::Tuic, "127.0.0.1", 443);
         node.uuid = Some("2DD61D93-75D8-4DA4-AC0E-6AECE7EAC365".into());
-        node.password = Some("secret".into());
+        let test_password = Uuid::new_v4().to_string();
+        node.password = Some(test_password.clone());
         node.udp = false;
         node.params.insert("udp_relay_mode".into(), "quic".into());
         node.params.insert("allow_insecure".into(), "true".into());
@@ -1003,7 +1004,7 @@ mod tests {
             outbound.uuid,
             Uuid::parse_str(node.uuid.as_deref().unwrap()).unwrap()
         );
-        assert_eq!(outbound.password, "secret");
+        assert_eq!(outbound.password, test_password);
         assert_eq!(outbound.udp_relay_mode, TuicUdpMode::Quic);
         assert!(!outbound.udp);
         assert!(outbound.insecure);
