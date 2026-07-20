@@ -16,6 +16,7 @@ pub mod migrate;
 pub mod model;
 pub mod node_uri;
 pub mod profile;
+mod ruleset_compat;
 pub mod runtime_plan;
 
 pub use error::{ConfigError, ConfigErrorKind, ConfigResult};

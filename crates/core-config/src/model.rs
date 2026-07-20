@@ -27,6 +27,15 @@ pub struct UserConfig {
     pub nodes: Vec<NodeSpec>,
     #[serde(default)]
     pub groups: BTreeMap<String, GroupSpec>,
+    /// Mihomo 顶层 `rule-providers` 兼容入口。编译阶段会归一化进
+    /// `route.sets`，不会原样进入 [`crate::runtime_plan::RuntimePlan`]。
+    #[serde(
+        default,
+        rename = "rule-providers",
+        alias = "rule_providers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub rule_providers: BTreeMap<String, MihomoRuleProviderSpec>,
     #[serde(default)]
     pub route: Option<Route>,
     #[serde(default)]
@@ -415,6 +424,15 @@ pub struct Route {
     /// 在 `steps` 中通过 `set:<name> -> <action>` 引用。
     #[serde(default)]
     pub sets: BTreeMap<String, RuleSetSpec>,
+    /// sing-box `route.rule_set` 兼容入口。编译阶段按 `tag` 展开并合并进
+    /// [`Self::sets`]；运行时只保留统一后的 `sets`。
+    #[serde(
+        default,
+        rename = "rule_set",
+        alias = "rule-set",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub rule_set: Vec<SingboxRuleSetSpec>,
 }
 
 /// 单条路由规则条目 —— 接受四种写法（混用合法）：
@@ -582,8 +600,10 @@ impl From<String> for RouteStepEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuleSetSpec {
+    /// 远程来源；与 `path` 同时出现时，`path` 是该远程规则集的显式缓存。
     #[serde(default)]
     pub url: Option<String>,
+    /// `url` 为空时是本地来源；`url` 存在时是远程缓存位置。
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -596,6 +616,83 @@ pub struct RuleSetSpec {
     pub every: Duration,
     #[serde(default = "default_feed_via")]
     pub via: String,
+}
+
+/// sing-box `route.rule_set[]` 原始配置。
+///
+/// 这里保留上游字段名与互斥关系；`runtime_plan` 编译阶段会严格校验后转换成
+/// [`RuleSetSpec`]。因此 sing-box 的 source-kind `type` 不会与 WutherCore
+/// 表示 behavior 的 `RuleSetSpec::type` 混淆。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingboxRuleSetSpec {
+    /// `inline` / `local` / `remote`；inline 可省略。
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    pub tag: SingboxRuleSetTags,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub rules: Option<Vec<serde_yaml::Value>>,
+    #[serde(default)]
+    pub update_interval: Option<CompatDuration>,
+    #[serde(default)]
+    pub download_detour: Option<String>,
+    /// 兼容任务所需的 `http_client.download_detour`。使用 `Value` 是为了让
+    /// 归一化层能对 string/object 与不支持的嵌套字段给出精确错误。
+    #[serde(default)]
+    pub http_client: Option<serde_yaml::Value>,
+}
+
+/// sing-box 1.14+ 允许一个 local/remote 配置用 tag 列表批量定义规则集。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SingboxRuleSetTags {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// Mihomo 顶层 `rule-providers.<name>` 原始配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MihomoRuleProviderSpec {
+    /// `http` / `file` / `inline`。
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub payload: Option<Vec<String>>,
+    pub behavior: String,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub interval: Option<CompatDuration>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+/// 上游刷新周期兼容表示：Mihomo 使用整数秒，sing-box 使用 duration 字符串。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompatDuration {
+    Seconds(u64),
+    Human(#[serde(with = "humantime_serde")] Duration),
+}
+
+impl CompatDuration {
+    pub fn duration(&self) -> Duration {
+        match self {
+            Self::Seconds(seconds) => Duration::from_secs(*seconds),
+            Self::Human(duration) => *duration,
+        }
+    }
 }
 
 fn default_ruleset_type() -> String {

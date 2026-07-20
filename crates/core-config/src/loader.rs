@@ -34,6 +34,8 @@ pub fn load_from_path<P: AsRef<Path>>(path: P) -> ConfigResult<RuntimePlan> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::model::{LogFormat, LogLevel};
 
@@ -176,5 +178,272 @@ profile: desktop
         let plan = load_from_str(yaml).unwrap();
 
         assert!(plan.log.is_none());
+    }
+
+    #[test]
+    fn singbox_rule_set_variants_normalize_into_route_sets() {
+        let yaml = r#"
+version: 1
+profile: desktop
+route:
+  rule_set:
+    - type: inline
+      tag: inline-sites
+      rules:
+        - domain_suffix: example.com
+        - type: logical
+          mode: and
+          rules:
+            - domain: secure.example
+            - port: 443
+    - type: local
+      tag: [local-a, local-b]
+      format: source
+      path: "./rules/{tag}.json"
+    - type: remote
+      tag: remote-binary
+      format: binary
+      url: "https://rules.example/remote.srs"
+      update_interval: 6h
+      http_client:
+        detour: direct
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        assert_eq!(plan.route.sets.len(), 4);
+
+        let inline = &plan.route.sets["inline-sites"];
+        assert_eq!(inline.r#type, "mixed");
+        assert_eq!(inline.format.as_deref(), Some("json"));
+        assert_eq!(inline.payload.len(), 1);
+        let inline_doc: serde_json::Value =
+            serde_json::from_str(&inline.payload[0]).expect("normalized inline JSON");
+        assert_eq!(inline_doc["version"], 5);
+        assert_eq!(inline_doc["rules"].as_array().unwrap().len(), 2);
+
+        assert_eq!(
+            plan.route.sets["local-a"].path.as_deref(),
+            Some("./rules/local-a.json")
+        );
+        assert_eq!(plan.route.sets["local-b"].format.as_deref(), Some("json"));
+        let remote = &plan.route.sets["remote-binary"];
+        assert_eq!(remote.format.as_deref(), Some("srs"));
+        assert_eq!(remote.every, Duration::from_secs(6 * 3600));
+        assert_eq!(remote.via, "direct");
+    }
+
+    #[test]
+    fn mihomo_rule_providers_normalize_all_source_types() {
+        let yaml = r#"
+version: 1
+profile: desktop
+rule-providers:
+  remote-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://rules.example/domain.mrs"
+    path: "./cache/domain.mrs"
+    interval: 600
+    proxy: DIRECT
+  local-ip:
+    type: file
+    behavior: ipcidr
+    format: text
+    path: "./rules/ip.list"
+    interval: 2h
+  inline-classical:
+    type: inline
+    behavior: classical
+    format: yaml
+    payload:
+      - "DOMAIN-SUFFIX,example.org"
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        let remote = &plan.route.sets["remote-domain"];
+        assert_eq!(
+            remote.url.as_deref(),
+            Some("https://rules.example/domain.mrs")
+        );
+        assert_eq!(remote.path.as_deref(), Some("./cache/domain.mrs"));
+        assert_eq!(remote.r#type, "domain");
+        assert_eq!(remote.format.as_deref(), Some("mrs"));
+        assert_eq!(remote.every, Duration::from_secs(600));
+
+        let local = &plan.route.sets["local-ip"];
+        assert_eq!(local.url, None);
+        assert_eq!(local.path.as_deref(), Some("./rules/ip.list"));
+        assert_eq!(local.r#type, "ipcidr");
+        assert_eq!(local.every, Duration::from_secs(2 * 3600));
+
+        let inline = &plan.route.sets["inline-classical"];
+        assert_eq!(inline.payload, vec!["DOMAIN-SUFFIX,example.org"]);
+        assert_eq!(inline.r#type, "classical");
+        assert_eq!(inline.format.as_deref(), Some("yaml"));
+    }
+
+    #[test]
+    fn native_route_sets_remain_compatible_and_are_canonicalized() {
+        let yaml = r#"
+version: 1
+profile: desktop
+route:
+  sets:
+    legacy:
+      type: IP
+      format: yml
+      url: "https://rules.example/ip.yaml"
+      path: "./cache/ip.yaml"
+      every: 1h
+      via: legacy-group
+"#;
+        let plan = load_from_str(yaml).unwrap();
+        let spec = &plan.route.sets["legacy"];
+        assert_eq!(spec.r#type, "ipcidr");
+        assert_eq!(spec.format.as_deref(), Some("yaml"));
+        assert_eq!(spec.url.as_deref(), Some("https://rules.example/ip.yaml"));
+        assert_eq!(spec.path.as_deref(), Some("./cache/ip.yaml"));
+        assert_eq!(spec.every, Duration::from_secs(3600));
+        assert_eq!(spec.via, "legacy-group");
+    }
+
+    #[test]
+    fn mrs_rejects_classical_behavior_during_config_compile() {
+        let yaml = r#"
+version: 1
+rule-providers:
+  invalid:
+    type: http
+    behavior: classical
+    format: mrs
+    url: "https://rules.example/classical.mrs"
+"#;
+        let error = load_from_str(yaml).unwrap_err().to_string();
+        assert!(error.contains("MRS"), "{error}");
+        assert!(error.contains("classical"), "{error}");
+        assert!(error.contains("rule-providers.invalid"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_provider_download_outbound_is_not_silently_ignored() {
+        let mihomo = r#"
+version: 1
+rule-providers:
+  proxied:
+    type: http
+    behavior: domain
+    url: "https://rules.example/domain.yaml"
+    proxy: select
+"#;
+        let error = load_from_str(mihomo).unwrap_err().to_string();
+        assert!(error.contains("core-fetch"), "{error}");
+        assert!(error.contains("proxy"), "{error}");
+
+        let singbox = r#"
+version: 1
+route:
+  rule_set:
+    - type: remote
+      tag: proxied
+      format: source
+      url: "https://rules.example/domain.json"
+      download_detour: select
+"#;
+        let error = load_from_str(singbox).unwrap_err().to_string();
+        assert!(error.contains("core-fetch"), "{error}");
+        assert!(error.contains("download_detour"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_provider_fields_and_invalid_combinations_are_errors() {
+        let unsupported_field = r#"
+version: 1
+rule-providers:
+  custom-header:
+    type: http
+    behavior: domain
+    url: "https://rules.example/domain.yaml"
+    header:
+      User-Agent: [mihomo]
+"#;
+        let error = load_from_str(unsupported_field).unwrap_err().to_string();
+        assert!(error.contains("header"), "{error}");
+
+        let invalid_http_client = r#"
+version: 1
+route:
+  rule_set:
+    - type: remote
+      tag: custom-client
+      format: source
+      url: "https://rules.example/domain.json"
+      http_client:
+        headers:
+          User-Agent: sing-box
+"#;
+        let error = load_from_str(invalid_http_client).unwrap_err().to_string();
+        assert!(error.contains("http_client.headers"), "{error}");
+
+        let named_http_client = r#"
+version: 1
+route:
+  rule_set:
+    - type: remote
+      tag: named-client
+      format: source
+      url: "https://rules.example/domain.json"
+      http_client: direct
+"#;
+        let error = load_from_str(named_http_client).unwrap_err().to_string();
+        assert!(error.contains("共享 HTTP client"), "{error}");
+        assert!(error.contains("http_clients registry"), "{error}");
+
+        let nonstandard_nested_detour = r#"
+version: 1
+route:
+  rule_set:
+    - type: remote
+      tag: invalid-nested-client
+      format: source
+      url: "https://rules.example/domain.json"
+      http_client:
+        download_detour: direct
+"#;
+        let error = load_from_str(nonstandard_nested_detour)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http_client.download_detour"), "{error}");
+
+        let invalid_local = r#"
+version: 1
+route:
+  rule_set:
+    - type: local
+      tag: invalid-local
+      format: source
+      path: "./rules/local.json"
+      update_interval: 1h
+"#;
+        let error = load_from_str(invalid_local).unwrap_err().to_string();
+        assert!(error.contains("update_interval"), "{error}");
+    }
+
+    #[test]
+    fn provider_names_cannot_overwrite_native_or_compatible_sets() {
+        let yaml = r#"
+version: 1
+rule-providers:
+  duplicate:
+    type: inline
+    behavior: domain
+    payload: [example.org]
+route:
+  sets:
+    duplicate:
+      type: domain
+      payload: [example.com]
+"#;
+        let error = load_from_str(yaml).unwrap_err().to_string();
+        assert!(error.contains("duplicate"), "{error}");
+        assert!(error.contains("重复"), "{error}");
     }
 }

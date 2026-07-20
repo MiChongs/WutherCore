@@ -65,6 +65,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
             r#final: "main".into(),
             steps: vec![],
             sets: Default::default(),
+            rule_set: vec![],
         });
     }
 

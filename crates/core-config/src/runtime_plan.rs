@@ -156,13 +156,18 @@ pub enum RouteAction {
 
 /* ---------------- compile ---------------- */
 
-/// 用户配置 -> RuntimePlan。要求 `apply_defaults` 已执行。
-pub fn compile(cfg: UserConfig) -> ConfigResult<RuntimePlan> {
+/// 用户配置 -> RuntimePlan。要求 [`apply_defaults`] 已执行。
+pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let listen = compile_listen(&cfg)?;
     let feeds = compile_feeds(&cfg.feeds);
     let nodes = compile_nodes(&cfg.nodes)?;
     let groups = compile_groups(&cfg, &nodes)?;
-    let cfg_route = cfg.route.clone().unwrap_or_default();
+    let mut cfg_route = cfg.route.take().unwrap_or_default();
+    crate::ruleset_compat::merge_compatible_rule_sets(
+        &mut cfg_route.sets,
+        std::mem::take(&mut cfg_route.rule_set),
+        std::mem::take(&mut cfg.rule_providers),
+    )?;
     let route_sets = cfg_route.sets.clone();
     let route = compile_route(cfg_route, &groups, route_sets)?;
     let resolver = cfg.resolver.unwrap_or_default();

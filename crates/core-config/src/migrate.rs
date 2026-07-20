@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 
 use serde_yaml::Value;
 
-use crate::error::{ConfigError, ConfigResult};
+use crate::{
+    error::{ConfigError, ConfigResult},
+    model::MihomoRuleProviderSpec,
+};
 
 /// 把 Mihomo YAML 文本转换为 Friendly YAML 文本。
 pub fn migrate_mihomo(text: &str) -> ConfigResult<String> {
@@ -88,9 +91,22 @@ pub fn migrate_mihomo(text: &str) -> ConfigResult<String> {
         friendly.insert("nodes".into(), Value::Sequence(nodes));
     }
 
-    // route preset
+    // route preset + rule-providers -> 原生 route.sets。使用与 loader 相同的
+    // 严格归一化逻辑，避免 migrate 接受、运行时却忽略某个 provider 字段。
     let mut route = serde_yaml::Mapping::new();
     route.insert("preset".into(), Value::String("cn_smart".into()));
+    if let Some(providers) = m
+        .get(Value::String("rule-providers".into()))
+        .and_then(Value::as_mapping)
+    {
+        let providers: BTreeMap<String, MihomoRuleProviderSpec> =
+            serde_yaml::from_value(Value::Mapping(providers.clone()))?;
+        let sets = crate::ruleset_compat::normalize_mihomo_rule_providers(providers)?;
+        if !sets.is_empty() {
+            let value = serde_yaml::to_value(sets).map_err(ConfigError::from)?;
+            route.insert("sets".into(), value);
+        }
+    }
     friendly.insert("route".into(), Value::Mapping(route));
 
     serde_yaml::to_string(&Value::Mapping(friendly)).map_err(Into::into)
@@ -135,3 +151,58 @@ fn mihomo_proxy_to_uri(p: &serde_yaml::Mapping) -> Option<String> {
 }
 
 use base64::Engine;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn migrates_mihomo_rule_providers_into_native_route_sets() {
+        let input = r#"
+rule-providers:
+  domain-set:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://rules.example/domain.mrs"
+    path: "./cache/domain.mrs"
+    interval: 3600
+    proxy: DIRECT
+  inline-set:
+    type: inline
+    behavior: classical
+    format: text
+    payload:
+      - "DOMAIN-SUFFIX,example.com"
+"#;
+        let migrated = migrate_mihomo(input).unwrap();
+        assert!(migrated.contains("sets:"), "{migrated}");
+        assert!(!migrated.contains("rule-providers:"), "{migrated}");
+
+        let plan = crate::loader::load_from_str(&migrated).unwrap();
+        let remote = &plan.route.sets["domain-set"];
+        assert_eq!(remote.path.as_deref(), Some("./cache/domain.mrs"));
+        assert_eq!(remote.every, Duration::from_secs(3600));
+        assert_eq!(
+            plan.route.sets["inline-set"].payload,
+            vec!["DOMAIN-SUFFIX,example.com"]
+        );
+    }
+
+    #[test]
+    fn migration_rejects_provider_fields_the_runtime_cannot_honor() {
+        let input = r#"
+rule-providers:
+  proxied:
+    type: http
+    behavior: domain
+    url: "https://rules.example/domain.yaml"
+    proxy: Proxy
+"#;
+        let error = migrate_mihomo(input).unwrap_err().to_string();
+        assert!(error.contains("core-fetch"), "{error}");
+        assert!(error.contains("proxy"), "{error}");
+    }
+}

@@ -11,7 +11,9 @@
 
 use thiserror::Error;
 
-use crate::{format::RulesetFormat, ir::RulesetProgram, matcher::ClassicalEntry};
+use crate::{
+    format::RulesetFormat, ir::RulesetProgram, matcher::ClassicalEntry, spec::RulesetType,
+};
 
 pub mod binary;
 pub mod mrs;
@@ -28,6 +30,8 @@ pub enum ParseError {
     Yaml(String),
     #[error("JSON 解析失败: {0}")]
     Json(String),
+    #[error("文本不是有效 UTF-8: {0}")]
+    Utf8(String),
     #[error("sing-box rule-set 缺少必填 version")]
     MissingVersion,
     #[error("不支持的 sing-box rule-set version: {0}（仅支持 1..=5）")]
@@ -85,5 +89,26 @@ pub fn parse_ruleset_compiled(
         RulesetFormat::Srs => srs::parse(body).map(RulesetCompiled::Semantic),
         // 其它格式继续走 entries 路径
         _ => parse_ruleset(format, body).map(RulesetCompiled::Classical),
+    }
+}
+
+/// 按规则集声明的 behavior/type 解析。
+///
+/// Mihomo 的 YAML/TEXT provider 只靠文件格式无法判定每一行的语义：
+/// `domain`、`ipcidr` 与 `classical` 使用不同语法。其它格式本身携带完整语义
+/// （sing-box JSON/SRS、MRS）或属于 WutherCore 原生格式，因此保持原路径。
+pub fn parse_ruleset_compiled_for_type(
+    format: RulesetFormat,
+    body: &[u8],
+    ruleset_type: RulesetType,
+) -> Result<RulesetCompiled, ParseError> {
+    match format {
+        RulesetFormat::Yaml => {
+            yaml::parse_for_type(body, ruleset_type).map(RulesetCompiled::Classical)
+        }
+        RulesetFormat::Text => {
+            txt::parse_for_type(body, ruleset_type).map(RulesetCompiled::Classical)
+        }
+        _ => parse_ruleset_compiled(format, body),
     }
 }

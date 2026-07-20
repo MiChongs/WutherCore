@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RulesetSpec {
-    /// 必填二选一：`url`（远程） 或 `path`（本地）；payload 内联时两者可空。
+    /// 远程来源。与 `path` 同时设置时，`path` 是该远程规则集的显式缓存位置。
     #[serde(default)]
     pub url: Option<String>,
+    /// `url` 为空时是本地来源；`url` 存在时是远程响应的显式缓存位置
+    /// （兼容 Mihomo HTTP provider）。
     #[serde(default)]
     pub path: Option<String>,
 
