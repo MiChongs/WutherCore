@@ -1,6 +1,13 @@
 //! 规则集格式枚举 + 自动嗅探。
 
-use std::path::Path;
+use std::{
+    io::{Cursor, Read},
+    path::Path,
+};
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const MRS_MAGIC: [u8; 4] = [b'M', b'R', b'S', 1];
+const MAX_MRS_SNIFF_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RulesetFormat {
@@ -22,9 +29,9 @@ pub enum RulesetFormat {
 /// 综合：1) 用户显式指定 → 2) 文件扩展名 → 3) 内容魔数。
 pub fn detect_format(hint: Option<&str>, path: Option<&str>, body: &[u8]) -> RulesetFormat {
     if let Some(h) = hint {
-        if let Some(f) = parse_hint(h) {
-            return f;
-        }
+        // An explicit but misspelled format must not silently fall through to a
+        // different parser.
+        return parse_hint(h).unwrap_or(RulesetFormat::Unknown);
     }
     if let Some(p) = path {
         if let Some(f) = from_extension(p) {
@@ -47,6 +54,9 @@ fn parse_hint(s: &str) -> Option<RulesetFormat> {
 }
 
 fn from_extension(path: &str) -> Option<RulesetFormat> {
+    // URLs commonly carry cache-busting query strings or fragments. They are
+    // not part of the filename extension.
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
         "yaml" | "yml" => RulesetFormat::Yaml,
@@ -67,8 +77,10 @@ fn sniff(body: &[u8]) -> RulesetFormat {
     if body.starts_with(&crate::rrs::MAGIC) {
         return RulesetFormat::Rrs;
     }
-    // mihomo MRS：magic = "MRS\0" 之类（无公开规范，按截至 2026 mihomo 主分支约定）
-    if body.starts_with(b"MRS") || body.starts_with(b"\x4D\x52\x53") {
+    // MRS wraps its complete payload, including `MRS\x01`, in zstd. Decode only
+    // the four-byte prefix so extensionless/CDN URLs are still detectable
+    // without inflating an attacker-controlled body.
+    if sniff_compressed_mrs(body) {
         return RulesetFormat::Mrs;
     }
     // sing-box SRS：magic = "SRS\0" 0x53 0x52 0x53
@@ -94,4 +106,63 @@ fn sniff(body: &[u8]) -> RulesetFormat {
     }
     // 默认按 text 试一次
     RulesetFormat::Text
+}
+
+fn sniff_compressed_mrs(body: &[u8]) -> bool {
+    if body.len() > MAX_MRS_SNIFF_BYTES || !body.starts_with(&ZSTD_MAGIC) {
+        return false;
+    }
+    let Ok(mut decoder) = ruzstd::decoding::StreamingDecoder::new(Cursor::new(body)) else {
+        return false;
+    };
+    let mut magic = [0u8; MRS_MAGIC.len()];
+    decoder.read_exact(&mut magic).is_ok() && magic == MRS_MAGIC
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+
+    #[test]
+    fn detects_compressed_mrs_without_filename_extension() {
+        let body = compress_to_vec(
+            &b"MRS\x01\x00\x00\x00\x00\x00\x00\x00\x00"[..],
+            CompressionLevel::Fastest,
+        );
+        assert_eq!(
+            detect_format(None, Some("https://cdn.example/download"), &body),
+            RulesetFormat::Mrs
+        );
+    }
+
+    #[test]
+    fn strips_url_query_and_fragment_before_extension_detection() {
+        assert_eq!(
+            detect_format(
+                None,
+                Some("https://cdn.example/geosite.mrs?token=abc#download"),
+                b""
+            ),
+            RulesetFormat::Mrs
+        );
+        assert_eq!(
+            detect_format(None, Some("https://cdn.example/geosite.srs?v=5"), b""),
+            RulesetFormat::Srs
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_explicit_hint_instead_of_guessing() {
+        assert_eq!(
+            detect_format(Some("mrss"), Some("geosite.mrs"), b"MRS"),
+            RulesetFormat::Unknown
+        );
+    }
+
+    #[test]
+    fn does_not_misclassify_other_zstd_payloads_as_mrs() {
+        let body = compress_to_vec(&b"not an MRS payload"[..], CompressionLevel::Fastest);
+        assert_ne!(detect_format(None, None, &body), RulesetFormat::Mrs);
+    }
 }
