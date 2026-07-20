@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 const DEFAULT_MAX_REDIRECTS: u8 = 5;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// 一次拉取的输入。`headers` 顺序保留，用于服务器对 header 顺序敏感的场景。
 #[derive(Debug, Clone)]
@@ -46,6 +47,10 @@ pub struct FetchOptions {
     pub headers: Vec<(String, String)>,
     /// `Accept-Encoding: gzip, br` —— 关掉就让上游不压缩，省掉本地解压。
     pub accept_encoding: bool,
+    /// 编码后的 HTTP body 与解压后的 body 都不能超过此上限。
+    ///
+    /// 同时限制两侧，避免无限 chunked response 与 gzip/brotli 解压炸弹。
+    pub max_body_bytes: usize,
 }
 
 impl Default for FetchOptions {
@@ -57,6 +62,7 @@ impl Default for FetchOptions {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             headers: Vec::new(),
             accept_encoding: true,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -93,6 +99,8 @@ pub enum FetchError {
     TooManyRedirects(u8),
     #[error("解压失败: {0}")]
     Decompress(String),
+    #[error("响应体超过上限 ({limit} bytes)")]
+    BodyTooLarge { limit: usize },
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -255,13 +263,12 @@ where
         .map_err(|e| FetchError::Http(format!("send_request: {e}")))?;
     let status = resp.status().as_u16();
     let headers = response_headers_lower(resp.headers());
-    let collected = resp
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| FetchError::Http(format!("read body: {e}")))?;
-    let raw = collected.to_bytes().to_vec();
-    let body = decode_body(&raw, headers.get("content-encoding").map(String::as_str))?;
+    let raw = read_body_limited(resp.into_body(), opts.max_body_bytes).await?;
+    let body = decode_body(
+        &raw,
+        headers.get("content-encoding").map(String::as_str),
+        opts.max_body_bytes,
+    )?;
     Ok(RawResp {
         status,
         headers,
@@ -288,30 +295,71 @@ fn response_headers_lower(headers: &HeaderMap) -> HashMap<String, String> {
     out
 }
 
-fn decode_body(raw: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, FetchError> {
-    use std::io::Read;
+async fn read_body_limited(
+    mut body: hyper::body::Incoming,
+    limit: usize,
+) -> Result<Vec<u8>, FetchError> {
+    let mut raw = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| FetchError::Http(format!("read body: {e}")))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        append_limited(&mut raw, &data, limit)?;
+    }
+    Ok(raw)
+}
+
+fn append_limited(out: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), FetchError> {
+    if chunk.len() > limit.saturating_sub(out.len()) {
+        return Err(FetchError::BodyTooLarge { limit });
+    }
+    out.try_reserve(chunk.len())
+        .map_err(|_| FetchError::BodyTooLarge { limit })?;
+    out.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn decode_body(raw: &[u8], encoding: Option<&str>, limit: usize) -> Result<Vec<u8>, FetchError> {
     match encoding.map(|s| s.trim().to_ascii_lowercase()) {
         Some(ref enc) if enc == "gzip" => {
-            let mut out = Vec::with_capacity(raw.len() * 4);
-            flate2::read::GzDecoder::new(raw)
-                .read_to_end(&mut out)
-                .map_err(|e| FetchError::Decompress(format!("gzip: {e}")))?;
-            Ok(out)
+            read_decoded_limited(flate2::read::GzDecoder::new(raw), "gzip", limit)
         }
         Some(ref enc) if enc == "br" => {
-            let mut out = Vec::with_capacity(raw.len() * 4);
-            brotli::Decompressor::new(raw, 4096)
-                .read_to_end(&mut out)
-                .map_err(|e| FetchError::Decompress(format!("brotli: {e}")))?;
-            Ok(out)
+            read_decoded_limited(brotli::Decompressor::new(raw, 4096), "brotli", limit)
         }
-        Some(ref enc) if enc == "identity" || enc.is_empty() => Ok(raw.to_vec()),
+        Some(ref enc) if enc == "identity" || enc.is_empty() => copy_limited(raw, limit),
         Some(other) => {
             warn!(target: "fetch", encoding = %other, "unknown content-encoding, returning raw");
-            Ok(raw.to_vec())
+            copy_limited(raw, limit)
         }
-        None => Ok(raw.to_vec()),
+        None => copy_limited(raw, limit),
     }
+}
+
+fn copy_limited(raw: &[u8], limit: usize) -> Result<Vec<u8>, FetchError> {
+    let mut out = Vec::new();
+    append_limited(&mut out, raw, limit)?;
+    Ok(out)
+}
+
+fn read_decoded_limited(
+    reader: impl std::io::Read,
+    encoding: &str,
+    limit: usize,
+) -> Result<Vec<u8>, FetchError> {
+    use std::io::Read;
+
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut reader = reader.take(read_limit);
+    let mut out = Vec::new();
+    reader
+        .read_to_end(&mut out)
+        .map_err(|e| FetchError::Decompress(format!("{encoding}: {e}")))?;
+    if out.len() > limit {
+        return Err(FetchError::BodyTooLarge { limit });
+    }
+    Ok(out)
 }
 
 /// 创建 outbound TCP —— 关键点：bind_outbound_socket 在 connect 之前调用，
@@ -388,23 +436,24 @@ mod tests {
         assert_eq!(o.max_redirects, 5);
         assert_eq!(o.timeout, Duration::from_secs(30));
         assert!(o.accept_encoding);
+        assert_eq!(o.max_body_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
     fn decode_identity_returns_input() {
         let raw = b"hello world";
-        let out = decode_body(raw, None).unwrap();
+        let out = decode_body(raw, None, raw.len()).unwrap();
         assert_eq!(out, raw);
-        let out = decode_body(raw, Some("identity")).unwrap();
+        let out = decode_body(raw, Some("identity"), raw.len()).unwrap();
         assert_eq!(out, raw);
-        let out = decode_body(raw, Some("")).unwrap();
+        let out = decode_body(raw, Some(""), raw.len()).unwrap();
         assert_eq!(out, raw);
     }
 
     #[test]
     fn decode_unknown_encoding_returns_raw() {
         let raw = b"compressed-by-aliens";
-        let out = decode_body(raw, Some("zstd")).unwrap();
+        let out = decode_body(raw, Some("zstd"), raw.len()).unwrap();
         assert_eq!(out, raw);
     }
 
@@ -415,8 +464,70 @@ mod tests {
         let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(payload).unwrap();
         let compressed = e.finish().unwrap();
-        let decoded = decode_body(&compressed, Some("gzip")).unwrap();
+        let decoded = decode_body(&compressed, Some("gzip"), payload.len()).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn encoded_body_limit_is_checked_across_chunks() {
+        let mut out = Vec::new();
+        append_limited(&mut out, b"1234", 6).unwrap();
+        let err = append_limited(&mut out, b"567", 6).unwrap_err();
+        assert!(matches!(err, FetchError::BodyTooLarge { limit: 6 }));
+        assert_eq!(out, b"1234");
+    }
+
+    #[test]
+    fn decompressed_body_limit_rejects_gzip_bomb() {
+        use std::io::Write;
+        let payload = vec![b'a'; 64 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 1024);
+
+        let err = decode_body(&compressed, Some("gzip"), 4096).unwrap_err();
+        assert!(matches!(err, FetchError::BodyTooLarge { limit: 4096 }));
+    }
+
+    #[tokio::test]
+    async fn chunked_http_body_is_rejected_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n\
+                      4\r\n1234\r\n\
+                      4\r\n5678\r\n\
+                      0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let options = FetchOptions {
+            timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_secs(1),
+            accept_encoding: false,
+            max_body_bytes: 6,
+            ..Default::default()
+        };
+        let error = fetch(&format!("http://{address}/rules"), &options)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FetchError::BodyTooLarge { limit: 6 }));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("test HTTP server did not exit")
+            .unwrap();
     }
 
     #[test]
