@@ -1218,7 +1218,13 @@ mod tests {
         install_auto_route(&routes, &plan);
 
         let added = backend.added.lock();
-        assert_eq!(added.len(), 4);
+        let expected_routes =
+            if plan.tun_v6_cidr.is_some() && is_ipv6_available(&plan.interface_name) {
+                4
+            } else {
+                2
+            };
+        assert_eq!(added.len(), expected_routes);
         assert!(
             added
                 .iter()
