@@ -2,7 +2,7 @@
 //!
 //! 优先级：
 //! 1. **root 模式**：优先复用 Linux 的 `/dev/net/tun` + `ioctl(TUNSETIFF)`。
-//! 2. **VpnService fd 注入 fallback**：宿主 App（Java/Kotlin）通过 [`set_vpn_fd`] 把
+//! 2. **VpnService fd 注入 fallback**：宿主 App（Java/Kotlin）通过 `set_vpn_fd` 把
 //!    `ParcelFileDescriptor` 的 fd（dup 后所有权交本进程）传过来。直接包成
 //!    `OwnedFd` + `AsyncFd`，无需 root。
 //! 3. 都不可用：返回 `Unsupported`。

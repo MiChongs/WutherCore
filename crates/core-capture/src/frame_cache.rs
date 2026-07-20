@@ -178,7 +178,7 @@ pub async fn write_ip_packet_to_tun(
 ///   一次性交给 [`TunIo::write_batch`]，平台后端可在内部做 GRO 合并；
 /// - 命中其它格式（外部 tap、读路径未剥头等）的包逐个走 [`encode_tun_ip_frame`] 老路径。
 ///
-/// 输入 `pkts` 接受所有权（[`crate::stack::Stack::drain_outbound`] 本身就返回 owned），
+/// 输入 `pkts` 接受所有权（`Stack::drain_outbound` 本身就返回 owned），
 /// 避免合并路径再克隆。任一包失败立即返回错误（已写出的包无法回滚）。
 pub async fn write_ip_packets_to_tun_batch(
     device: &Arc<dyn TunIo>,

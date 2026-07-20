@@ -419,7 +419,7 @@ pub trait CaptureEngine: Send + Sync {
     ) -> Result<(), CaptureError>;
     /// 优雅停止：撤销路由 / 清除防火墙规则 / 关 TUN。
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError>;
-    /// （仅 TUN engine）返回底层 [`TunIo`] 设备，供 user-stack / UDP forwarder 直接读写。
+    /// （仅 TUN engine）返回底层 `TunIo` 设备，供 user-stack / UDP forwarder 直接读写。
     /// 默认 None —— Tproxy/Redirect 等不需要直接访问 TUN。
     fn tun_io(&self) -> Option<Arc<dyn crate::tun_io::TunIo>> {
         None

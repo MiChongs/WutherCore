@@ -2,8 +2,14 @@
 name = "wuther-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-description = "WutherCore CLI 入口 —— Friendly YAML 代理内核"
+authors.workspace = true
+repository.workspace = true
+description = "Modular cross-platform proxy core with policy routing, DNS, transparent capture, and a management API"
+readme = "../../README.md"
+keywords = ["proxy", "networking", "tun", "dns", "rust"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "wuther-core"

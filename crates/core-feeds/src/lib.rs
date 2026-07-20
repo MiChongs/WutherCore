@@ -1,6 +1,6 @@
 //! core-feeds —— 订阅源实际拉取与解析。
 //!
-//! §5.3 feeds：负责把远程订阅链接转换为可用的 [`ParsedNode`] 列表。
+//! §5.3 feeds：负责把远程订阅链接转换为可用的 `ParsedNode` 列表。
 //! 设计要点：
 //! * 三种格式：base64-encoded URI 列表（最常见）、Clash/Mihomo YAML proxies、
 //!   纯文本 URI（每行一个）；自动嗅探。

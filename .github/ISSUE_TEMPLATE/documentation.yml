@@ -1,0 +1,55 @@
+name: 文档问题
+description: 报告错误、过时、缺失或不够清楚的文档。
+title: "[Docs]: "
+labels:
+  - documentation
+  - needs triage
+body:
+  - type: input
+    id: location
+    attributes:
+      label: 文档位置
+      description: 提供文件路径、章节标题或页面链接。
+      placeholder: docs/CONFIGURATION.md#流量接管
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 当前问题
+      description: 说明内容为何错误、过时、缺失或容易误解。
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 建议内容
+      description: 给出期望表述、可验证信息或相关实现位置。
+
+  - type: dropdown
+    id: audience
+    attributes:
+      label: 主要读者
+      options:
+        - 第一次使用者
+        - 日常使用者
+        - 集成开发者
+        - 项目贡献者
+        - 维护者
+        - 其他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue，确认没有相同报告。
+          required: true
+        - label: 报告中不包含订阅、节点凭据、密钥或个人网络信息。
+          required: true
+        - label: 我同意遵守项目行为准则。
+          required: true

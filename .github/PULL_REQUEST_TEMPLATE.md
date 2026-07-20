@@ -17,6 +17,8 @@
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo check --workspace --all-targets`
 - [ ] `cargo test --workspace`
+- [ ] `cargo doc --workspace --no-deps`
+- [ ] `python scripts/check-repository.py`
 - [ ] 已完成与改动相关的平台或手动验证
 
 ## 提交前确认

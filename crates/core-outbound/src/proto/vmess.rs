@@ -14,7 +14,7 @@
 //!     - `AUTH_LEN`(0x10) ：长度字段独立 AEAD（AES-128-GCM with `KDF(key, "auth_len")`）
 //! * **Cmd**: TCP `0x01` + UDP `0x02`
 //! * **Header AEAD**: AuthID(16) + Length(18) + Nonce(8) + Payload(N+16)
-//! * **Header Legacy**: 由 [`vmess_legacy`] 模块提供（HMAC-MD5 AuthInfo + AES-128-CFB header）
+//! * **Header Legacy**: 由 `vmess_legacy` 模块提供（HMAC-MD5 AuthInfo + AES-128-CFB header）
 //! * **响应解析**: 完整解析 ResponseAuth + Options + CmdResp + CmdRespSize
 //!
 //! 客户端默认开启 `CHUNK_STREAM | CHUNK_MASKING | GLOBAL_PADDING | AUTH_LEN`（与 mihomo 默认一致）。
@@ -365,7 +365,7 @@ impl OutboundAdapter for VmessOutbound {
     }
 }
 
-/// 给 [`vmess_legacy`] 复用的入口。
+/// 给 `vmess_legacy` 复用的入口。
 pub fn build_legacy_header_payload(
     iv: &[u8; 16],
     req_key: &[u8; 16],
@@ -388,7 +388,7 @@ pub fn build_legacy_header_payload(
     )
 }
 
-/// 给 [`vmess_legacy`] 复用的 chunk-stream 包装。
+/// 给 `vmess_legacy` 复用的 chunk-stream 包装。
 pub fn wrap_chunk_stream(
     stream: BoxedStream,
     security: VmessSecurity,

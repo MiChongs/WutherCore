@@ -43,7 +43,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 
-/// 缓存返回的复合体 —— 同时持 bytes 与 Arc<Value>。clone 都是 Arc bump，廉价。
+/// 缓存返回的复合体 —— 同时持 bytes 与 `Arc<Value>`。clone 都是 Arc bump，廉价。
 #[derive(Clone)]
 pub struct CacheEntry {
     pub bytes: Bytes,
@@ -148,7 +148,7 @@ impl SnapshotCache {
         None
     }
 
-    /// 立即让缓存过期。下次 [`fetch`] 一定重建。
+    /// 立即让缓存过期。下次 `fetch` 一定重建。
     pub fn invalidate(&self) {
         let mut s = self.inner.write();
         s.bytes = None;

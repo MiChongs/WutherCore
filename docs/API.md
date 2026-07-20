@@ -1,0 +1,114 @@
+# 管理 API
+
+管理服务默认包含健康检查、原生 `/v1` API，以及可选的 Clash/Mihomo 兼容接口。实际监听地址来自 `listen.panel`，接口开关和密钥来自 `ui`。
+
+## 启用
+
+```yaml
+listen:
+  panel: 127.0.0.1:9090
+
+ui:
+  on: true
+  secret: "replace-with-a-long-random-secret"
+  api:
+    native: true
+    clash-compat: true
+  cors:
+    - "http://127.0.0.1:3000"
+```
+
+没有配置 `ui.secret` 时，API 不鉴权，只适合严格本机监听。暴露到局域网或容器网络时必须配置密钥和 CORS allowlist。
+
+## 鉴权
+
+普通 API 请求支持：
+
+```http
+Authorization: Bearer <secret>
+```
+
+或：
+
+```http
+x-api-secret: <secret>
+```
+
+WebSocket/SSE 因浏览器协议限制，可使用 `?token=<secret>`。普通 GET/POST 不接受 query token，避免凭据进入访问日志和 Referer。
+
+以下路径不要求密钥：
+
+- `GET /`
+- `GET /healthz`
+- `/ui...` 静态 Dashboard 路径
+- CORS `OPTIONS` 预检
+
+认证失败统一返回 `401`：
+
+```json
+{"message":"Unauthorized"}
+```
+
+## 原生 `/v1` 端点
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/v1/status` | 运行状态与启动时间 |
+| `GET` | `/v1/traffic` | 流量统计 |
+| `GET` | `/v1/nodes` | 节点列表与状态 |
+| `GET` | `/v1/groups` | 策略组列表 |
+| `PATCH` | `/v1/groups/:name` | 修改策略组选择 |
+| `GET` | `/v1/connections` | 当前连接 |
+| `DELETE` | `/v1/connections/:id` | 关闭指定连接 |
+| `GET` | `/v1/resolver/query` | 调试 DNS 查询 |
+| `GET` | `/v1/route/check` | 调试路由结果 |
+| `GET` | `/v1/capture/state` | 流量接管状态 |
+| `GET` | `/v1/smart/why` | 查看 Smart 选择理由 |
+| `POST` | `/v1/smart/pin` | 固定节点 |
+| `POST` | `/v1/smart/avoid` | 临时回避节点 |
+| `POST` | `/v1/smart/reset` | 重置 Smart 状态 |
+| `GET` | `/v1/smart/cache` | 查看 Smart 缓存 |
+| `GET` | `/v1/smart/nodes/:group` | 查看组内 Smart 节点 |
+
+请求参数和响应结构在 1.0 前仍可能变化。集成时应保留未知字段，并对非 2xx 响应记录状态码和脱敏后的消息。
+
+## 示例
+
+```bash
+curl http://127.0.0.1:9090/healthz
+```
+
+```bash
+curl \
+  -H "Authorization: Bearer $WUTHERCORE_SECRET" \
+  http://127.0.0.1:9090/v1/status
+```
+
+```bash
+curl \
+  -H "x-api-secret: $WUTHERCORE_SECRET" \
+  "http://127.0.0.1:9090/v1/route/check?host=example.org&port=443"
+```
+
+不要把密钥直接写进 Shell 历史；上例建议通过环境变量提供。
+
+## 兼容 API
+
+`ui.api.clash-compat: true` 时，服务会合并 Clash/Mihomo 兼容路由，供现有 Dashboard 查询版本、配置、代理、规则、连接、日志与流量，并执行部分控制操作。
+
+兼容目标是常见 Dashboard 工作流，不承诺实现上游项目的每个私有或实验接口。集成前应针对实际 Dashboard 版本执行冒烟测试。
+
+## 服务端保护
+
+API 层包含：
+
+- CORS allowlist 与 Private Network Access 响应头；
+- 按来源 IP 的请求限流；
+- 请求体大小限制；
+- 请求超时；
+- 安全响应头；
+- 常量时间密钥比较；
+- WebSocket/SSE 的单独处理。
+
+这些保护不代替反向代理、防火墙或网络隔离。
+

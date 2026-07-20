@@ -134,7 +134,7 @@ pub enum RouteMatcher {
     PortRange(u16, u16),
     Network(String),
     Process(String),
-    /// 外部规则集（route.sets.<name>）。
+    /// 外部规则集（`route.sets.<name>`）。
     Set(String),
     /// L7 协议指纹（stun/dtls/quic/tls/sni/http/webrtc）。
     Proto(String),
@@ -156,7 +156,7 @@ pub enum RouteAction {
 
 /* ---------------- compile ---------------- */
 
-/// 用户配置 -> RuntimePlan。要求 [`apply_defaults`] 已执行。
+/// 用户配置 -> RuntimePlan。要求 `apply_defaults` 已执行。
 pub fn compile(cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let listen = compile_listen(&cfg)?;
     let feeds = compile_feeds(&cfg.feeds);

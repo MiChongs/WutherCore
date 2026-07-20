@@ -118,7 +118,7 @@ impl Runtime {
     ///
     /// `rulesets` 必须由 main 在创建 Runtime 之前先 `RulesetIndex::new()` 并传入，
     /// 这样 [`RouteEngine`] 才能在 `set:<name>` 规则评估时查到外部规则集；
-    /// 同一个 `Arc<RulesetIndex>` 应同时传给 [`core_capture`] 的
+    /// 同一个 `Arc<RulesetIndex>` 应同时传给 `core_capture` 的
     /// `RulesetIpSetProvider`，保证 route + capture 共用同一份索引。
     pub fn build_with(
         plan: RuntimePlan,

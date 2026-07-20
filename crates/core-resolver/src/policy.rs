@@ -16,7 +16,7 @@
 //!
 //! ## 顺序评估
 //!
-//! [`PolicyEngine::evaluate_rules`] 按 `rules` 顺序逐条尝试匹配；
+//! `PolicyEngine::evaluate_rules` 按 `rules` 顺序逐条尝试匹配；
 //! 命中后按动作的语义决定是否终止：
 //! * Reject / Accept / Direct / Proxy / Fake / Route / Respond —— **terminal**
 //! * Evaluate —— **non-terminal**，把上下文 saved response 更新后继续

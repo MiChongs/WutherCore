@@ -38,9 +38,13 @@ cargo check --workspace --all-targets
 cargo fmt --all --check
 cargo check --workspace --all-targets
 cargo test --workspace
+cargo doc --workspace --no-deps
+python scripts/check-repository.py
 ```
 
 平台专属代码无法在本机执行时，请在 Pull Request 中明确说明已验证和未验证的部分。不要用跳过测试来隐藏失败。
+
+只改文档时至少运行 `python scripts/check-repository.py`；修改公开 Rust 类型或模块说明时同时运行 `cargo doc --workspace --no-deps`。
 
 ## Commit 与 Pull Request
 

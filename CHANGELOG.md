@@ -1,0 +1,26 @@
+# Changelog
+
+本文件记录用户可见的重要变化。正式版本的发布说明由 GitHub Release 根据 `.github/release.yml` 分类生成，并补充兼容性、已知限制和升级方式。
+
+## [Unreleased]
+
+### Added
+
+- 仓库文档中心、功能矩阵、架构、配置、API、排错和路线图；
+- 结构化 Issue 表单、Pull Request 模板和 CODEOWNERS；
+- Dependabot、依赖变更审查、CodeQL 与私密漏洞报告；
+- 项目治理、紧急合并、安全、支持和行为准则；
+- README 与 GitHub Social Preview 共用的品牌横幅。
+
+### Changed
+
+- README 改为按使用、集成和贡献场景组织；
+- 合并门禁使用 `Required CI`，发布构建不作为 PR 必需检查；
+- GitHub About、Topics、合并策略、标签和社区功能完成配置。
+
+### Security
+
+- 高危依赖变更会阻止 Pull Request 合并；
+- CodeQL 初次扫描告警由 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 跟踪，未批量忽略。
+
+[Unreleased]: https://github.com/MiChongs/WutherCore/compare/main...HEAD

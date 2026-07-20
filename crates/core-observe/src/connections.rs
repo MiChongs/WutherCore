@@ -7,9 +7,9 @@
 //!   dnsMode / process / processPath / specialProxy / specialRules / sniffHost / uuid /
 //!   chains / rule / rulePayload；providerChains 是 tracker 顶层字段，随 meta 在内存
 //!   中流转但不序列化进 metadata 子对象）。
-//! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable Arc<ConnectionMeta> +
-//!   实时累计字节数（Arc<AtomicU64>，由 splice 路径在 copy loop 内自增）+ 取消
-//!   信号（Arc<Notify>，DELETE /connections/:id 触发后让数据流主动 shutdown）+
+//! * [`ConnectionEntry`] —— 一条活跃连接的完整状态：immutable `Arc<ConnectionMeta>` +
+//!   实时累计字节数（`Arc<AtomicU64>`，由 splice 路径在 copy loop 内自增）+ 取消
+//!   信号（`Arc<Notify>`，DELETE /connections/:id 触发后让数据流主动 shutdown）+
 //!   smart-block 旗标（AtomicU8，flip 不需要重建 meta）。
 //! * [`ConnectionGuard`] —— RAII：splice 任务持有 guard，drop 时自动从表移除，
 //!   即便 panic / early-return 也不会漏关。
@@ -292,7 +292,7 @@ pub struct ConnectionInfo {
     pub rule_payload: CompactString,
     pub max_upload_rate: u64,
     pub max_download_rate: u64,
-    /// "" 或 "blocked"；序列化时由 [`serialize_smart_block`] 把原子状态映射成
+    /// "" 或 "blocked"；序列化时由 `serialize_smart_block` 把原子状态映射成
     /// 字符串，与 dashboard 期望一致。
     #[serde(rename = "smartBlock", serialize_with = "serialize_smart_block")]
     pub smart_block: Arc<AtomicU8>,
@@ -404,7 +404,7 @@ impl ConnectionTable {
     /// 连接（DNS resolver、ruleset fetcher、URLTest 等）用。
     ///
     /// 行为：
-    /// * 不分配新的 connection id（统一用 0），不写 [`Self::entries`]；
+    /// * 不分配新的 connection id（统一用 0），不写 `Self::entries`；
     /// * counter / cancel token / window 仍可用 —— 上游 splice / accounting
     ///   代码不必分支判断；
     /// * Drop 时不调 `remove_silent`，因为根本没有 entry。
@@ -843,7 +843,7 @@ impl ConnectionTable {
 /// RAII guard：drop 时自动从表移除。所有 splice 路径都应该握住 guard
 /// 直到双向拷贝结束 —— 即使任务 panic / early-return 也能保证表里不留死条目。
 ///
-/// `tracked` = false 时是 [`Self::detached`] 构造的"旁路 guard"：counter /
+/// `tracked` = false 时是 `ConnectionGuard::detached` 构造的“旁路 guard”：counter /
 /// cancel / window 都仍正常工作（让上游 splice 代码不需要分支判断），
 /// 但 Drop 时不去碰 `table` —— 适合 inner 连接（DNS resolver / ruleset
 /// fetcher 等核心组件自身发起的连接），既不入 ConnectionTable 也不污染

@@ -12,7 +12,7 @@
 //!     // 读取同一份 YAML，导出 VpnService.Builder 需要的 address/route/dns/app 配置 JSON。
 //!     public static native String vpnServiceConfigJson(String configPath);
 //!     // （可选）通知 native 可以开始工作 —— 实际 capture supervisor 启动由
-//!     // proxy-core::main 控制。
+//!     // wuther-core::main 控制。
 //!     public static native int nativeStart();
 //!     public static native void nativeStop();
 //! }

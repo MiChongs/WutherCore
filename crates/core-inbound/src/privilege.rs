@@ -6,7 +6,7 @@
 //! 2. **诚实**：不假装拥有权限；检测失败时 `level = User` 并把所有受限能力降级。
 //! 3. **Android 诚实探测 su**：[`try_request_root_android`] 调用 `su -c id`，
 //!    成功只表示可执行 root 子命令；不会把当前进程伪装成 uid=0。
-//! 4. **零 unsafe**：unix 用 [`nix`] 封装，Windows 走外部命令检测。
+//! 4. **零 unsafe**：Unix 用 `nix` 封装，Windows 走外部命令检测。
 
 use serde::Serialize;
 use tracing::{debug, info, warn};

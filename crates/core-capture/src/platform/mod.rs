@@ -4,7 +4,7 @@
 //! * `pub fn build_engine(plan, deps) -> Result<Arc<dyn CaptureEngine>, CaptureError>`
 //! * `pub fn list_interfaces() -> Vec<String>`
 //!
-//! 另有 `*_tun_io` 子模块负责跨平台 [`TunIo`] 实现，供 supervisor packet loop 使用。
+//! 另有 `*_tun_io` 子模块负责跨平台 `TunIo` 实现，供 supervisor packet loop 使用。
 
 use std::sync::Arc;
 
