@@ -26,7 +26,7 @@ use crate::{
         sudoku::{AeadMethod as SudokuAead, SudokuOutbound},
         trojan::TrojanOutbound,
         trusttunnel::TrustTunnelOutbound,
-        tuic::TuicOutbound,
+        tuic::{TuicOutbound, TuicUdpMode},
         vless::{VlessNetwork, VlessOutbound},
         vmess::{VmessNetwork, VmessOutbound, VmessSecurity},
         vmess_legacy::VmessLegacyOutbound,
@@ -665,22 +665,102 @@ fn build_hysteria2(node: &ParsedNode) -> SharedOutbound {
 }
 
 fn build_tuic(node: &ParsedNode) -> SharedOutbound {
+    match tuic_from_node(node) {
+        Ok(outbound) => Arc::new(outbound),
+        Err(protocol) => StubOutbound::new(node.name.clone(), protocol),
+    }
+}
+
+fn tuic_from_node(node: &ParsedNode) -> Result<TuicOutbound, &'static str> {
     let uuid = node
         .uuid
         .as_deref()
         .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::nil);
-    let pwd = node.password.clone().unwrap_or_default();
+        .ok_or("tuic(invalid-uuid)")?;
+    let pwd = node.password.clone().ok_or("tuic(missing-password)")?;
     let mut ob = TuicOutbound::new(&node.name, &node.host, node.port, uuid, pwd);
     if let Some(s) = node.sni.clone() {
         ob.sni = Some(s);
     }
-    ob.insecure = node
+    ob.insecure = [
+        "insecure",
+        "allowInsecure",
+        "allow-insecure",
+        "allow_insecure",
+        "skip-cert-verify",
+        "skipCertVerify",
+    ]
+    .iter()
+    .filter_map(|key| node.params.get(*key))
+    .any(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    ob.disable_sni = ["disable-sni", "disable_sni"]
+        .iter()
+        .filter_map(|key| node.params.get(*key))
+        .any(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    ob.udp = node.udp;
+
+    if let Some(mode) = node
         .params
-        .get("insecure")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-    Arc::new(ob)
+        .get("udp-relay-mode")
+        .or_else(|| node.params.get("udp_relay_mode"))
+    {
+        ob.udp_relay_mode = match mode.as_str() {
+            mode if mode.eq_ignore_ascii_case("native") => TuicUdpMode::Native,
+            mode if mode.eq_ignore_ascii_case("quic") => TuicUdpMode::Quic,
+            _ => return Err("tuic(invalid-udp-relay-mode)"),
+        };
+    }
+    if let Some(alpn) = node.params.get("alpn") {
+        let values = alpn
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            ob.alpn = values;
+        }
+    }
+    if let Some(milliseconds) = node
+        .params
+        .get("heartbeat-interval")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        ob.heartbeat_interval = std::time::Duration::from_millis(milliseconds);
+    } else if let Some(interval) = node
+        .params
+        .get("heartbeat")
+        .and_then(|value| parse_tuic_duration(value))
+    {
+        ob.heartbeat_interval = interval;
+    }
+    Ok(ob)
+}
+
+fn parse_tuic_duration(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim();
+    let (number, unit_seconds) = [
+        ("ms", 1e-3),
+        ("us", 1e-6),
+        ("µs", 1e-6),
+        ("μs", 1e-6),
+        ("ns", 1e-9),
+        ("s", 1.0),
+        ("m", 60.0),
+        ("h", 3600.0),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|number| (number.trim(), multiplier))
+    })
+    .unwrap_or((value, 1.0));
+    let seconds = number.parse::<f64>().ok()? * unit_seconds;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    std::time::Duration::try_from_secs_f64(seconds).ok()
 }
 
 fn build_wireguard(node: &ParsedNode) -> SharedOutbound {
@@ -883,8 +963,10 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
 mod tests {
     use base64::Engine;
     use core_config::node_uri::{NodeProtocol, ParsedNode};
+    use uuid::Uuid;
 
-    use super::build_outbound;
+    use super::{build_outbound, tuic_from_node};
+    use crate::proto::tuic::TuicUdpMode;
 
     #[test]
     fn ss2022_registry_preserves_udp_flag_and_eih_chain() {
@@ -902,5 +984,83 @@ mod tests {
         node.udp = true;
         let outbound = build_outbound(&node);
         assert!(outbound.capabilities().udp);
+    }
+
+    #[test]
+    fn tuic_registry_maps_sing_box_and_mihomo_options() {
+        let mut node = ParsedNode::new("tuic", NodeProtocol::Tuic, "127.0.0.1", 443);
+        node.uuid = Some("2DD61D93-75D8-4DA4-AC0E-6AECE7EAC365".into());
+        node.password = Some("secret".into());
+        node.udp = false;
+        node.params.insert("udp_relay_mode".into(), "quic".into());
+        node.params.insert("allow_insecure".into(), "true".into());
+        node.params.insert("disable-sni".into(), "1".into());
+        node.params.insert("heartbeat".into(), "1500ms".into());
+        node.params.insert("alpn".into(), "h3, custom".into());
+
+        let outbound = tuic_from_node(&node).unwrap();
+        assert_eq!(
+            outbound.uuid,
+            Uuid::parse_str(node.uuid.as_deref().unwrap()).unwrap()
+        );
+        assert_eq!(outbound.password, "secret");
+        assert_eq!(outbound.udp_relay_mode, TuicUdpMode::Quic);
+        assert!(!outbound.udp);
+        assert!(outbound.insecure);
+        assert!(outbound.disable_sni);
+        assert_eq!(
+            outbound.heartbeat_interval,
+            std::time::Duration::from_millis(1500)
+        );
+        assert_eq!(outbound.alpn, ["h3", "custom"]);
+
+        let mut mihomo = ParsedNode::new("tuic", NodeProtocol::Tuic, "127.0.0.1", 443);
+        mihomo.uuid = node.uuid.clone();
+        mihomo.password = node.password.clone();
+        mihomo
+            .params
+            .insert("heartbeat-interval".into(), "10000".into());
+        let outbound = tuic_from_node(&mihomo).unwrap();
+        assert_eq!(
+            outbound.heartbeat_interval,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(outbound.udp_relay_mode, TuicUdpMode::Native);
+    }
+
+    #[test]
+    fn tuic_registry_parses_sing_box_duration_units() {
+        for (value, expected) in [
+            ("250ms", std::time::Duration::from_millis(250)),
+            ("1.5s", std::time::Duration::from_millis(1500)),
+            ("2m", std::time::Duration::from_secs(120)),
+            ("0.5h", std::time::Duration::from_secs(1800)),
+        ] {
+            assert_eq!(super::parse_tuic_duration(value), Some(expected));
+        }
+        assert_eq!(super::parse_tuic_duration("-1s"), None);
+        assert_eq!(super::parse_tuic_duration("forever"), None);
+    }
+
+    #[test]
+    fn tuic_registry_rejects_invalid_required_options() {
+        let mut node = ParsedNode::new("tuic", NodeProtocol::Tuic, "127.0.0.1", 443);
+        node.password = Some("secret".into());
+        assert_eq!(build_outbound(&node).protocol(), "tuic(invalid-uuid)");
+
+        node.uuid = Some("not-a-uuid".into());
+        assert_eq!(build_outbound(&node).protocol(), "tuic(invalid-uuid)");
+
+        node.uuid = Some("2DD61D93-75D8-4DA4-AC0E-6AECE7EAC365".into());
+        node.password = None;
+        assert_eq!(build_outbound(&node).protocol(), "tuic(missing-password)");
+
+        node.password = Some("secret".into());
+        node.params
+            .insert("udp-relay-mode".into(), "unsupported".into());
+        assert_eq!(
+            build_outbound(&node).protocol(),
+            "tuic(invalid-udp-relay-mode)"
+        );
     }
 }

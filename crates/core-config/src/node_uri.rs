@@ -240,8 +240,15 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     if !user.is_empty() {
         let decoded = pct_decode(user);
         match proto {
-            NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic => {
+            NodeProtocol::Trojan | NodeProtocol::Hysteria2 => {
                 node.password = Some(decoded);
+            }
+            NodeProtocol::Tuic => {
+                // TUIC v5 share links use `tuic://uuid:password@host:port`.
+                // Treating the username as the password silently produced a nil UUID
+                // and a non-interoperable authentication token.
+                node.uuid = Some(decoded);
+                node.password = url.password().map(pct_decode);
             }
             NodeProtocol::Vless | NodeProtocol::Vmess | NodeProtocol::Wireguard => {
                 node.uuid = Some(decoded);
@@ -445,6 +452,30 @@ mod tests {
         assert_eq!(n.protocol, NodeProtocol::Trojan);
         assert_eq!(n.password.as_deref(), Some("pwd"));
         assert_eq!(n.sni.as_deref(), Some("example.com"));
+        assert!(n.tls);
+    }
+
+    #[test]
+    fn parse_tuic_v5_credentials_and_options() {
+        let n = parse_uri(
+            "tuic://2DD61D93-75D8-4DA4-AC0E-6AECE7EAC365:p%40ss@example.com:443?udp_relay_mode=quic&heartbeat=10s&allow_insecure=1#TUIC",
+        )
+        .unwrap();
+        assert_eq!(n.protocol, NodeProtocol::Tuic);
+        assert_eq!(
+            n.uuid.as_deref(),
+            Some("2DD61D93-75D8-4DA4-AC0E-6AECE7EAC365")
+        );
+        assert_eq!(n.password.as_deref(), Some("p@ss"));
+        assert_eq!(
+            n.params.get("udp_relay_mode").map(String::as_str),
+            Some("quic")
+        );
+        assert_eq!(n.params.get("heartbeat").map(String::as_str), Some("10s"));
+        assert_eq!(
+            n.params.get("allow_insecure").map(String::as_str),
+            Some("1")
+        );
         assert!(n.tls);
     }
 
