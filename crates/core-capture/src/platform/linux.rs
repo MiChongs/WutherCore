@@ -19,7 +19,12 @@ use tracing::{debug, info, warn};
 use crate::{
     engine::{CaptureEngine, CaptureError, CaptureEvent, CapturePlan, EngineKind},
     packet::{L4, parse_tun_frame},
-    platform::linux_tun_io,
+    platform::{
+        linux_auto_redirect::{self, AutoRedirectBackend, RedirectPorts},
+        linux_auto_redirect_route::{self, AutoRedirectRouteLease},
+        linux_tproxy::{RedirectTcpListener, bind_tcp_redirect_listener_set, run_tcp_redirect},
+        linux_tun_io,
+    },
     route_table::{ManagedRoute, RouteTable},
     tproxy_rules,
     tun_io::TunIo,
@@ -63,6 +68,123 @@ struct TunState {
     loop_handle: Option<JoinHandle<()>>,
     stop_tx: Option<oneshot::Sender<()>>,
     platform_preconfigured: bool,
+    effective_plan: Option<CapturePlan>,
+    redirect_listeners: Vec<RedirectTcpListener>,
+    redirect_backend: Option<AutoRedirectBackend>,
+    redirect_route_lease: Option<AutoRedirectRouteLease>,
+    redirect_tasks: Option<JoinSet<()>>,
+    redirect_stops: Vec<oneshot::Sender<()>>,
+}
+
+fn redirect_ports_from_addrs(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<RedirectPorts, CaptureError> {
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+    for address in addresses {
+        let slot = if address.is_ipv4() {
+            &mut ipv4
+        } else {
+            &mut ipv6
+        };
+        if slot.replace(address.port()).is_some() {
+            return Err(CaptureError::Nat(format!(
+                "duplicate TCP REDIRECT listener family: {address}"
+            )));
+        }
+    }
+    let ipv4 = ipv4
+        .ok_or_else(|| CaptureError::Nat("missing required IPv4 TCP REDIRECT listener".into()))?;
+    if ipv4 == 0 || ipv6 == Some(0) {
+        return Err(CaptureError::Nat(
+            "TCP REDIRECT listener did not receive an ephemeral port".into(),
+        ));
+    }
+    Ok(RedirectPorts::new(ipv4, ipv6))
+}
+
+fn validate_auto_redirect_activation(plan: &CapturePlan) -> Result<(), CaptureError> {
+    if !plan.auto_redirect {
+        return Ok(());
+    }
+    if cfg!(target_os = "android") {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect currently supports root-managed Linux only; Android requires a dedicated iptables/VpnService contract".into(),
+        ));
+    }
+    if !plan.auto_route {
+        return Err(CaptureError::Nat(
+            "TUN auto_redirect requires auto_route".into(),
+        ));
+    }
+    if plan.traffic != core_config::model::CaptureTraffic::System {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect currently supports traffic=system only".into(),
+        ));
+    }
+    if plan.strict_route {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect does not yet support strict_route because it installs no policy-routing rule for ICMP/non-TCP-UDP traffic".into(),
+        ));
+    }
+    if !plan.route_address_set.is_empty() || !plan.route_exclude_address_set.is_empty() {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect dynamic route-set snapshots are not installed".into(),
+        ));
+    }
+    if plan.iproute2_rule_index < 4 {
+        return Err(CaptureError::Route(
+            "auto_redirect iproute2_rule_index must be at least 4".into(),
+        ));
+    }
+    if plan.iproute2_table_index == 0 || matches!(plan.iproute2_table_index, 253..=255) {
+        return Err(CaptureError::Route(format!(
+            "auto_redirect requires a non-reserved private routing table; table {} is unsafe",
+            plan.iproute2_table_index
+        )));
+    }
+    if plan.exclude_mptcp
+        || !plan.exclude_processes.is_empty()
+        || !plan.filters.include_interface.is_empty()
+        || !plan.filters.exclude_interface.is_empty()
+        || !plan.filters.include_uid.is_empty()
+        || !plan.filters.include_uid_range.is_empty()
+        || !plan.filters.exclude_uid.is_empty()
+        || !plan.filters.exclude_uid_range.is_empty()
+        || !plan.filters.include_gid.is_empty()
+        || !plan.filters.include_gid_range.is_empty()
+        || !plan.filters.exclude_gid.is_empty()
+        || !plan.filters.exclude_gid_range.is_empty()
+        || !plan.filters.include_android_user.is_empty()
+        || !plan.filters.include_package.is_empty()
+        || !plan.filters.exclude_package.is_empty()
+        || !plan.filters.include_mac.is_empty()
+        || !plan.filters.exclude_mac.is_empty()
+    {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect cannot activate filters whose full TCP/UDP policy-routing bypass is not transactional".into(),
+        ));
+    }
+    let defaults = (
+        core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK,
+        core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK,
+        core_config::model::DEFAULT_AUTO_REDIRECT_NFQUEUE,
+        core_config::model::DEFAULT_IPROUTE2_AUTO_REDIRECT_FALLBACK_RULE_INDEX,
+    );
+    let actual = (
+        plan.auto_redirect_marks.input.unwrap_or(defaults.0),
+        plan.auto_redirect_marks.reset.unwrap_or(defaults.1),
+        plan.auto_redirect_marks.nfqueue.unwrap_or(defaults.2),
+        plan.auto_redirect_marks
+            .fallback_rule_index
+            .unwrap_or(defaults.3),
+    );
+    if actual != defaults {
+        return Err(CaptureError::Unsupported(
+            "auto_redirect input/reset/NFQUEUE/fallback fields belong to an unimplemented mark/NFQUEUE data plane".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl LinuxTun {
@@ -108,16 +230,20 @@ impl LinuxTun {
         // 未配置（Android root linux_tun_io 路径）：手动 addr + mtu + link up
         let v4 = plan.tun_v4_addr_cidr();
         let mtu_s = plan.mtu.to_string();
-        let _ = run_logged(
+        let mtu_ok = matches!(
+            run_logged(
             "root-tun.link-mtu",
             "ip",
             &["link", "set", "dev", &plan.interface_name, "mtu", &mtu_s],
             true,
+            ),
+            Some(status) if status.success()
         );
-        let _ = configure_addr_with_ip(false, &v4, &plan.interface_name);
+        let v4_ok = configure_addr_with_ip(false, &v4, &plan.interface_name);
+        let mut v6_ok = true;
         if let Some(ref v6_cidr) = plan.tun_v6_addr_cidr() {
             if is_ipv6_available(&plan.interface_name) {
-                let _ = configure_addr_with_ip(true, v6_cidr, &plan.interface_name);
+                v6_ok = configure_addr_with_ip(true, v6_cidr, &plan.interface_name);
             } else {
                 debug!(
                     target: "capture::linux::tun",
@@ -126,16 +252,24 @@ impl LinuxTun {
                 );
             }
         }
-        let _ = run_logged(
+        let ip_link_up = matches!(
+            run_logged(
             "root-tun.link-up",
             "ip",
             &["link", "set", "dev", &plan.interface_name, "up"],
             true,
+            ),
+            Some(status) if status.success()
         );
-        if cfg!(any(target_os = "linux", target_os = "android")) {
-            let _ = linux_tun_io::set_link_up_ioctl(&plan.interface_name);
-        }
+        let ioctl_link_up = linux_tun_io::set_link_up_ioctl(&plan.interface_name).is_ok();
         let _ = log_iface_snapshot(&plan.interface_name);
+        if plan.auto_redirect && !(mtu_ok && v4_ok && v6_ok && (ip_link_up || ioctl_link_up)) {
+            return Err(CaptureError::DeviceFailed(format!(
+                "auto_redirect requires complete TUN interface configuration \
+                 (mtu={mtu_ok}, ipv4={v4_ok}, ipv6={v6_ok}, link={})",
+                ip_link_up || ioctl_link_up
+            )));
+        }
         Ok(())
     }
 }
@@ -450,6 +584,7 @@ impl CaptureEngine for LinuxTun {
         if g.started {
             return Ok(());
         }
+        validate_auto_redirect_activation(&self.plan)?;
         let summary = root_tun_summary(&self.plan);
         info!(
             target: "capture::linux::tun",
@@ -488,6 +623,15 @@ impl CaptureEngine for LinuxTun {
         let mut effective_plan = self.plan.clone();
         effective_plan.interface_name = device.name().to_string();
         let manage_linux_config = should_manage_linux_tun_config(device.as_ref());
+        // Publish every resource needed by rollback before the first
+        // fallible host-network mutation. CaptureSupervisor marks the engine
+        // started before awaiting us, so any later error calls stop() and
+        // cleans this effective (kernel-selected) interface rather than the
+        // requested name.
+        g.platform_preconfigured = !manage_linux_config;
+        g.effective_plan = Some(effective_plan.clone());
+        g.device = Some(device.clone());
+        g.started = true;
         info!(
             target: "capture::linux::tun",
             requested_iface = %self.plan.interface_name,
@@ -496,12 +640,30 @@ impl CaptureEngine for LinuxTun {
             platform_preconfigured = !manage_linux_config,
             "root tun device opened"
         );
+        if effective_plan.auto_redirect && !manage_linux_config {
+            return Err(CaptureError::Unsupported(
+                "auto_redirect requires a root-managed Linux/Android TUN; \
+                 a platform-preconfigured/VpnService device already owns capture"
+                    .into(),
+            ));
+        }
         if manage_linux_config {
             Self::configure_iface(&effective_plan, device.as_ref())?;
 
+            // Bind every required address family before routes or firewall
+            // hooks can send traffic to the data plane. The actual ports are
+            // injected into rules during post_start, after the dispatcher
+            // owns TUN packet I/O.
+            if effective_plan.auto_redirect {
+                let redirect_ipv6 = effective_plan.ipv6_enabled
+                    && effective_plan.tun_v6_cidr.is_some()
+                    && is_ipv6_available(&effective_plan.interface_name);
+                g.redirect_listeners = bind_tcp_redirect_listener_set(redirect_ipv6)?;
+            }
+
             // auto_route：将所有目标流量导入 TUN（按 sing-box 默认拆 0/1 + 128/1 双半区
             // 路由，避免覆盖系统已有的 0/0 默认路由），并写入指定 iproute2 表。
-            if effective_plan.auto_route {
+            if effective_plan.auto_route && !effective_plan.auto_redirect {
                 install_auto_route(&self.routes, &effective_plan);
                 // 内核级身份旁路：在 OUTPUT/mangle 链上为 excluded UID/GID/package
                 // 打 fwmark = tun_outbound_mark，触发 install_auto_route 注册的
@@ -524,12 +686,6 @@ impl CaptureEngine for LinuxTun {
             // strict_route：在主表里拒绝其它一切，强制流量必经 TUN。
             if effective_plan.strict_route {
                 install_strict_route(&effective_plan);
-            }
-            // auto_redirect：nftables 重定向 + fwmark；输入/输出/reset mark 全量配置。
-            if effective_plan.auto_redirect {
-                if let Err(e) = install_auto_redirect(&effective_plan) {
-                    warn!(target: "capture::linux", error = %e, "auto_redirect install failed");
-                }
             }
         } else {
             info!(
@@ -557,27 +713,159 @@ impl CaptureEngine for LinuxTun {
             let _ = events;
         }
 
-        g.platform_preconfigured = !manage_linux_config;
-        g.device = Some(device);
         g.stop_tx = Some(stop_tx);
-        g.started = true;
         info!(
             target: "capture::linux::tun",
-            iface = %self.plan.interface_name,
-            mtu = self.plan.mtu,
+            iface = %effective_plan.interface_name,
+            mtu = effective_plan.mtu,
             dispatcher_owns_tun,
-            "linux tun started"
+            auto_redirect_prebound = g.redirect_listeners.len(),
+            "linux tun prepared"
         );
         Ok(())
     }
-    async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
+
+    async fn post_start(
+        self: Arc<Self>,
+        events: mpsc::Sender<CaptureEvent>,
+        runtime: Arc<core_runtime::Runtime>,
+    ) -> Result<(), CaptureError> {
         let mut g = self.state.lock().await;
+        if !g.started {
+            return Err(CaptureError::Nat(
+                "cannot activate auto_redirect before Linux TUN is prepared".into(),
+            ));
+        }
+        let plan = g
+            .effective_plan
+            .clone()
+            .ok_or_else(|| CaptureError::Nat("Linux TUN effective plan is missing".into()))?;
+        if !plan.auto_redirect || g.platform_preconfigured {
+            return Ok(());
+        }
+        if g.redirect_backend.is_some() {
+            return Ok(());
+        }
+        validate_auto_redirect_activation(&plan)?;
+        if g.redirect_tasks.is_some() || g.redirect_route_lease.is_some() || !self.routes.is_empty()
+        {
+            return Err(CaptureError::Route(
+                "auto_redirect has a partial activation ledger; pre_stop must clean it before retry"
+                    .into(),
+            ));
+        }
+        let ports = redirect_ports_from_addrs(
+            g.redirect_listeners
+                .iter()
+                .map(RedirectTcpListener::local_addr),
+        )?;
+        let redirect_ipv6 = ports.ipv6.is_some();
+
+        let listeners = std::mem::take(&mut g.redirect_listeners);
+        let mut tasks = JoinSet::new();
+        let mut stops = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let (listener, local_addr) = listener.into_parts();
+            let (stop_tx, stop_rx) = oneshot::channel();
+            stops.push(stop_tx);
+            let events = events.clone();
+            let runtime = runtime.clone();
+            tasks.spawn(async move {
+                if let Err(error) = run_tcp_redirect(listener, events, runtime, stop_rx).await {
+                    warn!(
+                        target: "capture::linux::auto_redirect",
+                        %local_addr,
+                        %error,
+                        "TCP REDIRECT listener stopped with error"
+                    );
+                }
+            });
+        }
+        g.redirect_tasks = Some(tasks);
+        g.redirect_stops = stops;
+
+        // Publish the exact policy-rule ledger before the first fallible route
+        // mutation. `pre_stop` can then unwind every partial post_start state.
+        g.redirect_route_lease = Some(AutoRedirectRouteLease::default());
+        linux_auto_redirect_route::prepare_routes(&self.routes, &plan, redirect_ipv6)?;
+        linux_auto_redirect_route::install(
+            &plan,
+            redirect_ipv6,
+            g.redirect_route_lease
+                .as_mut()
+                .expect("auto_redirect route lease was published"),
+        )?;
+
+        // This synchronous, bounded nft transaction contains no await and is
+        // deliberately last: no packet can enter until listeners, routes,
+        // policy rules, and the dispatcher are all ready.
+        let backend = linux_auto_redirect::install(&plan, ports)?;
+        g.redirect_backend = Some(backend);
+        info!(
+            target: "capture::linux::auto_redirect",
+            iface = %plan.interface_name,
+            ?backend,
+            ipv4_port = ports.ipv4,
+            ipv6_port = ?ports.ipv6,
+            "TUN auto_redirect activated after dispatcher"
+        );
+        Ok(())
+    }
+
+    async fn pre_stop(self: Arc<Self>) -> Result<(), CaptureError> {
+        let mut g = self.state.lock().await;
+        if let Some(backend) = g.redirect_backend {
+            // On failure retain the backend, listeners and dispatcher-facing
+            // state so CaptureSupervisor can retry without creating a
+            // black-hole window.
+            linux_auto_redirect::uninstall(backend)?;
+            g.redirect_backend = None;
+        }
+
+        // Pending listeners exist when start/post_start failed before rules
+        // were activated. Dropping them is sufficient because no hook can
+        // reference their ports.
+        g.redirect_listeners.clear();
+        let mut tasks = g.redirect_tasks.take().unwrap_or_else(JoinSet::new);
+        let mut stops = std::mem::take(&mut g.redirect_stops);
+        stop_listener_tasks(&mut stops, &mut tasks).await;
+
+        if let Some(lease) = g.redirect_route_lease.as_mut() {
+            linux_auto_redirect_route::uninstall(lease)?;
+        }
+        if self.plan.auto_redirect && !self.routes.is_empty() {
+            self.routes.revert_all_checked().map_err(|error| {
+                CaptureError::Route(format!(
+                    "auto_redirect split-default route cleanup incomplete: {error}"
+                ))
+            })?;
+        }
+        if g.redirect_route_lease
+            .as_ref()
+            .is_some_and(AutoRedirectRouteLease::is_empty)
+            && self.routes.is_empty()
+        {
+            g.redirect_route_lease = None;
+        }
+        Ok(())
+    }
+
+    async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
+        self.clone().pre_stop().await?;
+        let mut g = self.state.lock().await;
+        if !g.started && g.effective_plan.is_none() {
+            return Ok(());
+        }
+        let plan = g
+            .effective_plan
+            .clone()
+            .unwrap_or_else(|| self.plan.clone());
         info!(
             target: "capture::linux::tun",
-            iface = %self.plan.interface_name,
-            auto_route = self.plan.auto_route,
-            auto_redirect = self.plan.auto_redirect,
-            strict_route = self.plan.strict_route,
+            iface = %plan.interface_name,
+            auto_route = plan.auto_route,
+            auto_redirect = plan.auto_redirect,
+            strict_route = plan.strict_route,
             "root tun stopping"
         );
         if let Some(tx) = g.stop_tx.take() {
@@ -593,181 +881,175 @@ impl CaptureEngine for LinuxTun {
         g.platform_preconfigured = false;
         if platform_preconfigured {
             g.started = false;
+            g.effective_plan = None;
             info!(
                 target: "capture::linux::tun",
-                iface = %self.plan.interface_name,
+                iface = %plan.interface_name,
                 "tun device was platform-preconfigured; skip linux route/rule cleanup"
             );
-            info!(target: "capture", iface = %self.plan.interface_name, "linux tun stopped");
+            info!(target: "capture", iface = %plan.interface_name, "linux tun stopped");
             return Ok(());
         }
-        if self.plan.auto_redirect {
-            revert_auto_redirect(&self.plan);
-        }
-        if self.plan.strict_route {
-            revert_strict_route(&self.plan);
-        }
-        // 撤销 auto_route 安装的 main-table bypass rule
-        if self.plan.auto_route {
-            // 内核级身份旁路：与 install 对称，先于 ip rule 清理顺序由
-            // iptables -X 自身管理（与 catch-all 规则无依赖关系）。
-            crate::platform::linux_identity_bypass::revert(&self.plan);
-        }
-        if self.plan.auto_route && ip_rule_supported() {
-            let out_mark = tun_outbound_mark(&self.plan);
-            let mark_s = format!("{out_mark:#x}");
-            let bypass_prio =
-                outbound_bypass_rule_priority(self.plan.iproute2_rule_index).to_string();
-            let cleanup_tables = outbound_bypass_cleanup_tables();
-            for fam in ["", "-6"] {
-                for lookup in &cleanup_tables {
+        if !plan.auto_redirect {
+            if plan.strict_route {
+                revert_strict_route(&plan);
+            }
+            // 撤销 auto_route 安装的 main-table bypass rule
+            if plan.auto_route {
+                // 内核级身份旁路：与 install 对称，先于 ip rule 清理顺序由
+                // iptables -X 自身管理（与 catch-all 规则无依赖关系）。
+                crate::platform::linux_identity_bypass::revert(&plan);
+            }
+            if plan.auto_route && ip_rule_supported() {
+                let out_mark = tun_outbound_mark(&plan);
+                let mark_s = format!("{out_mark:#x}");
+                let bypass_prio =
+                    outbound_bypass_rule_priority(plan.iproute2_rule_index).to_string();
+                let cleanup_tables = outbound_bypass_cleanup_tables();
+                for fam in ["", "-6"] {
+                    for lookup in &cleanup_tables {
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.outbound-bypass",
+                            fam,
+                            &[
+                                "rule",
+                                "del",
+                                "priority",
+                                &bypass_prio,
+                                "fwmark",
+                                &mark_s,
+                                "lookup",
+                                lookup.as_str(),
+                            ],
+                            false,
+                        );
+                        // 兼容清理旧版本写入的无 priority 规则。
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.legacy-outbound-bypass",
+                            fam,
+                            &["rule", "del", "fwmark", &mark_s, "lookup", lookup.as_str()],
+                            false,
+                        );
+                    }
                     let _ = run_ip_logged(
-                        "root-tun.rule-del.outbound-bypass",
+                        "root-tun.rule-del.legacy-0xff-bypass",
                         fam,
-                        &[
-                            "rule",
-                            "del",
-                            "priority",
-                            &bypass_prio,
-                            "fwmark",
-                            &mark_s,
-                            "lookup",
-                            lookup.as_str(),
-                        ],
-                        false,
-                    );
-                    // 兼容清理旧版本写入的无 priority 规则。
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.legacy-outbound-bypass",
-                        fam,
-                        &["rule", "del", "fwmark", &mark_s, "lookup", lookup.as_str()],
+                        &["rule", "del", "fwmark", "0xff", "lookup", "main"],
                         false,
                     );
                 }
-                let _ = run_ip_logged(
-                    "root-tun.rule-del.legacy-0xff-bypass",
-                    fam,
-                    &["rule", "del", "fwmark", "0xff", "lookup", "main"],
-                    false,
-                );
-            }
-            // TUN 子网规则清理。
-            let tun_subnet_prio =
-                tun_subnet_rule_priority(self.plan.iproute2_rule_index).to_string();
-            let table_s_cleanup = self.plan.iproute2_table_index.to_string();
-            let v4_cidr = self.plan.tun_v4_cidr.to_string();
-            let _ = run_ip_logged(
-                "root-tun.rule-del.tun-subnet",
-                "",
-                &[
-                    "rule",
-                    "del",
-                    "priority",
-                    &tun_subnet_prio,
-                    "to",
-                    &v4_cidr,
-                    "lookup",
-                    &table_s_cleanup,
-                ],
-                false,
-            );
-            if let Some(v6_cidr) = self.plan.tun_v6_cidr {
-                let v6_cidr = v6_cidr.to_string();
+                // TUN 子网规则清理。
+                let tun_subnet_prio =
+                    tun_subnet_rule_priority(plan.iproute2_rule_index).to_string();
+                let table_s_cleanup = plan.iproute2_table_index.to_string();
+                let v4_cidr = plan.tun_v4_cidr.to_string();
                 let _ = run_ip_logged(
                     "root-tun.rule-del.tun-subnet",
-                    "-6",
+                    "",
                     &[
                         "rule",
                         "del",
                         "priority",
                         &tun_subnet_prio,
                         "to",
-                        &v6_cidr,
+                        &v4_cidr,
                         "lookup",
                         &table_s_cleanup,
                     ],
                     false,
                 );
-            }
-            // 静态 route-exclude-address 绕过 TUN 表；动态 set 在用户态强制 DIRECT。
-            // Android 的默认网络通常不在 main 表，清理时同时覆盖 main 与当前探测表。
-            let route_bypass_prio =
-                route_bypass_rule_priority(self.plan.iproute2_rule_index).to_string();
-            for net in &self.plan.route_exclude_addresses {
-                let dest = net.to_string();
-                let fam = route_rule_family(net);
-                for lookup in &cleanup_tables {
+                if let Some(v6_cidr) = plan.tun_v6_cidr {
+                    let v6_cidr = v6_cidr.to_string();
                     let _ = run_ip_logged(
-                        "root-tun.rule-del.route-exclude-bypass",
-                        fam,
+                        "root-tun.rule-del.tun-subnet",
+                        "-6",
                         &[
                             "rule",
                             "del",
                             "priority",
-                            &route_bypass_prio,
+                            &tun_subnet_prio,
                             "to",
-                            &dest,
+                            &v6_cidr,
                             "lookup",
-                            lookup.as_str(),
+                            &table_s_cleanup,
                         ],
                         false,
                     );
                 }
-            }
-            // 主 ip rule（lookup <custom>）也撤掉。
-            let prio_s = self.plan.iproute2_rule_index.to_string();
-            let table_s = self.plan.iproute2_table_index.to_string();
-            if auto_route_uses_catch_all_rule(&self.plan) {
-                for fam in ["", "-6"] {
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.catch-all",
-                        fam,
-                        &["rule", "del", "priority", &prio_s, "lookup", &table_s],
-                        false,
-                    );
-                }
-            } else {
-                for net in &self.plan.route_addresses {
+                // 静态 route-exclude-address 绕过 TUN 表；动态 set 在用户态强制 DIRECT。
+                // Android 的默认网络通常不在 main 表，清理时同时覆盖 main 与当前探测表。
+                let route_bypass_prio =
+                    route_bypass_rule_priority(plan.iproute2_rule_index).to_string();
+                for net in &plan.route_exclude_addresses {
                     let dest = net.to_string();
                     let fam = route_rule_family(net);
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.static-route-address",
-                        fam,
-                        &[
-                            "rule", "del", "priority", &prio_s, "to", &dest, "lookup", &table_s,
-                        ],
-                        false,
-                    );
+                    for lookup in &cleanup_tables {
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.route-exclude-bypass",
+                            fam,
+                            &[
+                                "rule",
+                                "del",
+                                "priority",
+                                &route_bypass_prio,
+                                "to",
+                                &dest,
+                                "lookup",
+                                lookup.as_str(),
+                            ],
+                            false,
+                        );
+                    }
+                }
+                // 主 ip rule（lookup <custom>）也撤掉。
+                let prio_s = plan.iproute2_rule_index.to_string();
+                let table_s = plan.iproute2_table_index.to_string();
+                if auto_route_uses_catch_all_rule(&plan) {
+                    for fam in ["", "-6"] {
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.catch-all",
+                            fam,
+                            &["rule", "del", "priority", &prio_s, "lookup", &table_s],
+                            false,
+                        );
+                    }
+                } else {
+                    for net in &plan.route_addresses {
+                        let dest = net.to_string();
+                        let fam = route_rule_family(net);
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.static-route-address",
+                            fam,
+                            &[
+                                "rule", "del", "priority", &prio_s, "to", &dest, "lookup", &table_s,
+                            ],
+                            false,
+                        );
+                    }
+                }
+                // 兼容清理旧版本 catch-all 规则。当前配置本身就是 catch-all 时，
+                // 上面的 `root-tun.rule-del.catch-all` 已经用完全相同的 selector
+                // 删除过；重复执行只会产生误导性的 ENOENT 日志。
+                if should_cleanup_legacy_catch_all_rule(&plan) {
+                    for fam in ["", "-6"] {
+                        let _ = run_ip_logged(
+                            "root-tun.rule-del.legacy-catch-all",
+                            fam,
+                            &["rule", "del", "priority", &prio_s, "lookup", &table_s],
+                            false,
+                        );
+                    }
                 }
             }
-            // 兼容清理旧版本 catch-all 规则。当前配置本身就是 catch-all 时，
-            // 上面的 `root-tun.rule-del.catch-all` 已经用完全相同的 selector
-            // 删除过；重复执行只会产生误导性的 ENOENT 日志。
-            if should_cleanup_legacy_catch_all_rule(&self.plan) {
-                for fam in ["", "-6"] {
-                    let _ = run_ip_logged(
-                        "root-tun.rule-del.legacy-catch-all",
-                        fam,
-                        &["rule", "del", "priority", &prio_s, "lookup", &table_s],
-                        false,
-                    );
-                }
-            }
+            self.routes.revert_all();
         }
-        self.routes.revert_all();
         let _ = run_quiet(
             "ip",
-            &[
-                "tuntap",
-                "del",
-                "dev",
-                &self.plan.interface_name,
-                "mode",
-                "tun",
-            ],
+            &["tuntap", "del", "dev", &plan.interface_name, "mode", "tun"],
         );
         g.started = false;
-        info!(target: "capture", iface = %self.plan.interface_name, "linux tun stopped");
+        g.effective_plan = None;
+        info!(target: "capture", iface = %plan.interface_name, "linux tun stopped");
         Ok(())
     }
 }
@@ -1065,6 +1347,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    fn auto_redirect_plan() -> CapturePlan {
+        let mut capture = core_config::model::Capture {
+            on: true,
+            method: core_config::model::CaptureMethod::VirtualNic,
+            ..core_config::model::Capture::default()
+        };
+        capture.tun.auto_route = true;
+        capture.tun.auto_redirect = true;
+        CapturePlan::from_config(&capture).unwrap()
+    }
+
+    #[test]
+    fn redirect_listener_ports_require_one_ipv4_and_at_most_one_ipv6() {
+        let ports = redirect_ports_from_addrs([
+            "0.0.0.0:41001".parse().unwrap(),
+            "[::]:41002".parse().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(ports, RedirectPorts::new(41001, Some(41002)));
+
+        assert!(
+            redirect_ports_from_addrs(["[::]:41002".parse().unwrap()]).is_err(),
+            "IPv4 REDIRECT is mandatory"
+        );
+        assert!(
+            redirect_ports_from_addrs([
+                "0.0.0.0:41001".parse().unwrap(),
+                "127.0.0.1:41003".parse().unwrap(),
+            ])
+            .is_err(),
+            "duplicate address families must fail closed"
+        );
+    }
+
+    #[test]
+    fn auto_redirect_activation_rechecks_safe_contract() {
+        let plan = auto_redirect_plan();
+        validate_auto_redirect_activation(&plan).unwrap();
+
+        let mut lan = plan.clone();
+        lan.traffic = core_config::model::CaptureTraffic::Lan;
+        assert!(validate_auto_redirect_activation(&lan).is_err());
+
+        let mut identity = plan.clone();
+        identity.filters.exclude_uid = vec![1000];
+        assert!(validate_auto_redirect_activation(&identity).is_err());
+
+        let mut reserved = plan.clone();
+        reserved.auto_redirect_marks.reset = Some(0x5151);
+        assert!(validate_auto_redirect_activation(&reserved).is_err());
+
+        let mut reserved_table = plan;
+        reserved_table.iproute2_table_index = 254;
+        assert!(validate_auto_redirect_activation(&reserved_table).is_err());
+    }
+
     struct TunConfigProbe {
         preconfigured: bool,
     }
@@ -1300,7 +1638,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            stop_tproxy_listener_tasks(&mut stops, &mut tasks),
+            stop_listener_tasks(&mut stops, &mut tasks),
         )
         .await
         .expect("all listeners must stop promptly");
@@ -1333,691 +1671,6 @@ fn revert_strict_route(plan: &CapturePlan) {
     let prio_s = (plan.iproute2_rule_index + 1).to_string();
     for fam in ["", "-6"] {
         let _ = run_ip_quiet(fam, &["rule", "del", "priority", &prio_s]);
-    }
-}
-
-const NFT_REDIRECT_TABLE: &str = "wuthercore_redirect";
-
-fn install_auto_redirect(plan: &CapturePlan) -> Result<(), CaptureError> {
-    let marks = &plan.auto_redirect_marks;
-    let in_mark = marks.input.unwrap_or(0x2023);
-    let out_mark = tun_outbound_mark(plan);
-    let reset_mark = marks.reset.unwrap_or(0x2025);
-
-    let mut script = String::new();
-    use std::fmt::Write;
-    let t = NFT_REDIRECT_TABLE;
-    let iface = &plan.interface_name;
-
-    // 1. 创建独立 inet 表 + prerouting / output / mark chain
-    let _ = writeln!(script, "add table inet {t}");
-    let _ = writeln!(
-        script,
-        "add chain inet {t} prerouting {{ type filter hook prerouting priority -150; }}"
-    );
-    let _ = writeln!(
-        script,
-        "add chain inet {t} output {{ type filter hook output priority -150; }}"
-    );
-    let _ = writeln!(script, "add chain inet {t} mark_chain");
-    let _ = writeln!(
-        script,
-        "add rule inet {t} prerouting iifname != \"{iface}\" jump mark_chain"
-    );
-
-    // 2. include / exclude 接口过滤（mark_chain 入口前拒绝）
-    for excl in &plan.filters.exclude_interface {
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain iifname \"{excl}\" return"
-        );
-    }
-    if !plan.filters.include_interface.is_empty() {
-        let names: Vec<String> = plan
-            .filters
-            .include_interface
-            .iter()
-            .map(|n| format!("\"{n}\""))
-            .collect();
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain iifname != {{ {} }} return",
-            names.join(", ")
-        );
-    }
-
-    // 3. UID 过滤（exclude 优先；include 限定）
-    for u in &plan.filters.exclude_uid {
-        let _ = writeln!(script, "add rule inet {t} mark_chain meta skuid {u} return");
-    }
-    for (a, b) in &plan.filters.exclude_uid_range {
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain meta skuid {a}-{b} return"
-        );
-    }
-    if !plan.filters.include_uid.is_empty() || !plan.filters.include_uid_range.is_empty() {
-        // 把允许的 UID 集生成元素 set
-        let mut allow: Vec<String> = plan
-            .filters
-            .include_uid
-            .iter()
-            .map(|u| u.to_string())
-            .collect();
-        for (a, b) in &plan.filters.include_uid_range {
-            allow.push(format!("{a}-{b}"));
-        }
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain meta skuid != {{ {} }} return",
-            allow.join(", ")
-        );
-    }
-
-    // 3b. GID 过滤（exclude 优先；include 限定）—— mihomo `meta skgid` 等价。
-    for g in &plan.filters.exclude_gid {
-        let _ = writeln!(script, "add rule inet {t} mark_chain meta skgid {g} return");
-    }
-    for (a, b) in &plan.filters.exclude_gid_range {
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain meta skgid {a}-{b} return"
-        );
-    }
-    if !plan.filters.include_gid.is_empty() || !plan.filters.include_gid_range.is_empty() {
-        let mut allow: Vec<String> = plan
-            .filters
-            .include_gid
-            .iter()
-            .map(|g| g.to_string())
-            .collect();
-        for (a, b) in &plan.filters.include_gid_range {
-            allow.push(format!("{a}-{b}"));
-        }
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain meta skgid != {{ {} }} return",
-            allow.join(", ")
-        );
-    }
-
-    // 4. loopback_address 排除（保留地址 / lan）
-    for ip in &plan.loopback_addresses {
-        let proto = match ip {
-            std::net::IpAddr::V4(_) => "ip",
-            std::net::IpAddr::V6(_) => "ip6",
-        };
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain {proto} daddr {ip} return"
-        );
-    }
-
-    // 4b. MAC 地址过滤（路由器 / LAN 接管场景）。
-    for mac in &plan.filters.exclude_mac {
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain ether saddr {mac} return"
-        );
-    }
-    if !plan.filters.include_mac.is_empty() {
-        let macs: Vec<String> = plan.filters.include_mac.iter().map(|m| m.clone()).collect();
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain ether saddr != {{ {} }} return",
-            macs.join(", ")
-        );
-    }
-
-    // 4c. Android user → UID 偶合：Android user N 的 UID = N * 100000 + appUid。
-    // include_android_user 字段当用户没有显式指定 include_uid 时生效。
-    if plan.filters.include_uid.is_empty()
-        && plan.filters.include_uid_range.is_empty()
-        && !plan.filters.include_android_user.is_empty()
-    {
-        let mut ranges: Vec<String> = Vec::new();
-        for u in &plan.filters.include_android_user {
-            let lo = u * 100_000;
-            let hi = lo + 99_999;
-            ranges.push(format!("{lo}-{hi}"));
-        }
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain meta skuid != {{ {} }} return",
-            ranges.join(", ")
-        );
-    }
-
-    // 5. exclude_mptcp：透传 MPTCP 不接管
-    if plan.exclude_mptcp {
-        let _ = writeln!(
-            script,
-            "add rule inet {t} mark_chain tcp option mptcp exists return"
-        );
-    }
-
-    // 6. 主标记：进入 TUN 表
-    let _ = writeln!(
-        script,
-        "add rule inet {t} mark_chain meta mark set {in_mark:#x}"
-    );
-    let _ = writeln!(
-        script,
-        "add rule inet {t} mark_chain ct state new tcp flags syn meta mark set {reset_mark:#x}"
-    );
-    // 7. 出方向：output 上 outbound mark 自身流量直接 accept，避免回环
-    let _ = writeln!(
-        script,
-        "add rule inet {t} output meta mark {out_mark:#x} accept"
-    );
-
-    let create = script;
-    // —— 后端选择：nft → iptables(+ip6tables) TPROXY → iptables NAT REDIRECT 三级降级。
-    let nft_ok = has_tool("nft") && nft_load(&create);
-    if nft_ok {
-        // ip rule fwmark <in_mark> 走 TUN 自定义表
-        if ip_rule_supported() {
-            let table_s = plan.iproute2_table_index.to_string();
-            let mark_s = format!("{in_mark:#x}");
-            for fam in ["", "-6"] {
-                let _ = run_ip_quiet(fam, &["rule", "add", "fwmark", &mark_s, "lookup", &table_s]);
-            }
-            if let Some(fb) = marks.fallback_rule_index {
-                let prio_s = fb.to_string();
-                for fam in ["", "-6"] {
-                    let _ = run_ip_quiet(
-                        fam,
-                        &["rule", "add", "priority", &prio_s, "lookup", &table_s],
-                    );
-                }
-            }
-        }
-        if let Some(q) = marks.nfqueue {
-            let qs = q.to_string();
-            let _ = run_quiet(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    NFT_REDIRECT_TABLE,
-                    "prerouting",
-                    "queue",
-                    "num",
-                    &qs,
-                ],
-            );
-        }
-        info!(
-            target: "capture::linux",
-            backend = "nftables",
-            in_mark = format_args!("{in_mark:#x}"),
-            out_mark = format_args!("{out_mark:#x}"),
-            reset_mark = format_args!("{reset_mark:#x}"),
-            "auto_redirect installed"
-        );
-        return Ok(());
-    }
-
-    // —— 回落 1：iptables + ip6tables TPROXY（双栈、Android root 通用）
-    if has_tool("iptables") && install_iptables_tproxy(plan, in_mark, out_mark) {
-        if ip_rule_supported() {
-            let table_s = plan.iproute2_table_index.to_string();
-            let mark_s = format!("{in_mark:#x}");
-            for fam in ["", "-6"] {
-                let _ = run_ip_quiet(fam, &["rule", "add", "fwmark", &mark_s, "lookup", &table_s]);
-            }
-        }
-        info!(
-            target: "capture::linux",
-            backend = "iptables-tproxy",
-            in_mark = format_args!("{in_mark:#x}"),
-            out_mark = format_args!("{out_mark:#x}"),
-            "auto_redirect installed (iptables/ip6tables TPROXY fallback; nft 不可用)"
-        );
-        return Ok(());
-    }
-
-    // —— 回落 2：iptables NAT REDIRECT（仅 TCP；UDP 走 fake-ip + TUN）
-    if has_tool("iptables") && install_iptables_redirect(plan) {
-        warn!(
-            target: "capture::linux",
-            backend = "iptables-nat-redirect",
-            "auto_redirect installed (NAT REDIRECT；仅 TCP；UDP 由 fake-ip+TUN 承担)"
-        );
-        return Ok(());
-    }
-
-    Err(CaptureError::Doctor(
-        "auto_redirect 全部后端失败：nft / iptables 都不可用。\
-         Android 设备请确认已 root 且安装 magisk 模块 iptables 或 nftables；\
-         否则请关掉 auto_redirect，使用 method=virtual_nic + stack=mixed 走纯 TUN。"
-            .into(),
-    ))
-}
-
-/// 把 nft 脚本通过 stdin 喂给 nft -f -；返回是否成功。
-fn nft_load(script: &str) -> bool {
-    use std::io::Write;
-    let child = std::process::Command::new("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let Ok(mut child) = child else { return false };
-    if let Some(mut sin) = child.stdin.take() {
-        let _ = sin.write_all(script.as_bytes());
-    }
-    matches!(child.wait(), Ok(s) if s.success())
-}
-
-const IPT_CHAIN: &str = "WUTHERCORE_REDIR";
-const IPT_TPROXY_PORT: &str = "7894";
-
-/// iptables(+ip6tables) TPROXY 注入：mihomo 等价 Android `IptablesV4V6Tproxy` Tier。
-fn install_iptables_tproxy(plan: &CapturePlan, in_mark: u32, out_mark: u32) -> bool {
-    let in_mark_s = format!("{in_mark:#x}");
-    let out_mark_s = format!("{out_mark:#x}");
-    let mut all_ok = true;
-    for ipt in iptables_binaries() {
-        // 创建 / 复用 chain（已存在 → silent ok）
-        let _ = run_quiet(ipt, &["-t", "mangle", "-N", IPT_CHAIN]);
-        // 自身流量（mark 命中 out_mark）跳过
-        let r1 = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "mangle",
-                "-A",
-                IPT_CHAIN,
-                "-m",
-                "mark",
-                "--mark",
-                &out_mark_s,
-                "-j",
-                "RETURN",
-            ],
-        );
-        // loopback / TUN iif 跳过
-        let _ = run_quiet(
-            ipt,
-            &["-t", "mangle", "-A", IPT_CHAIN, "-i", "lo", "-j", "RETURN"],
-        );
-        let _ = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "mangle",
-                "-A",
-                IPT_CHAIN,
-                "-i",
-                &plan.interface_name,
-                "-j",
-                "RETURN",
-            ],
-        );
-
-        // UID/GID exclude
-        for u in &plan.filters.exclude_uid {
-            let val = u.to_string();
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "mangle",
-                    "-A",
-                    IPT_CHAIN,
-                    "-m",
-                    "owner",
-                    "--uid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        for (a, b) in &plan.filters.exclude_uid_range {
-            let val = format!("{a}-{b}");
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "mangle",
-                    "-A",
-                    IPT_CHAIN,
-                    "-m",
-                    "owner",
-                    "--uid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        for g in &plan.filters.exclude_gid {
-            let val = g.to_string();
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "mangle",
-                    "-A",
-                    IPT_CHAIN,
-                    "-m",
-                    "owner",
-                    "--gid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        for (a, b) in &plan.filters.exclude_gid_range {
-            let val = format!("{a}-{b}");
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "mangle",
-                    "-A",
-                    IPT_CHAIN,
-                    "-m",
-                    "owner",
-                    "--gid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        // include_uid / include_gid 用 ! 否定 RETURN 实现"只放行集合"语义。
-        if !plan.filters.include_uid.is_empty() || !plan.filters.include_uid_range.is_empty() {
-            for u in &plan.filters.include_uid {
-                let val = u.to_string();
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "mangle",
-                        "-A",
-                        IPT_CHAIN,
-                        "-m",
-                        "owner",
-                        "!",
-                        "--uid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-            for (a, b) in &plan.filters.include_uid_range {
-                let val = format!("{a}-{b}");
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "mangle",
-                        "-A",
-                        IPT_CHAIN,
-                        "-m",
-                        "owner",
-                        "!",
-                        "--uid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-        }
-        if !plan.filters.include_gid.is_empty() || !plan.filters.include_gid_range.is_empty() {
-            for g in &plan.filters.include_gid {
-                let val = g.to_string();
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "mangle",
-                        "-A",
-                        IPT_CHAIN,
-                        "-m",
-                        "owner",
-                        "!",
-                        "--gid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-            for (a, b) in &plan.filters.include_gid_range {
-                let val = format!("{a}-{b}");
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "mangle",
-                        "-A",
-                        IPT_CHAIN,
-                        "-m",
-                        "owner",
-                        "!",
-                        "--gid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-        }
-
-        // TPROXY mark + 投递到本地端口
-        let r2 = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "mangle",
-                "-A",
-                IPT_CHAIN,
-                "-p",
-                "tcp",
-                "-j",
-                "TPROXY",
-                "--on-port",
-                IPT_TPROXY_PORT,
-                "--tproxy-mark",
-                &in_mark_s,
-            ],
-        );
-        let r3 = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "mangle",
-                "-A",
-                IPT_CHAIN,
-                "-p",
-                "udp",
-                "-j",
-                "TPROXY",
-                "--on-port",
-                IPT_TPROXY_PORT,
-                "--tproxy-mark",
-                &in_mark_s,
-            ],
-        );
-        // PREROUTING 跳本 chain
-        let r4 = run_quiet(ipt, &["-t", "mangle", "-A", "PREROUTING", "-j", IPT_CHAIN]);
-        for r in [r1, r2, r3, r4] {
-            if !matches!(r, Some(s) if s.success()) {
-                all_ok = false;
-            }
-        }
-    }
-    all_ok
-}
-
-/// iptables NAT REDIRECT 注入（只 TCP，UDP 不支持）—— Android 旧设备 / kernel 阉割时。
-fn install_iptables_redirect(plan: &CapturePlan) -> bool {
-    let mut all_ok = true;
-    for ipt in iptables_binaries() {
-        let _ = run_quiet(ipt, &["-t", "nat", "-N", IPT_CHAIN]);
-        let _ = run_quiet(
-            ipt,
-            &["-t", "nat", "-A", IPT_CHAIN, "-i", "lo", "-j", "RETURN"],
-        );
-        let _ = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "nat",
-                "-A",
-                IPT_CHAIN,
-                "-i",
-                &plan.interface_name,
-                "-j",
-                "RETURN",
-            ],
-        );
-        // UID/GID 排除：owner-match 在 nat 表只对 OUTPUT 链有效。
-        for u in &plan.filters.exclude_uid {
-            let val = u.to_string();
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "nat",
-                    "-A",
-                    "OUTPUT",
-                    "-m",
-                    "owner",
-                    "--uid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        for g in &plan.filters.exclude_gid {
-            let val = g.to_string();
-            let _ = run_quiet(
-                ipt,
-                &[
-                    "-t",
-                    "nat",
-                    "-A",
-                    "OUTPUT",
-                    "-m",
-                    "owner",
-                    "--gid-owner",
-                    &val,
-                    "-j",
-                    "RETURN",
-                ],
-            );
-        }
-        let r = run_quiet(
-            ipt,
-            &[
-                "-t",
-                "nat",
-                "-A",
-                IPT_CHAIN,
-                "-p",
-                "tcp",
-                "-j",
-                "REDIRECT",
-                "--to-ports",
-                IPT_TPROXY_PORT,
-            ],
-        );
-        let r2 = run_quiet(ipt, &["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN]);
-        for x in [r, r2] {
-            if !matches!(x, Some(s) if s.success()) {
-                all_ok = false;
-            }
-        }
-    }
-    all_ok
-}
-
-/// 返回当前可用的 iptables binaries：iptables / ip6tables（v6 可选）。
-fn iptables_binaries() -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if has_tool("iptables") {
-        out.push("iptables");
-    }
-    if has_tool("ip6tables") {
-        out.push("ip6tables");
-    }
-    out
-}
-
-fn revert_auto_redirect(plan: &CapturePlan) {
-    // nft：best-effort 删表
-    let _ = run_quiet("nft", &["delete", "table", "inet", NFT_REDIRECT_TABLE]);
-
-    // iptables 后端 best-effort 卸载（chain 不存在的报错全部静默）
-    for ipt in iptables_binaries() {
-        for table in ["mangle", "nat"] {
-            let _ = run_quiet(ipt, &["-t", table, "-D", "PREROUTING", "-j", IPT_CHAIN]);
-            // NAT 模式下 owner-match 写在 OUTPUT 链 → 也撤掉
-            for u in &plan.filters.exclude_uid {
-                let val = u.to_string();
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "nat",
-                        "-D",
-                        "OUTPUT",
-                        "-m",
-                        "owner",
-                        "--uid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-            for g in &plan.filters.exclude_gid {
-                let val = g.to_string();
-                let _ = run_quiet(
-                    ipt,
-                    &[
-                        "-t",
-                        "nat",
-                        "-D",
-                        "OUTPUT",
-                        "-m",
-                        "owner",
-                        "--gid-owner",
-                        &val,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-            let _ = run_quiet(ipt, &["-t", table, "-F", IPT_CHAIN]);
-            let _ = run_quiet(ipt, &["-t", table, "-X", IPT_CHAIN]);
-        }
-    }
-
-    // ip rule 撤销
-    if ip_rule_supported() {
-        let table_s = plan.iproute2_table_index.to_string();
-        let mark_s = format!("{:#x}", plan.auto_redirect_marks.input.unwrap_or(0x2023));
-        for fam in ["", "-6"] {
-            let _ = run_ip_quiet(fam, &["rule", "del", "fwmark", &mark_s, "lookup", &table_s]);
-        }
-        if let Some(fb) = plan.auto_redirect_marks.fallback_rule_index {
-            let prio_s = fb.to_string();
-            for fam in ["", "-6"] {
-                let _ = run_ip_quiet(fam, &["rule", "del", "priority", &prio_s]);
-            }
-        }
     }
 }
 
@@ -2193,7 +1846,7 @@ fn prepare_tproxy_start<L>(
     Ok(listeners)
 }
 
-async fn stop_tproxy_listener_tasks(stops: &mut Vec<oneshot::Sender<()>>, tasks: &mut JoinSet<()>) {
+async fn stop_listener_tasks(stops: &mut Vec<oneshot::Sender<()>>, tasks: &mut JoinSet<()>) {
     // Signal every address-family/protocol listener before awaiting any one of
     // them. If this future is cancelled while joining, JoinSet::drop aborts all
     // remaining tasks and the caller's rule cleanup guard removes the routes.
@@ -2202,7 +1855,7 @@ async fn stop_tproxy_listener_tasks(stops: &mut Vec<oneshot::Sender<()>>, tasks:
     }
     while let Some(joined) = tasks.join_next().await {
         if let Err(error) = joined {
-            warn!(target: "capture::tproxy", %error, "tproxy listener task join failed");
+            warn!(target: "capture", %error, "transparent listener task join failed");
         }
     }
 }
@@ -2318,7 +1971,7 @@ impl CaptureEngine for LinuxTproxy {
         let mut listener_tasks = g.listener_tasks.take().unwrap_or_else(JoinSet::new);
         let mut listener_stops = std::mem::take(&mut g.listener_stops);
         g.on = false;
-        stop_tproxy_listener_tasks(&mut listener_stops, &mut listener_tasks).await;
+        stop_listener_tasks(&mut listener_stops, &mut listener_tasks).await;
         Self::revert_rules(&self.plan);
         rule_cleanup.armed = false;
         info!(target: "capture", "linux tproxy stopped");

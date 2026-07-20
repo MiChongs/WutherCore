@@ -956,10 +956,136 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
 }
 
 fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
+    validate_capture_platform_for_os(c, std::env::consts::OS)
+}
+
+fn validate_capture_platform_for_os(c: &Capture, os: &str) -> ConfigResult<()> {
     if !c.on {
         return Ok(());
     }
-    let os = std::env::consts::OS;
+    validate_capture_literals(c)?;
+
+    if c.tun.auto_redirect {
+        if !c.tun.auto_route {
+            return Err(
+                ConfigError::invalid("capture.tun.auto_redirect 依赖 auto_route")
+                    .hint("启用 capture.tun.auto_route，或关闭 auto_redirect"),
+            );
+        }
+        if c.method != CaptureMethod::VirtualNic {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 只属于 TUN 数据面，要求 capture.method=virtual_nic",
+            )
+            .hint("独立 TPROXY/REDIRECT 是不同入口；不要用 auto_redirect 替代"));
+        }
+        if os != "linux" {
+            return Err(
+                ConfigError::new(crate::error::ConfigErrorKind::UnsupportedPlatform(format!(
+                    "capture.tun.auto_redirect 当前仅支持 root-managed Linux；当前平台为 {os}"
+                )))
+                .hint("关闭 auto_redirect；Android root/VpnService 数据面将在独立能力中实现"),
+            );
+        }
+        if c.traffic != CaptureTraffic::System {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 当前只支持 traffic=system 的本机 TCP/UDP 数据面",
+            )
+            .hint("LAN/Apps 需要独立的全协议 policy-routing 过滤能力，不能仅靠 NAT return"));
+        }
+        if c.tun.strict_route {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 当前不支持 strict_route",
+            )
+            .hint("当前不为 ICMP/非 TCP-UDP 协议安装导流 rule，它们按已有主路由策略处理；启用 strict_route 会产生虚假的防泄漏承诺"));
+        }
+        if !c.tun.route_address_set.is_empty() || !c.tun.route_exclude_address_set.is_empty() {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不能安全同步 route_address_set/route_exclude_address_set 的动态 IP 快照",
+            )
+            .hint("关闭 auto_redirect 可继续由 TUN 路由层使用动态规则集；内核 nft set 同步完成前禁止静默忽略"));
+        }
+        if c.tun.auto_redirect_nfqueue.is_some() {
+            return Err(ConfigError::invalid(
+                "auto_redirect_nfqueue 需要配套 NFQUEUE 用户态消费者，当前数据面未启用该能力",
+            )
+            .hint("删除 auto_redirect_nfqueue；TCP REDIRECT 与 UDP TUN 数据面不依赖 NFQUEUE"));
+        }
+        if c.tun.auto_redirect_input_mark.is_some()
+            || c.tun.auto_redirect_reset_mark.is_some()
+            || c.tun.auto_redirect_iproute2_fallback_rule_index.is_some()
+        {
+            return Err(ConfigError::invalid(
+                "显式 auto_redirect input/reset/fallback 配置属于 NFQUEUE/mark 数据面，当前 TCP REDIRECT 后端不会消费",
+            )
+            .hint("删除这些保留字段；auto_redirect_output_mark 已完整用于 outbound 绕行"));
+        }
+        if c.tun.exclude_mptcp {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不支持 exclude_mptcp 的全协议旁路语义",
+            ));
+        }
+        if !c.exclude.process.is_empty() {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不支持按进程名做内核级全协议旁路",
+            ));
+        }
+        let has_interface_filters =
+            !c.tun.include_interface.is_empty() || !c.tun.exclude_interface.is_empty();
+        let has_mac_filters =
+            !c.tun.include_mac_address.is_empty() || !c.tun.exclude_mac_address.is_empty();
+        if has_interface_filters || has_mac_filters {
+            return Err(ConfigError::invalid(
+                "traffic=system auto_redirect 暂不支持 interface/MAC 过滤",
+            )
+            .hint("NAT 链 return 不能撤销 auto_route，禁止把 TCP 快路径过滤误当成全协议旁路"));
+        }
+        let has_identity_filters = !c.tun.include_uid.is_empty()
+            || !c.tun.include_uid_range.is_empty()
+            || !c.tun.exclude_uid.is_empty()
+            || !c.tun.exclude_uid_range.is_empty()
+            || !c.tun.include_gid.is_empty()
+            || !c.tun.include_gid_range.is_empty()
+            || !c.tun.exclude_gid.is_empty()
+            || !c.tun.exclude_gid_range.is_empty()
+            || !c.tun.include_android_user.is_empty()
+            || !c.tun.include_package.is_empty()
+            || !c.tun.exclude_package.is_empty();
+        if has_identity_filters {
+            return Err(ConfigError::invalid(
+                "auto_redirect 身份过滤尚未具备双栈、可回滚的 policy-routing 事务",
+            )
+            .hint("删除 UID/GID/Android user/package 过滤；该能力会以独立提交补全"));
+        }
+        let rule_index = if c.tun.iproute2_rule_index == 0 {
+            9000
+        } else {
+            c.tun.iproute2_rule_index
+        };
+        if rule_index < 4 {
+            return Err(ConfigError::invalid(
+                "auto_redirect iproute2_rule_index 必须至少为 4，才能保留 TUN 子网和 bypass 优先级",
+            ));
+        }
+        if rule_index > MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX {
+            return Err(ConfigError::invalid(format!(
+                "auto_redirect iproute2_rule_index={rule_index} 必须小于 Linux main rule 优先级 32766"
+            ))
+            .hint("使用 4..=32765 的空闲优先级，例如默认值 9000"));
+        }
+        let table_index = if c.tun.iproute2_table_index == 0 {
+            2022
+        } else {
+            c.tun.iproute2_table_index
+        };
+        if matches!(table_index, 253..=255) {
+            return Err(ConfigError::invalid(format!(
+                "auto_redirect iproute2_table_index={table_index} 是 Linux 保留路由表，不能作为 TUN 私有表"
+            ))
+            .hint("使用独立的自定义表号，例如默认值 2022"));
+        }
+        validate_auto_redirect_marks(&c.tun)?;
+    }
+
     let ok = match c.method {
         CaptureMethod::Auto | CaptureMethod::VirtualNic => true,
         CaptureMethod::Tproxy | CaptureMethod::Redirect => os == "linux" || os == "android",
@@ -976,6 +1102,93 @@ fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_capture_literals(c: &Capture) -> ConfigResult<()> {
+    fn cidrs(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            value.parse::<ipnet::IpNet>().map_err(|_| {
+                ConfigError::invalid(format!("{field}[{index}] 不是合法的 CIDR: {value}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn addresses(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            if value.parse::<ipnet::Ipv4Net>().is_err() && value.parse::<ipnet::Ipv6Net>().is_err()
+            {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 不是合法的 IPv4/IPv6 CIDR: {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ips(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            value.parse::<std::net::IpAddr>().map_err(|_| {
+                ConfigError::invalid(format!("{field}[{index}] 不是合法的 IP 地址: {value}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn ranges(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            let valid = value
+                .split_once(':')
+                .and_then(|(start, end)| {
+                    Some((start.parse::<u32>().ok()?, end.parse::<u32>().ok()?))
+                })
+                .is_some_and(|(start, end)| start <= end);
+            if !valid {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 必须是 start:end 闭区间且 start <= end: {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    cidrs("capture.exclude.cidr", &c.exclude.cidr)?;
+    addresses("capture.tun.address", &c.tun.address)?;
+    cidrs("capture.tun.route_address", &c.tun.route_address)?;
+    cidrs(
+        "capture.tun.route_exclude_address",
+        &c.tun.route_exclude_address,
+    )?;
+    ips("capture.tun.loopback_address", &c.tun.loopback_address)?;
+    ranges("capture.tun.include_uid_range", &c.tun.include_uid_range)?;
+    ranges("capture.tun.exclude_uid_range", &c.tun.exclude_uid_range)?;
+    ranges("capture.tun.include_gid_range", &c.tun.include_gid_range)?;
+    ranges("capture.tun.exclude_gid_range", &c.tun.exclude_gid_range)?;
+    Ok(())
+}
+
+fn validate_auto_redirect_marks(tun: &TunInboundOptions) -> ConfigResult<()> {
+    fn parse(name: &str, value: Option<&str>, default: u32) -> ConfigResult<u32> {
+        normalize_auto_redirect_mark(value, default)
+            .ok_or_else(|| ConfigError::invalid(format!("{name} 不是合法的 u32/十六进制 mark")))
+    }
+
+    let _input = parse(
+        "auto_redirect_input_mark",
+        tun.auto_redirect_input_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_INPUT_MARK,
+    )?;
+    let _output = parse(
+        "auto_redirect_output_mark",
+        tun.auto_redirect_output_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
+    )?;
+    let _reset = parse(
+        "auto_redirect_reset_mark",
+        tun.auto_redirect_reset_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_RESET_MARK,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,6 +1198,240 @@ mod tests {
         let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
         apply_defaults(&mut cfg);
         compile(cfg).unwrap()
+    }
+
+    fn auto_redirect_capture() -> Capture {
+        let mut capture = Capture {
+            on: true,
+            method: CaptureMethod::VirtualNic,
+            ..Capture::default()
+        };
+        capture.tun.auto_route = true;
+        capture.tun.auto_redirect = true;
+        capture
+    }
+
+    #[test]
+    fn omitted_tun_and_empty_tun_have_identical_serde_defaults() {
+        let omitted: Capture = serde_yaml::from_str("{}").unwrap();
+        let empty: Capture = serde_yaml::from_str("tun: {}").unwrap();
+
+        assert_eq!(omitted.tun.inet6, empty.tun.inet6);
+        assert_eq!(omitted.tun.auto_route, empty.tun.auto_route);
+        assert_eq!(
+            omitted.tun.iproute2_table_index,
+            empty.tun.iproute2_table_index
+        );
+        assert_eq!(
+            omitted.tun.iproute2_rule_index,
+            empty.tun.iproute2_rule_index
+        );
+        assert_eq!(omitted.tun.udp_timeout, empty.tun.udp_timeout);
+        assert!(omitted.tun.inet6);
+        assert!(omitted.tun.auto_route);
+        assert_eq!(omitted.tun.iproute2_table_index, 2022);
+        assert_eq!(omitted.tun.iproute2_rule_index, 9000);
+        assert_eq!(omitted.tun.udp_timeout, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn auto_redirect_requires_auto_route() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.auto_route = false;
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("依赖 auto_route"));
+    }
+
+    #[test]
+    fn auto_redirect_requires_virtual_nic_data_plane() {
+        let mut capture = auto_redirect_capture();
+        capture.method = CaptureMethod::Tproxy;
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("method=virtual_nic"));
+    }
+
+    #[test]
+    fn auto_redirect_platform_contract_is_explicit() {
+        let capture = auto_redirect_capture();
+
+        validate_capture_platform_for_os(&capture, "linux").unwrap();
+        let android = validate_capture_platform_for_os(&capture, "android").unwrap_err();
+        let error = validate_capture_platform_for_os(&capture, "windows").unwrap_err();
+
+        assert!(android.to_string().contains("root-managed Linux"));
+        assert!(error.to_string().contains("root-managed Linux"));
+    }
+
+    #[test]
+    fn disabled_capture_ignores_dormant_auto_redirect_fields() {
+        let mut capture = auto_redirect_capture();
+        capture.on = false;
+        capture.method = CaptureMethod::Redirect;
+        capture.tun.auto_route = false;
+        capture.tun.auto_redirect_nfqueue = Some(100);
+        capture.tun.auto_redirect_input_mark = Some("not-a-mark".into());
+
+        validate_capture_platform_for_os(&capture, "windows").unwrap();
+    }
+
+    #[test]
+    fn auto_redirect_rejects_dynamic_route_sets_until_kernel_snapshots_exist() {
+        for exclude in [false, true] {
+            let mut capture = auto_redirect_capture();
+            if exclude {
+                capture.tun.route_exclude_address_set = vec!["geoip-private".into()];
+            } else {
+                capture.tun.route_address_set = vec!["geoip-proxy".into()];
+            }
+
+            let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+            assert!(error.to_string().contains("动态 IP 快照"));
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rejects_unowned_nfqueue_configuration() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.auto_redirect_nfqueue = Some(100);
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("NFQUEUE 用户态消费者"));
+    }
+
+    #[test]
+    fn auto_redirect_rejects_unimplemented_cross_protocol_contracts() {
+        let mut lan = auto_redirect_capture();
+        lan.traffic = CaptureTraffic::Lan;
+        assert!(
+            validate_capture_platform_for_os(&lan, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("traffic=system")
+        );
+
+        let mut strict = auto_redirect_capture();
+        strict.tun.strict_route = true;
+        assert!(
+            validate_capture_platform_for_os(&strict, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("strict_route")
+        );
+
+        let mut interface = auto_redirect_capture();
+        interface.tun.exclude_interface = vec!["eth0".into()];
+        assert!(
+            validate_capture_platform_for_os(&interface, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("interface/MAC")
+        );
+
+        let mut identity = auto_redirect_capture();
+        identity.tun.exclude_uid = vec![1000];
+        assert!(
+            validate_capture_platform_for_os(&identity, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("身份过滤")
+        );
+    }
+
+    #[test]
+    fn auto_redirect_rejects_reserved_mark_data_plane_fields() {
+        for field in ["input", "reset", "fallback"] {
+            let mut capture = auto_redirect_capture();
+            match field {
+                "input" => capture.tun.auto_redirect_input_mark = Some("0x2023".into()),
+                "reset" => capture.tun.auto_redirect_reset_mark = Some("0x2025".into()),
+                "fallback" => {
+                    capture.tun.auto_redirect_iproute2_fallback_rule_index = Some(32768);
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                validate_capture_platform_for_os(&capture, "linux")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("保留字段")
+            );
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rejects_linux_reserved_route_tables() {
+        for table in 253..=255 {
+            let mut capture = auto_redirect_capture();
+            capture.tun.iproute2_table_index = table;
+            let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+            assert!(error.to_string().contains("Linux 保留路由表"));
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rule_priority_must_precede_linux_main_rule() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.iproute2_rule_index = MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX;
+        validate_capture_platform_for_os(&capture, "linux").unwrap();
+
+        capture.tun.iproute2_rule_index = MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX + 1;
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+        assert!(error.to_string().contains("main rule 优先级 32766"));
+    }
+
+    #[test]
+    fn active_capture_literals_fail_closed() {
+        let mut invalid_cidr = auto_redirect_capture();
+        invalid_cidr.tun.route_address = vec!["not-a-cidr".into()];
+        assert!(
+            validate_capture_platform_for_os(&invalid_cidr, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("route_address[0]")
+        );
+
+        let mut reversed_range = auto_redirect_capture();
+        reversed_range.tun.include_uid_range = vec!["2000:1000".into()];
+        assert!(
+            validate_capture_platform_for_os(&reversed_range, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("start <= end")
+        );
+    }
+
+    #[test]
+    fn auto_redirect_marks_are_parsed_and_zero_uses_defaults() {
+        let mut invalid = auto_redirect_capture();
+        invalid.tun.auto_redirect_output_mark = Some("0xnot-hex".into());
+        assert!(
+            validate_capture_platform_for_os(&invalid, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("不是合法")
+        );
+
+        let mut zero = auto_redirect_capture();
+        zero.tun.auto_redirect_output_mark = Some("0".into());
+        validate_capture_platform_for_os(&zero, "linux").unwrap();
+        assert_eq!(
+            normalize_auto_redirect_mark(
+                zero.tun.auto_redirect_output_mark.as_deref(),
+                DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+            ),
+            Some(DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+        );
+
+        let mut valid = auto_redirect_capture();
+        valid.tun.auto_redirect_output_mark = Some("50".into());
+        validate_capture_platform_for_os(&valid, "linux").unwrap();
     }
 
     #[test]

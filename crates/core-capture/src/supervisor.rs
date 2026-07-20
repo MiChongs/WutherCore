@@ -100,21 +100,62 @@ enum CleanupStep {
     NetworkListener,
     PurgeTask,
     EventTask,
+    EngineIngress,
     Dispatcher,
     SystemProxy,
     Engine,
+    OutboundFwmark,
     DnsListener,
 }
 
-const CLEANUP_ORDER: [CleanupStep; 7] = [
+const CLEANUP_ORDER: [CleanupStep; 9] = [
     CleanupStep::NetworkListener,
     CleanupStep::PurgeTask,
     CleanupStep::EventTask,
+    CleanupStep::EngineIngress,
     CleanupStep::Dispatcher,
     CleanupStep::SystemProxy,
     CleanupStep::Engine,
+    CleanupStep::OutboundFwmark,
     CleanupStep::DnsListener,
 ];
+
+#[derive(Debug)]
+struct OutboundFwmarkLease {
+    previous: u32,
+    installed: u32,
+}
+
+impl OutboundFwmarkLease {
+    fn install(requested: u32) -> Result<Option<Self>, CaptureError> {
+        if requested == 0 {
+            return Ok(None);
+        }
+        match core_outbound::compare_exchange_outbound_fwmark(0, requested) {
+            Ok(previous) => Ok(Some(Self {
+                previous,
+                installed: requested,
+            })),
+            Err(active) => Err(CaptureError::DeviceFailed(format!(
+                "cannot activate capture outbound fwmark {requested:#x}: \
+                 process-wide fwmark {active:#x} is already owned"
+            ))),
+        }
+    }
+
+    fn release(self) {
+        if let Err(active) =
+            core_outbound::compare_exchange_outbound_fwmark(self.installed, self.previous)
+        {
+            warn!(
+                target: "capture",
+                installed = self.installed,
+                active,
+                "outbound fwmark ownership changed before cleanup; preserving newer value"
+            );
+        }
+    }
+}
 
 #[derive(Default)]
 struct SupervisorResources {
@@ -125,9 +166,16 @@ struct SupervisorResources {
     network_listener_handle: Option<JoinHandle<()>>,
     dispatcher: Option<DispatcherHandles>,
     sys_proxy: Option<SystemProxyGuard>,
+    outbound_fwmark: Option<OutboundFwmarkLease>,
 }
 
 impl SupervisorResources {
+    fn release_outbound_fwmark(&mut self) {
+        if let Some(lease) = self.outbound_fwmark.take() {
+            lease.release();
+        }
+    }
+
     async fn shutdown(
         &mut self,
         engine: Arc<dyn CaptureEngine>,
@@ -148,6 +196,12 @@ impl SupervisorResources {
                     }
                     stop_and_join(self.event_handle.take()).await;
                 }
+                CleanupStep::EngineIngress if stop_engine => {
+                    // Keep the dispatcher alive until kernel/user-space
+                    // ingress has stopped accepting new traffic.
+                    engine.clone().pre_stop().await?;
+                }
+                CleanupStep::EngineIngress => {}
                 CleanupStep::Dispatcher => {
                     if let Some(dispatcher) = self.dispatcher.take() {
                         dispatcher.stop();
@@ -162,6 +216,14 @@ impl SupervisorResources {
                     engine_result = engine.clone().stop().await;
                 }
                 CleanupStep::Engine => {}
+                CleanupStep::OutboundFwmark => {
+                    // Platform rules must be gone before sockets lose their
+                    // loop-prevention mark. Failed cleanup keeps the lease for
+                    // the CleanupFailed retry path.
+                    if engine_result.is_ok() || !stop_engine {
+                        self.release_outbound_fwmark();
+                    }
+                }
                 CleanupStep::DnsListener => {
                     // If platform rollback failed, keep the resolver live while
                     // system DNS may still point at it. A later stop retry
@@ -177,8 +239,7 @@ impl SupervisorResources {
         engine_result
     }
 
-    /// Cancellation fallback for a dropped start/stop future. Async engine
-    /// cleanup is scheduled separately by [`CleanupTransaction::drop`].
+    /// Synchronous fallback when no Tokio runtime can host ordered cleanup.
     fn abort_sync(&mut self) {
         for handle in [
             self.network_listener_handle.take(),
@@ -200,6 +261,12 @@ impl SupervisorResources {
         }
         if let Some(proxy) = self.sys_proxy.take() {
             proxy.revert();
+        }
+        if self.outbound_fwmark.is_some() {
+            warn!(
+                target: "capture",
+                "synchronous abort cannot prove platform rollback; preserving outbound fwmark"
+            );
         }
     }
 }
@@ -303,41 +370,26 @@ impl Drop for CleanupTransaction {
         if !self.armed {
             return;
         }
-        if let Some(resources) = self.resources.as_mut() {
-            resources.abort_sync();
-        }
-        let dns_listeners = self
-            .resources
-            .as_mut()
-            .map(|resources| std::mem::take(&mut resources.dns_listeners))
-            .unwrap_or_default();
-
         let owner = self.owner.clone();
         if self.stop_engine {
             let engine = self.engine.clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let mut resources = self.resources.take().unwrap_or_default();
                 runtime.spawn(async move {
-                    if let Err(error) = engine.stop().await {
+                    if let Err(error) = resources.shutdown(engine, true).await {
                         warn!(
                             target: "capture",
                             %error,
                             "cancelled lifecycle transition: engine rollback failed"
                         );
                         if let Some(owner) = owner.upgrade() {
-                            let recovery = SupervisorResources {
-                                dns_listeners,
-                                ..SupervisorResources::default()
-                            };
                             {
                                 let mut slot = owner.resources.lock();
-                                *slot = Some(recovery);
+                                *slot = Some(resources);
                             }
                             owner.finish_transition(Lifecycle::CleanupFailed);
                         }
                         return;
-                    }
-                    for listener in dns_listeners.into_iter().rev() {
-                        listener.shutdown().await;
                     }
                     if let Some(owner) = owner.upgrade() {
                         owner.finish_transition(Lifecycle::Stopped);
@@ -346,7 +398,21 @@ impl Drop for CleanupTransaction {
                 return;
             }
         }
-        drop(dns_listeners);
+        if self.stop_engine {
+            let mut resources = self.resources.take().unwrap_or_default();
+            resources.abort_sync();
+            if let Some(owner) = owner.upgrade() {
+                {
+                    let mut slot = owner.resources.lock();
+                    *slot = Some(resources);
+                }
+                owner.finish_transition(Lifecycle::CleanupFailed);
+            }
+            return;
+        }
+        if let Some(resources) = self.resources.as_mut() {
+            resources.abort_sync();
+        }
         if let Some(owner) = owner.upgrade() {
             owner.finish_transition(Lifecycle::Stopped);
         }
@@ -578,10 +644,15 @@ impl CaptureSupervisor {
                 transaction.resources_mut().dns_listeners.push(listener);
             }
         }
+        transaction.resources_mut().outbound_fwmark =
+            OutboundFwmarkLease::install(runtime.capture_outbound_fwmark())?;
         transaction.mark_engine_started();
 
         let start_result: Result<(), CaptureError> = async {
-            self.engine.clone().start(tx, runtime.clone()).await?;
+            self.engine
+                .clone()
+                .start(tx.clone(), runtime.clone())
+                .await?;
             if failpoint == StartFailpoint::AfterEngine {
                 return Err(CaptureError::DeviceFailed(
                     "injected supervisor failure after engine start".into(),
@@ -649,6 +720,13 @@ impl CaptureSupervisor {
                 };
                 transaction.resources_mut().dispatcher = Some(handles);
             }
+            // Platform ingress hooks are activated only after the TUN
+            // dispatcher owns packet I/O. This prevents auto-redirect from
+            // accepting traffic into a half-started data plane.
+            self.engine
+                .clone()
+                .post_start(tx.clone(), runtime.clone())
+                .await?;
 
             let pool = self.fake_pool.clone();
             let nat = self.nat.clone();
@@ -1094,9 +1172,11 @@ route:
                 CleanupStep::NetworkListener,
                 CleanupStep::PurgeTask,
                 CleanupStep::EventTask,
+                CleanupStep::EngineIngress,
                 CleanupStep::Dispatcher,
                 CleanupStep::SystemProxy,
                 CleanupStep::Engine,
+                CleanupStep::OutboundFwmark,
                 CleanupStep::DnsListener,
             ]
         );
@@ -1125,11 +1205,14 @@ route:
         assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
         assert!(sup.resources.lock().is_none());
         assert_eq!(engine.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.post_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.pre_stops.load(Ordering::SeqCst), 1);
         assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
 
         sup.start(runtime).await.expect("retry after rollback");
         assert_eq!(sup.lifecycle(), Lifecycle::Running);
         assert_eq!(engine.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.post_starts.load(Ordering::SeqCst), 2);
 
         sup.stop().await.expect("first stop");
         assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
@@ -1139,6 +1222,163 @@ route:
             engine.stops.load(Ordering::SeqCst),
             2,
             "already-stopped engine must not be stopped twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_stop_failure_preserves_cleanup_state_for_retry() {
+        let engine = Arc::new(LifecycleEngine::new(false));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+        sup.start(runtime).await.unwrap();
+        engine.fail_pre_stop_once.store(true, Ordering::SeqCst);
+
+        let error = sup
+            .stop()
+            .await
+            .expect_err("injected pre-stop failure must escape stop");
+        assert!(
+            error
+                .to_string()
+                .contains("injected engine pre-stop failure")
+        );
+        assert_eq!(sup.lifecycle(), Lifecycle::CleanupFailed);
+        assert!(sup.resources.lock().is_some());
+        assert_eq!(engine.pre_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.stops.load(Ordering::SeqCst),
+            0,
+            "engine/TUN teardown must wait until ingress is detached"
+        );
+
+        sup.stop().await.expect("pre-stop retry succeeds");
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+        assert_eq!(engine.pre_stops.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn post_start_failure_rolls_back_engine_and_allows_retry() {
+        let engine = Arc::new(LifecycleEngine::new(false));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime();
+        engine.fail_post_start_once.store(true, Ordering::SeqCst);
+
+        let error = sup
+            .start(runtime.clone())
+            .await
+            .expect_err("injected post-start failure must escape start");
+        assert!(
+            error
+                .to_string()
+                .contains("injected engine post-start failure")
+        );
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert!(sup.resources.lock().is_none());
+        assert_eq!(engine.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.post_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.pre_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.stops.load(Ordering::SeqCst), 1);
+
+        sup.start(runtime).await.expect("retry after rollback");
+        assert_eq!(sup.lifecycle(), Lifecycle::Running);
+        assert_eq!(engine.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.post_starts.load(Ordering::SeqCst), 2);
+        sup.stop().await.expect("clean stop after retry");
+    }
+
+    #[tokio::test]
+    async fn outbound_fwmark_lease_tracks_capture_lifecycle_and_cleanup_retry() {
+        struct ResetFwmark;
+        impl Drop for ResetFwmark {
+            fn drop(&mut self) {
+                core_outbound::set_outbound_fwmark(0);
+            }
+        }
+
+        let _reset = ResetFwmark;
+        core_outbound::set_outbound_fwmark(0);
+        let engine = Arc::new(LifecycleEngine::new(false));
+        let sup = lifecycle_supervisor(engine.clone());
+        let runtime = lifecycle_runtime_with_fwmark();
+        assert_eq!(runtime.capture_outbound_fwmark(), 0x2d0);
+        assert_eq!(
+            core_outbound::outbound_fwmark(),
+            0,
+            "building Runtime must not activate process-wide socket state"
+        );
+
+        sup.start(runtime.clone()).await.expect("capture start");
+        assert_eq!(core_outbound::outbound_fwmark(), 0x2d0);
+
+        engine.fail_pre_stop_once.store(true, Ordering::SeqCst);
+        sup.stop()
+            .await
+            .expect_err("pre-stop failure must retain the active mark");
+        assert_eq!(sup.lifecycle(), Lifecycle::CleanupFailed);
+        assert_eq!(
+            core_outbound::outbound_fwmark(),
+            0x2d0,
+            "platform ingress may still be active after failed pre-stop"
+        );
+        sup.stop().await.expect("cleanup retry");
+        assert_eq!(core_outbound::outbound_fwmark(), 0);
+
+        engine.fail_post_start_once.store(true, Ordering::SeqCst);
+        sup.start(runtime.clone())
+            .await
+            .expect_err("post-start failure must roll back the lease");
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert_eq!(core_outbound::outbound_fwmark(), 0);
+
+        engine.fail_post_start_once.store(true, Ordering::SeqCst);
+        engine.fail_stop_once.store(true, Ordering::SeqCst);
+        sup.start(runtime.clone())
+            .await
+            .expect_err("failed startup rollback must publish CleanupFailed");
+        assert_eq!(sup.lifecycle(), Lifecycle::CleanupFailed);
+        assert_eq!(
+            core_outbound::outbound_fwmark(),
+            0x2d0,
+            "startup rollback failure must retain the mark and cleanup ledger"
+        );
+
+        engine.fail_stop_once.store(true, Ordering::SeqCst);
+        sup.stop()
+            .await
+            .expect_err("caller cleanup retry failure must remain retryable");
+        assert_eq!(sup.lifecycle(), Lifecycle::CleanupFailed);
+        assert_eq!(core_outbound::outbound_fwmark(), 0x2d0);
+        sup.stop().await.expect("later caller cleanup retry");
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert_eq!(core_outbound::outbound_fwmark(), 0);
+
+        sup.start(runtime.clone())
+            .await
+            .expect("ownership restore test");
+        core_outbound::set_outbound_fwmark(0x7788);
+        sup.stop()
+            .await
+            .expect("platform cleanup with newer mark owner");
+        assert_eq!(
+            core_outbound::outbound_fwmark(),
+            0x7788,
+            "lease release must not overwrite a newer process-wide owner"
+        );
+        core_outbound::set_outbound_fwmark(0);
+
+        core_outbound::set_outbound_fwmark(0x55aa);
+        let error = sup
+            .start(runtime)
+            .await
+            .expect_err("a second process-wide fwmark owner must be rejected");
+        assert!(error.to_string().contains("already owned"));
+        assert_eq!(sup.lifecycle(), Lifecycle::Stopped);
+        assert_eq!(
+            core_outbound::outbound_fwmark(),
+            0x55aa,
+            "failed lease acquisition must preserve the existing owner"
         );
     }
 
@@ -1264,7 +1504,11 @@ route:
     struct LifecycleEngine {
         plan: CapturePlan,
         starts: AtomicUsize,
+        post_starts: AtomicUsize,
+        pre_stops: AtomicUsize,
         stops: AtomicUsize,
+        fail_post_start_once: AtomicBool,
+        fail_pre_stop_once: AtomicBool,
         fail_stop_once: AtomicBool,
         block_start_once: AtomicBool,
         entered: Semaphore,
@@ -1280,7 +1524,11 @@ route:
             Self {
                 plan,
                 starts: AtomicUsize::new(0),
+                post_starts: AtomicUsize::new(0),
+                pre_stops: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
+                fail_post_start_once: AtomicBool::new(false),
+                fail_pre_stop_once: AtomicBool::new(false),
                 fail_stop_once: AtomicBool::new(false),
                 block_start_once: AtomicBool::new(block_start_once),
                 entered: Semaphore::new(0),
@@ -1312,6 +1560,30 @@ route:
                     .await
                     .expect("start release semaphore")
                     .forget();
+            }
+            Ok(())
+        }
+
+        async fn post_start(
+            self: Arc<Self>,
+            _events: mpsc::Sender<CaptureEvent>,
+            _runtime: Arc<core_runtime::Runtime>,
+        ) -> Result<(), CaptureError> {
+            self.post_starts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_post_start_once.swap(false, Ordering::SeqCst) {
+                return Err(CaptureError::DeviceFailed(
+                    "injected engine post-start failure".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn pre_stop(self: Arc<Self>) -> Result<(), CaptureError> {
+            self.pre_stops.fetch_add(1, Ordering::SeqCst);
+            if self.fail_pre_stop_once.swap(false, Ordering::SeqCst) {
+                return Err(CaptureError::DeviceFailed(
+                    "injected engine pre-stop failure".into(),
+                ));
             }
             Ok(())
         }
@@ -1385,6 +1657,23 @@ route:
             )
             .unwrap(),
         ))
+    }
+
+    fn lifecycle_runtime_with_fwmark() -> Arc<core_runtime::Runtime> {
+        let mut plan = core_config::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  preset: direct
+"#,
+        )
+        .unwrap();
+        plan.capture.on = true;
+        plan.capture.method = CaptureMethod::Tproxy;
+        Arc::new(core_runtime::Runtime::build(plan))
     }
 
     fn dummy_engine() -> Arc<dyn CaptureEngine> {

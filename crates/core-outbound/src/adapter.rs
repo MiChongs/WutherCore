@@ -248,6 +248,16 @@ pub fn set_outbound_fwmark(mark: u32) {
     OUTBOUND_FWMARK.store(mark, Ordering::Release);
 }
 
+/// Atomically replace the process-wide outbound fwmark when it still equals
+/// `current`.
+///
+/// Capture supervisors use this as a lease boundary: only one running
+/// supervisor may own the non-zero mark, and cleanup must not overwrite a
+/// newer owner.
+pub fn compare_exchange_outbound_fwmark(current: u32, new: u32) -> Result<u32, u32> {
+    OUTBOUND_FWMARK.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+}
+
 pub fn outbound_fwmark() -> u32 {
     OUTBOUND_FWMARK.load(Ordering::Acquire)
 }
