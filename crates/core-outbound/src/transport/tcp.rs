@@ -10,7 +10,7 @@ use crate::{
         BoxedStream, apply_outbound_mark_for_addr, protect_socket, resolve_host,
         resolve_host_for_direct,
     },
-    loopback::TrackedTcpStream,
+    loopback::{LoopbackTcpGuard, TrackedTcpStream, register_tcp},
     transport::Transport,
 };
 
@@ -94,6 +94,17 @@ pub async fn marked_connect(
     addr: std::net::SocketAddr,
     timeout: Duration,
 ) -> std::io::Result<TrackedTcpStream<TcpStream>> {
+    let (stream, guard) = marked_connect_raw(addr, timeout).await?;
+    Ok(TrackedTcpStream::with_guard(stream, guard))
+}
+
+/// 与 [`marked_connect`] 相同地应用 socket 保护、路由标记和接口绑定，
+/// 但把裸 Tokio TCP 流与自抓回环 guard 分开返回。需要接管真实 TCP 类型的
+/// REALITY TLS 引擎使用此入口，并必须把 guard 保留到最终流被丢弃。
+pub async fn marked_connect_raw(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<(TcpStream, LoopbackTcpGuard)> {
     let std_stream =
         tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
             let domain = if addr.is_ipv4() {
@@ -118,5 +129,5 @@ pub async fn marked_connect(
         })??;
     let stream = TcpStream::from_std(std_stream)?;
     let local = stream.local_addr()?;
-    Ok(TrackedTcpStream::new(stream, local))
+    Ok((stream, register_tcp(local)))
 }

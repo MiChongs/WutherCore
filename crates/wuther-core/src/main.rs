@@ -14,7 +14,9 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
+use core_inbound::{
+    MixedListener, RealityListener, ensure_best_effort_privilege, run_mixed, run_reality,
+};
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
@@ -744,6 +746,21 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         info!(addr = %addr, udp = mixed.udp, "mixed inbound: HTTP+SOCKS5 ready");
     } else {
         info!("listen.local 未配置，跳过 Mixed 入站");
+    }
+
+    // REALITY 入站。构造阶段会再次做密钥与资源上限的防御性校验；监听
+    // future 直接持有真实 RealityServer，不存在普通 TLS 或占位回退路径。
+    for config in &plan.listen.reality {
+        let listener = RealityListener::from_config(config)
+            .map_err(|error| anyhow::anyhow!("REALITY listener configuration failed: {error}"))?;
+        let address = listener.listen_addr();
+        let rt = runtime.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(error) = run_reality(listener, rt).await {
+                warn!(target: "inbound::reality", %address, %error, "REALITY listener exited");
+            }
+        }));
+        info!(addr = %address, "VLESS-over-REALITY inbound ready");
     }
 
     // 控制面板/API
