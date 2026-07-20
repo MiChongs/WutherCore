@@ -1400,10 +1400,14 @@ mod tests {
     const TEST_CERT_DER: &str = "MIICyDCCAbCgAwIBAgIIE4OkdZFerRcwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAxMJbG9jYWxob3N0MB4XDTI2MDcxOTEzNTk0NloXDTMxMDcyMDEzNTk0NlowFDESMBAGA1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvC1XdP7r3Hd6bjNUOhswhLY6sf+PXhOSwrjheoRbWWDi+B6Upgfhg1UTDGaA4mfxVYKAkmfsatYM6Z6oJrCIMFzoW22J+S9VJ1v9a+El3z87ZAj+C0Q+YCDwRoOEJqVtO4yRTn+sOdhUYixw0HKiGS9rPD+1OxnGIYfjtJPszA2sEpkt2slab0OSAFiacyGbJLFDVMgFvlPR1585gj7te6Blh5YXVoh/0HwXE8dnynVqDrR4C+H8N+vpgiAj6rW8eEAvbW+/xdnMT5TMfy2FWiTJVRxOI6RHimOF0l2CymGJlzrMkI6afHzaMg+vEp+XA6sqXPbGXH/NW495f6xKwQIDAQABox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDQYJKoZIhvcNAQELBQADggEBACMgC4wpjpRmG32ClVPjrQJ+vr/Ngt1ZEK1e5r8qrLhlWXfUwjHwfsCNFH0ZtEIXWQy36gYV2rMiRKMulIgNH79bobEj55AxgeUSG8EeJuCD8BlR3BG2UyxO3Qb5Jj4QaoEO9HgasOQFN+aG2SlEEVt3k0lH+fuui+Sxt62dm9eEMYip/bSJHOjHaPWSm5EgzQN0bF5lP8JKJRMqF0037xdY3n8RKcy/OnyYBoYAocTKdDFO76s8BvOo4eWQqSMDxI+Re2BPO7d5i5AYWTEWd8yEBInOn4co7eYvWKpkZlnG8c1L4MAzbIvcUJ1UTjcAa2iocfjIbOh0f/alGBfSuoE=";
     const TEST_KEY_DER: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC8LVd0/uvcd3puM1Q6GzCEtjqx/49eE5LCuOF6hFtZYOL4HpSmB+GDVRMMZoDiZ/FVgoCSZ+xq1gzpnqgmsIgwXOhbbYn5L1UnW/1r4SXfPztkCP4LRD5gIPBGg4QmpW07jJFOf6w52FRiLHDQcqIZL2s8P7U7GcYhh+O0k+zMDawSmS3ayVpvQ5IAWJpzIZsksUNUyAW+U9HXnzmCPu17oGWHlhdWiH/QfBcTx2fKdWoOtHgL4fw36+mCICPqtbx4QC9tb7/F2cxPlMx/LYVaJMlVHE4jpEeKY4XSXYLKYYmXOsyQjpp8fNoyD68Sn5cDqypc9sZcf81bj3l/rErBAgMBAAECggEACqcOcmMT+xEQbzicpgVwA7NFM1piRVMaVcedjA/+E9s2PhGNHLEJhSPFxkfvN+HmeY6/tIoJiiq/5GHE5xvLOeGojbRvwRl62pWMjRTbzf2IYStZJk4gsdRrhbJgQsfOnTZh622y1Dt4223knQhAQOi8S1bX7ZaR7sgAjfJpz0tF3QsN55Iy3LA1GHmC5mJvFveTWPqVFQQJLqBG/KP+AGpifLUhm2wzjcUAXsfOS3v9Y2Vm60howcrX3EUAevJbmDOgkJ4h5auOANXU5AHlfS7ZwUJdrJh/SEhPc+2acxpkR2imulKWD+iwAlVeOKVIcB0/oGRfqppjStCj3D14WQKBgQDzTD7I5dc8KZQgpGtCiHj4w9c/+y8oyGvvENxdeMqyXKFp7PcGDD7CARIyhQWSPpGHiwCMCmUoPCZa2sFyFM85j+YxDA3rpa89e+4Q0wDvqALs6Lnm/89ceGh2nzzWaQwy27/ix7nMztjZLtKZrVblq6WO0Jl551mCbiAUUZ3FywKBgQDGAGPZ8TZmqfECobdJ2ObpN2dyZ/RbQ2M/vxH2m89ofyi8dczdFf9KBpPWOFqILKWVjMGzYFf6VcdgEbZqE4fwuKfGm/x/RBXhMGb+VxvIaEakzLQs+S0cssj7T3vebWt2WW6fDm7tzKPfIYE4T2AUMoGN6RqjVWeTksUwIAbAIwKBgF/sjMiKjhzjS8q+6Kc3xXJXTJOmRkavFpcQL8IOsOQ3z1BDJHXW+BtnbrRKbBLn5lrpfBK6un1tkbW6kBCZkcZhLOHjnc1t6rS0Gv25I6JZvKWJcFpaO3h65Lz4NXVXv36B05rnIiNU3nxqkJAUnrE4xrKTHh/JDip1nuJD94+XAoGAXbWHjHld3t7lQvKYlanDN3NSUVIj0yGkkmHytX1ufy1XcUJrb+NeTIGqbEOFjVdcEthoQGYDnWYFk1EuvSt7NhGezh+7M9xcYpSO2icN7h5z+MEtMO/JSwDOoCoxHMc6ieuvsDWbiI5GrG7mAmmGtmhk6m39fnoIKE7ZZnpx13MCgYEAljo6HLd+2UOp9mv10Kq8j5kZdC6eG7yCHe+PomTccwaW3D+DXP4NsTF9A9vwWkI40hcxtMWSVyfTq6jLQxtFsuaUf4YSs26U8jbLVTo5vR3OE4RsCs401c3PFLzAXf1MYRdHHdKICxXk6OC2+WIoxL0LGokwmG2BMOnh/v7LsNA=";
 
+    fn random_test_password() -> String {
+        Uuid::new_v4().to_string()
+    }
+
     #[test]
     fn tuic_construct() {
         let u = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
-        let password = Uuid::new_v4().to_string();
+        let password = random_test_password();
         let mut ob = TuicOutbound::new("t", "1.2.3.4", 443, u, &password);
         assert_eq!(ob.protocol(), "tuic");
         assert_eq!(ob.uuid, u);
@@ -1645,7 +1649,8 @@ mod tests {
         let endpoint = test_server_endpoint();
         let server_addr = endpoint.local_addr().unwrap();
         let uuid = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
-        let password = "connection-bound secret";
+        let password = random_test_password();
+        let server_password = password.clone();
         let request = (0..4096)
             .map(|value| (value % 251) as u8)
             .collect::<Vec<_>>();
@@ -1664,7 +1669,11 @@ mod tests {
             assert_eq!(&auth[2..18], uuid.as_bytes());
             let mut expected_token = [0u8; 32];
             connection
-                .export_keying_material(&mut expected_token, uuid.as_bytes(), password.as_bytes())
+                .export_keying_material(
+                    &mut expected_token,
+                    uuid.as_bytes(),
+                    server_password.as_bytes(),
+                )
                 .unwrap();
             assert_eq!(&auth[18..], &expected_token);
 
@@ -1692,8 +1701,13 @@ mod tests {
             );
         });
 
-        let mut outbound =
-            TuicOutbound::new("test", "127.0.0.1", server_addr.port(), uuid, password);
+        let mut outbound = TuicOutbound::new(
+            "test",
+            "127.0.0.1",
+            server_addr.port(),
+            uuid,
+            password.as_str(),
+        );
         outbound.insecure = true;
         outbound.udp_relay_mode = mode;
         outbound.heartbeat_interval = Duration::from_secs(60);
@@ -1858,8 +1872,14 @@ mod tests {
                 assert_eq!(&dissociate[..2], &[TUIC_VERSION, CMD_DISSOCIATE]);
             });
 
-            let mut outbound =
-                TuicOutbound::new("test", "127.0.0.1", server_addr.port(), uuid, "secret");
+            let password = random_test_password();
+            let mut outbound = TuicOutbound::new(
+                "test",
+                "127.0.0.1",
+                server_addr.port(),
+                uuid,
+                password.as_str(),
+            );
             outbound.insecure = true;
             outbound.heartbeat_interval = Duration::from_secs(60);
             let session = outbound.ensure_session().await.unwrap();
@@ -1913,8 +1933,14 @@ mod tests {
                 connection.closed().await;
             });
 
-            let mut outbound =
-                TuicOutbound::new("test", "127.0.0.1", server_addr.port(), uuid, "secret");
+            let password = random_test_password();
+            let mut outbound = TuicOutbound::new(
+                "test",
+                "127.0.0.1",
+                server_addr.port(),
+                uuid,
+                password.as_str(),
+            );
             outbound.insecure = true;
             outbound.heartbeat_interval = Duration::from_secs(60);
             let session = outbound.ensure_session().await.unwrap();
@@ -1966,8 +1992,14 @@ mod tests {
                 connection.closed().await;
             });
 
-            let mut outbound =
-                TuicOutbound::new("test", "127.0.0.1", server_addr.port(), uuid, "secret");
+            let password = random_test_password();
+            let mut outbound = TuicOutbound::new(
+                "test",
+                "127.0.0.1",
+                server_addr.port(),
+                uuid,
+                password.as_str(),
+            );
             outbound.insecure = true;
             let session = outbound.ensure_session().await.unwrap();
             ready_rx.await.unwrap();

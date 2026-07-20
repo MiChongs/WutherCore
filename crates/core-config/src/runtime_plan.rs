@@ -156,7 +156,7 @@ pub enum RouteAction {
 
 /* ---------------- compile ---------------- */
 
-/// 用户配置 -> RuntimePlan。要求 [`apply_defaults`] 已执行。
+/// 用户配置 -> RuntimePlan。要求 [`crate::profile::apply_defaults`] 已执行。
 pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     let listen = compile_listen(&cfg)?;
     let feeds = compile_feeds(&cfg.feeds);
