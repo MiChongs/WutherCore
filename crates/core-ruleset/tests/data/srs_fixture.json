@@ -1,0 +1,64 @@
+{
+  "version": 5,
+  "rules": [
+    {
+      "type": "logical",
+      "mode": "and",
+      "rules": [
+        {
+          "type": "logical",
+          "mode": "or",
+          "rules": [
+            {
+              "domain_suffix": [
+                ".suffix.example",
+                "root.example"
+              ]
+            },
+            {
+              "domain": [
+                "exact.example",
+                "blocked.example"
+              ]
+            }
+          ]
+        },
+        {
+          "source_ip_cidr": [
+            "10.0.0.0/8"
+          ],
+          "source_port_range": [
+            "1000:2000"
+          ]
+        },
+        {
+          "ip_cidr": [
+            "192.0.2.0/24"
+          ],
+          "port": [
+            443
+          ],
+          "network": [
+            "tcp"
+          ],
+          "process_name": [
+            "Curl"
+          ]
+        },
+        {
+          "type": "logical",
+          "mode": "and",
+          "rules": [
+            {
+              "domain": "blocked.example"
+            },
+            {
+              "network": "tcp"
+            }
+          ],
+          "invert": true
+        }
+      ]
+    }
+  ]
+}

@@ -598,6 +598,7 @@ mod tests {
             src_port: Some(12345),
             network: Some("TCP"),
             process_name: Some("Curl"),
+            ..Default::default()
         };
         assert!(matcher.matches_context(&ctx));
         let wrong_process_case = RulesetMatchContext {

@@ -8,7 +8,7 @@
 //! | **TXT / LIST**（每行一条 mihomo 规则） | mihomo / Clash | ✅ 完整 |
 //! | **JSON**（`{"version":N, "rules":[...]}`） | sing-box | ✅ v1–v5 语义保持；暂不能求值的官方字段显式报错 |
 //! | **MRS**（mihomo binary v1） | mihomo | ✅ 完整：zstd + succinct domain trie + ipcidr range list |
-//! | **SRS**（sing-box binary） | sing-box | ⚠️ 仅做 magic 嗅探 + 友好错误（结构与 MRS 不同，未实现） |
+//! | **SRS**（sing-box binary v1–v5） | sing-box | ✅ 全部官方字段；有界 zlib + compact domain/IP set + logical 语义保持 |
 //! | **inline payload**（YAML 内联 list） | WutherCore 自定义 | ✅ |
 //!
 //! ## 支持的规则类型（与 mihomo 对齐）
@@ -43,7 +43,10 @@ pub mod spec;
 
 pub use fetch::{FetchError, fetch_ruleset};
 pub use format::{RulesetFormat, detect_format};
-pub use ir::{PortRange, RulesetExpr, RulesetMatchContext, RulesetPredicate, RulesetProgram};
+pub use ir::{
+    PortRange, RulesetExpr, RulesetInterfaceAddress, RulesetMatchContext, RulesetPredicate,
+    RulesetProgram,
+};
 pub use manager::{RulesetManager, RulesetSink, RulesetUpdate};
 pub use matcher::{ClassicalEntry, RulesetIndex, RulesetMatcher};
 pub use parser::{ParseError, RulesetCompiled, parse_ruleset, parse_ruleset_compiled};

@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "rules": [
+    {
+      "network_type": ["wifi", "cellular"],
+      "network_is_expensive": true,
+      "network_is_constrained": true
+    }
+  ]
+}

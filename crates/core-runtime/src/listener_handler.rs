@@ -13,7 +13,7 @@ use std::{
 
 use compact_str::ToCompactString;
 use core_observe::{ConnectionGuard, ConnectionMeta, copy_bidirectional_tracked};
-use core_route::{FlowContext, L7Proto, NetworkKind};
+use core_route::{FlowContext, FlowRulesetMetadata, L7Proto, NetworkKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{info, warn};
 
@@ -195,12 +195,23 @@ impl InboundMetadata {
     pub fn flow_context(&self) -> FlowContext {
         let host = self.route_host();
         let ip = self.route_ip.or_else(|| host.parse::<IpAddr>().ok());
+        #[cfg(target_os = "android")]
+        let package_names = self.process.iter().cloned().collect();
+        #[cfg(not(target_os = "android"))]
+        let package_names = Vec::new();
         FlowContext {
             host,
             ip,
             port: self.destination_port,
             network: self.network,
             process: self.process.clone(),
+            ruleset: FlowRulesetMetadata {
+                source_ip: Some(self.source.ip()),
+                source_port: Some(self.source.port()),
+                process_path: self.process_path.clone(),
+                package_names,
+                ..FlowRulesetMetadata::default()
+            },
             protocol: self.protocol.clone(),
         }
     }
@@ -601,4 +612,32 @@ fn destination_ip(metadata: &InboundMetadata) -> compact_str::CompactString {
         .or_else(|| metadata.host.parse::<IpAddr>().ok())
         .map(|ip| ip.to_compact_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbound_metadata_populates_available_ruleset_fields() {
+        let source: SocketAddr = "192.0.2.9:53000".parse().unwrap();
+        let inbound: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let metadata = InboundMetadata::tcp("mixed", "socks5", source, inbound, "example.com", 443)
+            .with_process(
+                Some("com.example.client".into()),
+                Some("/usr/bin/example-client".into()),
+            );
+
+        let flow = metadata.flow_context();
+        assert_eq!(flow.ruleset.source_ip, Some(source.ip()));
+        assert_eq!(flow.ruleset.source_port, Some(source.port()));
+        assert_eq!(
+            flow.ruleset.process_path.as_deref(),
+            Some("/usr/bin/example-client")
+        );
+        #[cfg(target_os = "android")]
+        assert_eq!(flow.ruleset.package_names, ["com.example.client"]);
+        #[cfg(not(target_os = "android"))]
+        assert!(flow.ruleset.package_names.is_empty());
+    }
 }

@@ -11,5 +11,5 @@ pub mod builtin;
 pub mod engine;
 pub mod sniff;
 
-pub use engine::{FlowContext, NetworkKind, RouteDecision, RouteEngine};
+pub use engine::{FlowContext, FlowRulesetMetadata, NetworkKind, RouteDecision, RouteEngine};
 pub use sniff::{L7Proto, proto_name_matches, sniff_tcp, sniff_udp};

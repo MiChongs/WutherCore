@@ -233,6 +233,7 @@ async fn route_check(
         port,
         network,
         process: None,
+        ruleset: Default::default(),
         protocol: None,
     };
     let (decision, kind, src) = s.runtime.route.decide(&ctx);

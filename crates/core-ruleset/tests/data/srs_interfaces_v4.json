@@ -1,0 +1,20 @@
+{
+  "version": 4,
+  "rules": [
+    {
+      "network_interface_address": {
+        "wifi": [
+          "192.168.50.0/24",
+          "2001:db8:50::/64"
+        ],
+        "ethernet": [
+          "10.20.0.0/16"
+        ]
+      },
+      "default_interface_address": [
+        "192.168.1.0/24",
+        "2001:db8:1::/64"
+      ]
+    }
+  ]
+}

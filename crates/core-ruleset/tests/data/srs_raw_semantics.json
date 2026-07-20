@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "domain": ["Case.Example"]
+    },
+    {
+      "domain": ["trailing.example."]
+    },
+    {
+      "domain": ["例子.测试"]
+    },
+    {
+      "domain_keyword": ["KEY"]
+    },
+    {
+      "domain_regex": ["^API\\."]
+    },
+    {
+      "network": ["TCP"]
+    },
+    {
+      "process_name": [" Name "]
+    }
+  ]
+}
