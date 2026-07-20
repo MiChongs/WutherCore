@@ -10,7 +10,7 @@
 //!
 //! ## virtio_net_hdr + GSO/GRO 完整路径
 //!
-//! `IFF_VNET_HDR` 开启后，每个 read/write 都带 10 字节 [`virtio_net_hdr`] 前缀。
+//! `IFF_VNET_HDR` 开启后，每个 read/write 都带 10 字节 `virtio_net_hdr` 前缀。
 //! `offload=true` 时还会调 `TUNSETOFFLOAD` 启用 `TUN_F_CSUM | TSO4|TSO6 | USO4|USO6`，
 //! 让内核与用户态都能在大段（最大 64KiB）粒度上做 TCP/UDP 分片：
 //! - **读路径**：kernel 投递大段 vnet_hdr+IP，[`process_vnet_segment`] 解析后按
