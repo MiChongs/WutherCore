@@ -27,10 +27,14 @@
 //! 避免 TUN 抢了默认路由后再探拿到自己 → 自循环。
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
+use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -42,6 +46,11 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 static MONITOR: once_cell::sync::Lazy<NetworkMonitor> =
     once_cell::sync::Lazy::new(NetworkMonitor::new);
+static WATCHER_EXCLUDE: OnceCell<SharedExcludeList> = OnceCell::new();
+
+/// The OS/poll watcher is process-global. Restarts update the exclusion list
+/// used by the existing tasks instead of spawning another watcher pair.
+pub(crate) type SharedExcludeList = Arc<RwLock<ExcludeList>>;
 
 pub struct NetworkMonitor {
     generation: AtomicU64,
@@ -180,11 +189,14 @@ pub fn notify_network_changed_full(snapshot: DefaultInterface) {
 /// `exclude` 通常由 supervisor 传入：至少包含 plan.interface_name；
 /// [`ExcludeList::from_plan_iface`] 会再叠加常见 TUN 前缀。
 pub fn start_watcher(exclude: ExcludeList) {
+    let (exclude, is_new) = register_watcher_exclude(&WATCHER_EXCLUDE, exclude);
+
     // 同步跑一次初值 + 写全局态 —— 必须在 spawn watcher 任务之前，
     // 否则 supervisor.start() 返回后 DNS socket 工厂可能立刻被调用，但
     // outbound_interface_index 还是 None，IP_UNICAST_IF 无效，DNS 包反进
     // TUN 自循环。这里同步落盘一次能把这个窗口压到 0。
-    let initial = probe(&exclude);
+    let initial_exclude = exclude.read().clone();
+    let initial = probe(&initial_exclude);
     if !initial.is_empty() {
         info!(
             target: "capture::net_monitor",
@@ -201,11 +213,37 @@ pub fn start_watcher(exclude: ExcludeList) {
              watcher 会在网络变化时补齐，但启动这段时间内部组件 (DNS 等) 可能落 TUN"
         );
     }
+    if !is_new {
+        info!(
+            target: "capture::net_monitor",
+            "default-interface watcher already active; exclusion list updated"
+        );
+        return;
+    }
+
     crate::net_monitor_event::start(exclude.clone());
     tokio::spawn(poll_watcher(exclude));
 }
 
-async fn poll_watcher(exclude: ExcludeList) {
+fn register_watcher_exclude(
+    cell: &OnceCell<SharedExcludeList>,
+    exclude: ExcludeList,
+) -> (SharedExcludeList, bool) {
+    let candidate = Arc::new(RwLock::new(exclude));
+    match cell.set(candidate.clone()) {
+        Ok(()) => (candidate, true),
+        Err(candidate) => {
+            let established = cell
+                .get()
+                .expect("OnceCell must contain the winning watcher exclusion")
+                .clone();
+            *established.write() = candidate.read().clone();
+            (established, false)
+        }
+    }
+}
+
+async fn poll_watcher(exclude: SharedExcludeList) {
     info!(
         target: "capture::net_monitor",
         interval_ms = POLL_INTERVAL.as_millis() as u64,
@@ -216,7 +254,8 @@ async fn poll_watcher(exclude: ExcludeList) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let cur = probe(&exclude);
+        let current_exclude = exclude.read().clone();
+        let cur = probe(&current_exclude);
         global().submit(cur);
     }
 }
@@ -262,5 +301,22 @@ mod tests {
         assert_eq!(evt.generation, 1);
         assert_eq!(evt.new_interface(), Some("eth0"));
         assert_eq!(evt.interface.v4_index, Some(3));
+    }
+
+    #[test]
+    fn watcher_registration_is_singleton_and_updates_exclude() {
+        let cell = OnceCell::new();
+        let first_exclude = ExcludeList::from_plan_iface("tun-first");
+        let (first, first_started) = register_watcher_exclude(&cell, first_exclude);
+        assert!(first_started);
+
+        let second_exclude = ExcludeList::from_plan_iface("tun-second");
+        let (second, second_started) = register_watcher_exclude(&cell, second_exclude);
+        assert!(!second_started);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let current = first.read();
+        assert!(!current.names.contains("tun-first"));
+        assert!(current.names.contains("tun-second"));
     }
 }

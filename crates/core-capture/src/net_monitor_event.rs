@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use crate::{default_iface::ExcludeList, net_monitor::global};
+use crate::net_monitor::{SharedExcludeList, global};
 
 /// 100ms 去抖 —— 网络切换时一波路由 / 接口事件风暴（add / del / link up /
 /// link down 等），合并成一次 probe。
@@ -32,7 +32,7 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// 启动当前平台的事件驱动 watcher。失败 / 不支持时不报错，调用方可继续依赖
 /// polling 兜底。
-pub fn start(exclude: ExcludeList) {
+pub fn start(exclude: SharedExcludeList) {
     #[cfg(target_os = "windows")]
     {
         windows_impl::start(exclude);
@@ -77,7 +77,7 @@ mod windows_impl {
 
     use super::*;
 
-    pub fn start(exclude: ExcludeList) {
+    pub fn start(exclude: SharedExcludeList) {
         let notify = Arc::new(Notify::new());
         // Box::into_raw 拿到 'static 指针；进程生命周期持有，不显式 cancel。
         let ctx_ptr = Box::into_raw(Box::new(notify.clone())) as *const c_void;
@@ -161,7 +161,7 @@ mod linux_impl {
 
     use super::*;
 
-    pub fn start(exclude: ExcludeList) {
+    pub fn start(exclude: SharedExcludeList) {
         let notify = Arc::new(Notify::new());
         match open_netlink_socket() {
             Ok(fd) => {
@@ -265,7 +265,7 @@ mod darwin_impl {
 
     use super::*;
 
-    pub fn start(exclude: ExcludeList) {
+    pub fn start(exclude: SharedExcludeList) {
         let notify = Arc::new(Notify::new());
         match open_route_socket() {
             Ok(fd) => {
@@ -358,7 +358,7 @@ mod darwin_impl {
     target_os = "macos",
     target_os = "ios"
 ))]
-fn spawn_debounce_loop(notify: std::sync::Arc<tokio::sync::Notify>, exclude: ExcludeList) {
+fn spawn_debounce_loop(notify: std::sync::Arc<tokio::sync::Notify>, exclude: SharedExcludeList) {
     tokio::spawn(async move {
         loop {
             notify.notified().await;
@@ -367,7 +367,8 @@ fn spawn_debounce_loop(notify: std::sync::Arc<tokio::sync::Notify>, exclude: Exc
             tokio::time::sleep(DEBOUNCE).await;
             // 在 sleep 期间到来的额外 notify 已经合并掉了（Notify::notify_one 是
             // 幂等：未 await 时多次调用相当于一次）。
-            let cur = crate::default_iface::probe(&exclude);
+            let current_exclude = exclude.read().clone();
+            let cur = crate::default_iface::probe(&current_exclude);
             global().submit(cur);
         }
     });
