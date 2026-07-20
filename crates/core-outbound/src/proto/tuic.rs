@@ -1751,8 +1751,15 @@ mod tests {
                 assert_eq!(&dissociate[..2], &[TUIC_VERSION, CMD_DISSOCIATE]);
             });
 
-            let mut outbound =
-                TuicOutbound::new("test", "127.0.0.1", server_addr.port(), uuid, "secret");
+            let password = std::env::var("TUIC_TEST_PASSWORD")
+                .unwrap_or_else(|_| format!("tuic-test-password-{}", server_addr.port()));
+            let mut outbound = TuicOutbound::new(
+                "test",
+                "127.0.0.1",
+                server_addr.port(),
+                uuid,
+                password.as_str(),
+            );
             outbound.insecure = true;
             outbound.heartbeat_interval = Duration::from_secs(60);
             let socket = Arc::new(
