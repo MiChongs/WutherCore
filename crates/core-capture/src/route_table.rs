@@ -11,8 +11,8 @@
 //! | macOS   | `route -n add -net <dest> -interface <iface>`         | `route -n delete -net <dest>`           |
 //! | Windows | `route ADD <dest> MASK <mask> <gw> METRIC N IF <idx>` | `route DELETE <dest>`                   |
 //!
-//! 失败时记录 warning 但不中断（写路由失败常见于权限/接口尚未就绪），
-//! 撤销时尽力回滚（best-effort）。
+//! 添加失败会返回给调用方，且不会写入回滚账本；调用方可自行决定是否降级。
+//! 撤销已成功添加的路由时尽力回滚（best-effort）。
 
 use std::{net::IpAddr, process::Command, sync::Arc};
 
@@ -60,17 +60,16 @@ impl RouteTable {
         }
     }
 
-    /// 添加并真实写入。失败时 *仅* 记录 warning（不影响其它路由）。
+    /// 添加并真实写入。
+    ///
+    /// 只有后端确认成功后才写入回滚账本。失败的路由不能被记账，否则
+    /// [`Self::revert_all`] 可能在退出时删除一条并非由本进程创建的系统路由。
     pub fn add(&self, r: ManagedRoute) -> Result<(), String> {
-        match self.backend.add(&r) {
-            Ok(()) => {
-                info!(target: "capture::route", dest = %r.dest, iface = %r.interface, gw = ?r.gateway, table = ?r.table, metric = r.metric, "route added");
-            }
-            Err(e) => {
-                warn!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, metric = r.metric, "route add failed (continuing)");
-            }
-        }
-        // 不论平台 add 是否成功都记录 —— 让 stop 时尝试撤销，避免遗留。
+        self.backend.add(&r).map_err(|e| {
+            warn!(target: "capture::route", error = %e, dest = %r.dest, iface = %r.interface, table = ?r.table, metric = r.metric, "route add failed");
+            e
+        })?;
+        info!(target: "capture::route", dest = %r.dest, iface = %r.interface, gw = ?r.gateway, table = ?r.table, metric = r.metric, "route added");
         self.inner.lock().push(r);
         Ok(())
     }
@@ -348,12 +347,17 @@ mod tests {
     struct FakeBackend {
         added: AtomicUsize,
         deleted: AtomicUsize,
+        fail_add: bool,
     }
 
     impl RouteBackend for FakeBackend {
         fn add(&self, _r: &ManagedRoute) -> Result<(), String> {
             self.added.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.fail_add {
+                Err("add failed".into())
+            } else {
+                Ok(())
+            }
         }
         fn del(&self, _r: &ManagedRoute) -> Result<(), String> {
             self.deleted.fetch_add(1, Ordering::Relaxed);
@@ -388,6 +392,38 @@ mod tests {
         table.revert_all();
         assert_eq!(table.len(), 0);
         assert_eq!(backend.deleted.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn failed_add_is_returned_and_never_reverted() {
+        let backend = Arc::new(FakeBackend {
+            fail_add: true,
+            ..Default::default()
+        });
+        let table = RouteTable::with_backend(backend.clone());
+        let err = table
+            .add(ManagedRoute {
+                dest: "0.0.0.0/0".parse().unwrap(),
+                gateway: None,
+                interface: "rpktun0".into(),
+                metric: 1,
+                table: Some(2024),
+            })
+            .expect_err("backend failure must reach the caller");
+
+        assert_eq!(err, "add failed");
+        assert_eq!(backend.added.load(Ordering::Relaxed), 1);
+        assert!(
+            table.is_empty(),
+            "failed route must not enter rollback ledger"
+        );
+
+        table.revert_all();
+        assert_eq!(
+            backend.deleted.load(Ordering::Relaxed),
+            0,
+            "rollback must not delete a route this process never created"
+        );
     }
 
     #[test]
