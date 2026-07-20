@@ -52,6 +52,7 @@ async fn http_connect_through_mixed() {
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
+        udp: true,
     };
     tokio::spawn(run_mixed(listener, runtime.clone()));
 
@@ -115,6 +116,7 @@ async fn socks5_connect_through_mixed() {
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
+        udp: true,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;

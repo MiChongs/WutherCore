@@ -730,14 +730,18 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         } else {
             Some(plan.listen.auth.clone())
         };
-        let listener = MixedListener { listen: addr, auth };
+        let listener = MixedListener {
+            listen: addr,
+            auth,
+            udp: mixed.udp,
+        };
         let rt = runtime.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = run_mixed(listener, rt).await {
                 warn!(target: "inbound", error = %e, "mixed listener exited");
             }
         }));
-        info!(addr = %addr, "mixed inbound: HTTP+SOCKS5 ready");
+        info!(addr = %addr, udp = mixed.udp, "mixed inbound: HTTP+SOCKS5 ready");
     } else {
         info!("listen.local 未配置，跳过 Mixed 入站");
     }
