@@ -10,19 +10,23 @@
 
 use std::{
     collections::HashMap,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use base64::Engine;
 use core_runtime::{InboundMetadata, ListenerHandler, Runtime};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, mpsc, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::{Instant, Sleep, timeout},
 };
 use tracing::{debug, info, warn};
@@ -51,6 +55,13 @@ const SOCKS_UDP_MAX_SESSIONS: usize = 256;
 const SOCKS_UDP_SESSION_QUEUE: usize = 64;
 const SOCKS_UDP_MAX_DATAGRAM: usize = 65_507;
 const SOCKS_UDP_MAX_ASSOCIATION_PACKETS: u64 = 1_000_000;
+const MIXED_PROTOCOL_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MAX_HEADER_BYTES: usize = 16 * 1024;
+const HTTP_MAX_HEADERS: usize = 128;
+const HTTP_READ_CHUNK_BYTES: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct MixedListener {
@@ -80,26 +91,39 @@ async fn serve_mixed(
     let auth = listener.auth.map(Arc::new);
     let connection_permits = Arc::new(Semaphore::new(MIXED_MAX_CONNECTIONS));
     let udp_session_permits = Arc::new(Semaphore::new(MIXED_MAX_UDP_TARGET_SESSIONS));
+    // JoinSet aborts every in-flight connection when this listener future is
+    // cancelled or returns. Detached tasks would otherwise keep sockets and
+    // runtime state alive after the listener has shut down.
+    let mut connections = JoinSet::new();
     loop {
-        let (sock, peer) = listener_socket.accept().await?;
-        let _ = sock.set_nodelay(true);
-        let permit = match connection_permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                warn!(peer = %peer, limit = MIXED_MAX_CONNECTIONS, "mixed inbound connection limit reached");
-                continue;
+        tokio::select! {
+            accepted = listener_socket.accept() => {
+                let (sock, peer) = accepted?;
+                let _ = sock.set_nodelay(true);
+                let permit = match connection_permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(peer = %peer, limit = MIXED_MAX_CONNECTIONS, "mixed inbound connection limit reached");
+                        continue;
+                    }
+                };
+                let runtime = runtime.clone();
+                let auth = auth.clone();
+                let udp = listener.udp;
+                let udp_session_permits = udp_session_permits.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = handle(sock, peer, runtime, auth, udp, udp_session_permits).await {
+                        debug!(error = %e, peer = %peer, "mixed handle error");
+                    }
+                });
             }
-        };
-        let runtime = runtime.clone();
-        let auth = auth.clone();
-        let udp = listener.udp;
-        let udp_session_permits = udp_session_permits.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = handle(sock, peer, runtime, auth, udp, udp_session_permits).await {
-                debug!(error = %e, peer = %peer, "mixed handle error");
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(error = %error, "mixed connection task failed");
+                }
             }
-        });
+        }
     }
 }
 
@@ -112,7 +136,14 @@ async fn handle(
     udp_session_permits: Arc<Semaphore>,
 ) -> io::Result<()> {
     let mut peek = [0u8; 1];
-    let n = sock.peek(&mut peek).await?;
+    let n = timeout(MIXED_PROTOCOL_DETECT_TIMEOUT, sock.peek(&mut peek))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mixed protocol detection timed out",
+            )
+        })??;
     if n == 0 {
         return Ok(());
     }
@@ -1167,174 +1198,1094 @@ async fn shutdown_udp_sessions(
 /* ---------------- HTTP ---------------- */
 
 async fn handle_http(
-    sock: TcpStream,
+    mut sock: TcpStream,
     peer: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(sock);
-    let mut head = Vec::with_capacity(2048);
-    // 读到 \r\n\r\n
-    loop {
-        let mut byte = [0u8; 1];
-        if reader.read(&mut byte).await? == 0 {
-            return Ok(());
+    let (head, prefetched) = match read_http_head(&mut sock, HTTP_HEADER_TIMEOUT).await {
+        Ok(value) => value,
+        Err(error) => {
+            let response = if error.kind() == io::ErrorKind::TimedOut {
+                b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .as_slice()
+            } else if error.kind() == io::ErrorKind::InvalidData {
+                b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .as_slice()
+            } else {
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    .as_slice()
+            };
+            let _ = write_http_control(&mut sock, response).await;
+            return Err(error);
         }
-        head.push(byte[0]);
-        if head.len() >= 4 && &head[head.len() - 4..] == b"\r\n\r\n" {
-            break;
+    };
+    let request = match parse_http_request_head(&head) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = write_http_control(
+                &mut sock,
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+            return Err(error);
         }
-        if head.len() > 16 * 1024 {
-            return Err(other("HTTP 请求头过大"));
-        }
+    };
+    if !http_proxy_authenticated(&request, auth) {
+        let _ = write_http_control(
+            &mut sock,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"RPKernel\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HTTP proxy authentication failed",
+        ));
     }
+    let route = match parse_http_route(&request) {
+        Ok(route) => route,
+        Err(error) => {
+            let _ = write_http_control(
+                &mut sock,
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
-    let head_str = std::str::from_utf8(&head).map_err(|_| other("HTTP 请求头非 utf8"))?;
-    let mut lines = head_str.split("\r\n");
-    let req_line = lines.next().ok_or_else(|| other("空请求行"))?;
-    let mut parts = req_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| other("缺少 method"))?
-        .to_uppercase();
-    let target = parts
-        .next()
-        .ok_or_else(|| other("缺少 target"))?
-        .to_string();
-    let _version = parts.next().unwrap_or("HTTP/1.1");
-
-    // 鉴权
-    if let Some(slot) = auth {
-        if !slot.is_empty() {
-            let mut authed = false;
-            for line in lines.clone() {
-                if let Some((k, v)) = line.split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("Proxy-Authorization") {
-                        let v = v.trim();
-                        if let Some(rest) = v.strip_prefix("Basic ") {
-                            if let Ok(decoded) =
-                                base64::engine::general_purpose::STANDARD.decode(rest)
-                            {
-                                if let Ok(s) = std::str::from_utf8(&decoded) {
-                                    if let Some((u, p)) = s.split_once(':') {
-                                        authed = slot.iter().any(|x| x.user == u && x.pass == p);
-                                    }
-                                }
-                            }
-                        }
+    let handler = ListenerHandler::new(runtime);
+    let inbound_addr = sock.local_addr()?;
+    match route {
+        HttpRoute::Connect(authority) => {
+            let metadata = InboundMetadata::tcp(
+                "http-connect",
+                "HTTP",
+                peer,
+                inbound_addr,
+                authority.host,
+                authority.port,
+            );
+            match handler.prepare_tcp(metadata).await {
+                Ok(mut prepared) => {
+                    write_http_control(&mut sock, b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+                    if !prefetched.is_empty() {
+                        prepared.result.stream.write_all(&prefetched).await?;
+                        handler.record_upload(&prepared.guard, prefetched.len() as u64);
                     }
+                    handler.relay_prepared_tcp(sock, prepared).await
+                }
+                Err(error) => {
+                    let _ = write_http_control(
+                        &mut sock,
+                        b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                    Err(error)
                 }
             }
-            if !authed {
-                let mut sock = reader.into_inner();
-                let body = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-                let _ = sock.write_all(body).await;
-                return Err(other("HTTP 407 unauthorized"));
-            }
         }
-    }
-
-    if method == "CONNECT" {
-        let (host, port) = parse_host_port(&target)?;
-        let mut sock = reader.into_inner();
-        let handler = ListenerHandler::new(runtime);
-        let inbound_addr = sock.local_addr()?;
-        let metadata = InboundMetadata::tcp("http-connect", "HTTP", peer, inbound_addr, host, port);
-        match handler.prepare_tcp(metadata).await {
-            Ok(prepared) => {
-                sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?;
-                handler.relay_prepared_tcp(sock, prepared).await
+        HttpRoute::Forward(target) => {
+            let body_framing = match request.forward_body_framing() {
+                Ok(framing) => framing,
+                Err(error) => {
+                    let response = if error.kind() == io::ErrorKind::Unsupported {
+                        b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                            .as_slice()
+                    } else {
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                            .as_slice()
+                    };
+                    let _ = write_http_control(&mut sock, response).await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = body_framing.validate_prefetched(&prefetched) {
+                let _ = write_http_control(
+                    &mut sock,
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+                return Err(error);
             }
-            Err(e) => {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+            let forwarded_head = build_forward_head(&request, &target);
+            let metadata = InboundMetadata::tcp(
+                "http",
+                "HTTP",
+                peer,
+                inbound_addr,
+                target.authority.host.clone(),
+                target.authority.port,
+            );
+            match handler.prepare_tcp(metadata).await {
+                Ok(mut prepared) => {
+                    if let Err(error) = prepared.result.stream.write_all(&forwarded_head).await {
+                        let _ = write_http_control(
+                            &mut sock,
+                            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                    handler.record_upload(&prepared.guard, forwarded_head.len() as u64);
+                    let request_stream = HttpSingleRequestStream::new(
+                        sock,
+                        prefetched,
+                        body_framing,
+                        HTTP_BODY_IDLE_TIMEOUT,
+                    )?;
+                    handler.relay_prepared_tcp(request_stream, prepared).await
+                }
+                Err(error) => {
+                    let _ = write_http_control(
+                        &mut sock,
+                        b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
                     .await;
-                Err(e)
-            }
-        }
-    } else {
-        // 普通代理：target 可能是 http://host[:port]/path
-        let (host, port, path) = parse_absolute_target(&target)?;
-        // 重组请求：把 absolute-form 改成 origin-form。
-        let mut new_head = format!("{method} {path} HTTP/1.1\r\n");
-        let mut have_host = false;
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("proxy-authorization:") {
-                continue;
-            }
-            if lower.starts_with("proxy-connection:") {
-                continue;
-            }
-            if lower.starts_with("host:") {
-                have_host = true;
-            }
-            new_head.push_str(line);
-            new_head.push_str("\r\n");
-        }
-        if !have_host {
-            new_head.push_str(&format!("Host: {host}\r\n"));
-        }
-        new_head.push_str("\r\n");
-
-        let mut sock = reader.into_inner();
-        let handler = ListenerHandler::new(runtime);
-        let inbound_addr = sock.local_addr()?;
-        let metadata = InboundMetadata::tcp("http", "HTTP", peer, inbound_addr, host, port);
-        match handler.prepare_tcp(metadata).await {
-            Ok(mut prepared) => {
-                let n = new_head.len() as u64;
-                prepared
-                    .result
-                    .stream
-                    .write_all(new_head.as_bytes())
-                    .await?;
-                handler.record_upload(&prepared.guard, n);
-                handler.relay_prepared_tcp(sock, prepared).await
-            }
-            Err(e) => {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                    .await;
-                Err(e)
+                    Err(error)
+                }
             }
         }
     }
 }
 
-fn parse_host_port(s: &str) -> io::Result<(String, u16)> {
-    if let Some((h, p)) = s.rsplit_once(':') {
-        let h = h.trim_matches(|c| c == '[' || c == ']');
-        let port: u16 = p.parse().map_err(|_| other("端口非法"))?;
-        Ok((h.to_string(), port))
-    } else {
-        Err(other("缺少端口"))
+#[derive(Debug)]
+struct HttpRequestHead {
+    method: String,
+    target: String,
+    version: String,
+    headers: Vec<HttpHeader>,
+}
+
+#[derive(Debug)]
+struct HttpHeader {
+    name: String,
+    value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedAuthority {
+    host: String,
+    port: u16,
+    host_header: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForwardTarget {
+    authority: ParsedAuthority,
+    origin_form: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HttpRoute {
+    Connect(ParsedAuthority),
+    Forward(ForwardTarget),
+}
+
+async fn read_http_head<R>(sock: &mut R, header_timeout: Duration) -> io::Result<(Vec<u8>, Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(header_timeout, read_http_head_inner(sock))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request header timed out"))?
+}
+
+async fn read_http_head_inner<R>(sock: &mut R) -> io::Result<(Vec<u8>, Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut received = Vec::with_capacity(HTTP_READ_CHUNK_BYTES);
+    let mut chunk = [0u8; HTTP_READ_CHUNK_BYTES];
+    loop {
+        let size = sock.read(&mut chunk).await?;
+        if size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before HTTP request header completed",
+            ));
+        }
+        received.extend_from_slice(&chunk[..size]);
+        if let Some(start) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+            let end = start + 4;
+            if end > HTTP_MAX_HEADER_BYTES {
+                return Err(invalid_data("HTTP request header exceeds 16 KiB"));
+            }
+            let prefetched = received.split_off(end);
+            return Ok((received, prefetched));
+        }
+        if received.len() >= HTTP_MAX_HEADER_BYTES {
+            return Err(invalid_data("HTTP request header exceeds 16 KiB"));
+        }
     }
 }
 
-fn parse_absolute_target(s: &str) -> io::Result<(String, u16, String)> {
-    let s = s
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let (host_part, path) = match s.find('/') {
-        Some(i) => (&s[..i], s[i..].to_string()),
-        None => (s, "/".to_string()),
-    };
-    let (host, port) = if host_part.contains(':') {
-        let (h, p) = host_part.rsplit_once(':').unwrap();
-        (h.to_string(), p.parse().map_err(|_| other("端口非法"))?)
-    } else {
-        (host_part.to_string(), 80u16)
-    };
-    Ok((host, port, path))
+fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequestHead> {
+    if !head.ends_with(b"\r\n\r\n") {
+        return Err(invalid_data("incomplete HTTP request header"));
+    }
+    let block = &head[..head.len() - 4];
+    let mut raw_lines = block.split(|byte| *byte == b'\n').peekable();
+    let request_line = raw_lines
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP request line"))?;
+    let request_line = strip_line_cr(request_line, raw_lines.peek().is_some())?;
+    let request_line = std::str::from_utf8(request_line)
+        .map_err(|_| invalid_data("HTTP request line is not UTF-8"))?;
+    if !request_line.is_ascii() {
+        return Err(invalid_data("HTTP request line must be ASCII"));
+    }
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP method"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP request target"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP version"))?;
+    if parts.next().is_some()
+        || method.is_empty()
+        || !method.as_bytes().iter().copied().all(is_http_token_byte)
+        || target.is_empty()
+        || target.as_bytes().iter().any(u8::is_ascii_control)
+    {
+        return Err(invalid_data("malformed HTTP request line"));
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(invalid_data("unsupported HTTP version"));
+    }
+
+    let mut headers = Vec::new();
+    let mut host_seen = false;
+    let mut proxy_authorization_seen = false;
+    let mut content_length_seen = false;
+    let mut transfer_encoding_seen = false;
+    while let Some(raw_line) = raw_lines.next() {
+        if headers.len() >= HTTP_MAX_HEADERS {
+            return Err(invalid_data("too many HTTP request headers"));
+        }
+        let line = strip_line_cr(raw_line, raw_lines.peek().is_some())?;
+        if line.is_empty() || matches!(line.first(), Some(b' ' | b'\t')) {
+            return Err(invalid_data("empty or folded HTTP header field"));
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| invalid_data("HTTP header field is missing ':'"))?;
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().copied().all(is_http_token_byte) {
+            return Err(invalid_data("invalid HTTP header field name"));
+        }
+        let value = trim_http_ows(&line[colon + 1..]);
+        if value
+            .iter()
+            .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+        {
+            return Err(invalid_data("invalid control byte in HTTP header value"));
+        }
+        let name = std::str::from_utf8(name)
+            .map_err(|_| invalid_data("HTTP header field name must be ASCII"))?
+            .to_string();
+
+        if name.eq_ignore_ascii_case("host") {
+            if host_seen {
+                return Err(invalid_data("duplicate Host header"));
+            }
+            host_seen = true;
+        } else if name.eq_ignore_ascii_case("proxy-authorization") {
+            if proxy_authorization_seen {
+                return Err(invalid_data("duplicate Proxy-Authorization header"));
+            }
+            proxy_authorization_seen = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length_seen || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err(invalid_data("invalid or duplicate Content-Length header"));
+            }
+            content_length_seen = true;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if transfer_encoding_seen || value.is_empty() {
+                return Err(invalid_data(
+                    "invalid or duplicate Transfer-Encoding header",
+                ));
+            }
+            transfer_encoding_seen = true;
+        } else if name.eq_ignore_ascii_case("connection")
+            && (value.is_empty()
+                || value.split(|byte| *byte == b',').any(|option| {
+                    let option = trim_http_ows(option);
+                    option.is_empty() || !option.iter().copied().all(is_http_token_byte)
+                }))
+        {
+            return Err(invalid_data("invalid Connection header options"));
+        }
+        headers.push(HttpHeader {
+            name,
+            value: value.to_vec(),
+        });
+    }
+    if content_length_seen && transfer_encoding_seen {
+        return Err(invalid_data(
+            "request must not contain both Transfer-Encoding and Content-Length",
+        ));
+    }
+
+    Ok(HttpRequestHead {
+        method: method.to_string(),
+        target: target.to_string(),
+        version: version.to_string(),
+        headers,
+    })
 }
 
-fn other(s: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, s.to_string())
+fn strip_line_cr(line: &[u8], followed_by_lf: bool) -> io::Result<&[u8]> {
+    match (line.strip_suffix(b"\r"), followed_by_lf) {
+        (Some(line), true) if !line.contains(&b'\r') => Ok(line),
+        (None, true) => Err(invalid_data("HTTP header uses a bare line feed")),
+        (_, true) => Err(invalid_data("invalid carriage return in HTTP line")),
+        (_, false) if line.contains(&b'\r') => {
+            Err(invalid_data("invalid carriage return in HTTP line"))
+        }
+        (_, false) => Ok(line),
+    }
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn trim_http_ows(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn parse_http_route(request: &HttpRequestHead) -> io::Result<HttpRoute> {
+    let host_header = request.header("host");
+    if request.version == "HTTP/1.1" && host_header.is_none() {
+        return Err(invalid_data("HTTP/1.1 request is missing Host header"));
+    }
+    if let Some(value) = host_header {
+        let value =
+            std::str::from_utf8(value).map_err(|_| invalid_data("Host header must be ASCII"))?;
+        // Validate even when absolute-form supplies the routing authority. This
+        // prevents malformed or ambiguous Host values from crossing the proxy.
+        parse_authority(value, Some(80), false)?;
+    }
+
+    if request.method == "CONNECT" {
+        return Ok(HttpRoute::Connect(parse_authority(
+            &request.target,
+            None,
+            true,
+        )?));
+    }
+    if request.target.contains('#') {
+        return Err(invalid_data(
+            "HTTP request target must not contain a fragment",
+        ));
+    }
+    if request.target.starts_with('/') || request.target == "*" {
+        if request.target == "*" && request.method != "OPTIONS" {
+            return Err(invalid_data(
+                "asterisk-form request target is only valid for OPTIONS",
+            ));
+        }
+        let host = host_header.ok_or_else(|| {
+            invalid_data("origin-form HTTP request requires a Host header for routing")
+        })?;
+        let host =
+            std::str::from_utf8(host).map_err(|_| invalid_data("Host header must be ASCII"))?;
+        return Ok(HttpRoute::Forward(ForwardTarget {
+            authority: parse_authority(host, Some(80), false)?,
+            origin_form: request.target.clone(),
+        }));
+    }
+    Ok(HttpRoute::Forward(parse_absolute_target(&request.target)?))
+}
+
+impl HttpRequestHead {
+    fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_slice())
+    }
+
+    fn forward_body_framing(&self) -> io::Result<HttpBodyFraming> {
+        for framing_field in ["host", "content-length", "transfer-encoding", "trailer"] {
+            if self.connection_option(framing_field) {
+                return Err(invalid_data(
+                    "Connection header must not nominate routing or framing fields",
+                ));
+            }
+        }
+        if self.header("upgrade").is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "HTTP Upgrade is only supported through CONNECT tunnelling",
+            ));
+        }
+        if let Some(value) = self.header("transfer-encoding") {
+            if self.version != "HTTP/1.1" {
+                return Err(invalid_data(
+                    "Transfer-Encoding is not valid on an HTTP/1.0 request",
+                ));
+            }
+            let value = std::str::from_utf8(value)
+                .map_err(|_| invalid_data("Transfer-Encoding must be ASCII"))?;
+            if !value.eq_ignore_ascii_case("chunked") {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "only a single chunked transfer coding is supported",
+                ));
+            }
+            return Ok(HttpBodyFraming::chunked());
+        }
+        if self.header("trailer").is_some() {
+            return Err(invalid_data(
+                "Trailer header requires chunked Transfer-Encoding",
+            ));
+        }
+        let Some(value) = self.header("content-length") else {
+            return Ok(HttpBodyFraming::fixed(0));
+        };
+        let value =
+            std::str::from_utf8(value).map_err(|_| invalid_data("Content-Length must be ASCII"))?;
+        let length = value
+            .parse::<u64>()
+            .map_err(|_| invalid_data("Content-Length exceeds the supported range"))?;
+        Ok(HttpBodyFraming::fixed(length))
+    }
+
+    fn connection_option(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+            .flat_map(|header| header.value.split(|byte| *byte == b','))
+            .map(trim_http_ows)
+            .any(|option| option.eq_ignore_ascii_case(name.as_bytes()))
+    }
+}
+
+fn parse_absolute_target(target: &str) -> io::Result<ForwardTarget> {
+    let scheme_end = target.find("://").ok_or_else(|| {
+        invalid_data("non-CONNECT proxy request requires absolute- or origin-form")
+    })?;
+    let scheme = &target[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "only http:// absolute-form requests are supported; HTTPS must use CONNECT",
+        ));
+    }
+    let remainder = &target[scheme_end + 3..];
+    let authority_end = remainder
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '/' | '?' | '#').then_some(index))
+        .unwrap_or(remainder.len());
+    let authority = parse_authority(&remainder[..authority_end], Some(80), false)?;
+    let suffix = &remainder[authority_end..];
+    if suffix.contains('#') {
+        return Err(invalid_data(
+            "absolute-form URI must not contain a fragment",
+        ));
+    }
+    let origin_form = if suffix.is_empty() {
+        "/".to_string()
+    } else if suffix.starts_with('?') {
+        format!("/{suffix}")
+    } else if suffix.starts_with('/') {
+        suffix.to_string()
+    } else {
+        return Err(invalid_data("malformed absolute-form request target"));
+    };
+    Ok(ForwardTarget {
+        authority,
+        origin_form,
+    })
+}
+
+fn parse_authority(
+    authority: &str,
+    default_port: Option<u16>,
+    require_port: bool,
+) -> io::Result<ParsedAuthority> {
+    let authority = authority.trim();
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || authority.contains(['@', '/', '?', '#'])
+    {
+        return Err(invalid_data("invalid HTTP authority"));
+    }
+
+    let (raw_host, raw_port, ipv6) = if let Some(rest) = authority.strip_prefix('[') {
+        let closing = rest
+            .find(']')
+            .ok_or_else(|| invalid_data("unterminated IPv6 address in HTTP authority"))?;
+        let raw_host = &rest[..closing];
+        let after = &rest[closing + 1..];
+        let raw_port = if after.is_empty() {
+            None
+        } else {
+            Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| invalid_data("invalid text after IPv6 address"))?,
+            )
+        };
+        if raw_host.parse::<Ipv6Addr>().is_err() {
+            return Err(invalid_data("invalid IPv6 address in HTTP authority"));
+        }
+        (raw_host, raw_port, true)
+    } else {
+        if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
+            return Err(invalid_data("IPv6 HTTP authority must use square brackets"));
+        }
+        let (raw_host, raw_port) = authority
+            .rsplit_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        (raw_host, raw_port, false)
+    };
+    if raw_host.is_empty() {
+        return Err(invalid_data("HTTP authority host is empty"));
+    }
+
+    let explicit_port = raw_port.is_some();
+    let port = match raw_port {
+        Some(raw_port) if !raw_port.is_empty() => raw_port
+            .parse::<u16>()
+            .map_err(|_| invalid_data("invalid HTTP authority port"))?,
+        Some(_) => return Err(invalid_data("HTTP authority port is empty")),
+        None if require_port => {
+            return Err(invalid_data("CONNECT authority must include a port"));
+        }
+        None => default_port.ok_or_else(|| invalid_data("HTTP authority is missing a port"))?,
+    };
+    if port == 0 {
+        return Err(invalid_data("HTTP authority port must not be zero"));
+    }
+
+    let host = if ipv6 {
+        raw_host
+            .parse::<Ipv6Addr>()
+            .expect("IPv6 address was validated")
+            .to_string()
+    } else if let Ok(ip) = raw_host.parse::<Ipv4Addr>() {
+        ip.to_string()
+    } else {
+        normalize_http_domain(raw_host)?
+    };
+    let host_literal = if ipv6 {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let host_header = if explicit_port {
+        format!("{host_literal}:{port}")
+    } else {
+        host_literal
+    };
+    Ok(ParsedAuthority {
+        host,
+        port,
+        host_header,
+    })
+}
+
+fn normalize_http_domain(host: &str) -> io::Result<String> {
+    if !host.is_ascii()
+        || host.len() > 253
+        || host
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')))
+    {
+        return Err(invalid_data("invalid HTTP authority host"));
+    }
+    let without_root_dot = host.strip_suffix('.').unwrap_or(host);
+    if without_root_dot.is_empty()
+        || without_root_dot
+            .split('.')
+            .any(|label| label.is_empty() || label.len() > 63)
+        || (without_root_dot
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            && without_root_dot.parse::<Ipv4Addr>().is_err())
+    {
+        return Err(invalid_data("invalid HTTP authority host"));
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn http_proxy_authenticated(
+    request: &HttpRequestHead,
+    auth: Option<&[core_config::runtime_plan::UserPass]>,
+) -> bool {
+    let Some(auth) = auth.filter(|entries| !entries.is_empty()) else {
+        return true;
+    };
+    let Some(value) = request.header("proxy-authorization") else {
+        return false;
+    };
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let mut parts = value.split_ascii_whitespace();
+    let (Some(scheme), Some(credentials), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credentials) else {
+        return false;
+    };
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    auth.iter().any(|entry| {
+        entry.user.as_bytes() == &decoded[..colon] && entry.pass.as_bytes() == &decoded[colon + 1..]
+    })
+}
+
+fn build_forward_head(request: &HttpRequestHead, target: &ForwardTarget) -> Vec<u8> {
+    let connection_options = request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+        .flat_map(|header| header.value.split(|byte| *byte == b','))
+        .filter_map(|option| std::str::from_utf8(trim_http_ows(option)).ok())
+        .collect::<Vec<_>>();
+    let mut head = Vec::with_capacity(HTTP_MAX_HEADER_BYTES);
+    head.extend_from_slice(request.method.as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(target.origin_form.as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(request.version.as_bytes());
+    head.extend_from_slice(b"\r\nHost: ");
+    head.extend_from_slice(target.authority.host_header.as_bytes());
+    head.extend_from_slice(b"\r\nConnection: close\r\nVia: 1.1 RPKernel\r\n");
+    for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("host")
+            || header.name.eq_ignore_ascii_case("proxy-authorization")
+            || header.name.eq_ignore_ascii_case("proxy-connection")
+            || header.name.eq_ignore_ascii_case("proxy-authenticate")
+            || header.name.eq_ignore_ascii_case("connection")
+            || header.name.eq_ignore_ascii_case("keep-alive")
+            || header.name.eq_ignore_ascii_case("te")
+            || header.name.eq_ignore_ascii_case("upgrade")
+            || connection_options
+                .iter()
+                .any(|option| header.name.eq_ignore_ascii_case(option))
+        {
+            continue;
+        }
+        head.extend_from_slice(header.name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(&header.value);
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    head
+}
+
+/// Presents exactly one HTTP request body to the relay and then returns EOF.
+///
+/// The write side remains the original client socket, so the origin response
+/// still streams normally. Returning EOF after the declared body makes the
+/// relay half-close the upstream connection and prevents a second proxy
+/// request (possibly for another target) from bypassing HTTP parsing.
+struct HttpSingleRequestStream<S> {
+    inner: S,
+    prefetched: Vec<u8>,
+    prefetched_position: usize,
+    body: HttpBodyFraming,
+    idle_timeout: Duration,
+    idle_sleep: Pin<Box<Sleep>>,
+}
+
+impl<S> HttpSingleRequestStream<S> {
+    fn new(
+        inner: S,
+        prefetched: Vec<u8>,
+        body: HttpBodyFraming,
+        idle_timeout: Duration,
+    ) -> io::Result<Self> {
+        body.validate_prefetched(&prefetched)?;
+        Ok(Self {
+            inner,
+            prefetched,
+            prefetched_position: 0,
+            body,
+            idle_timeout,
+            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+        })
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S> AsyncRead for HttpSingleRequestStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.body.is_complete() || output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        if this.prefetched_position < this.prefetched.len() {
+            let size = this.body.read_limit(output.remaining()).min(
+                this.prefetched
+                    .len()
+                    .saturating_sub(this.prefetched_position),
+            );
+            let end = this.prefetched_position + size;
+            this.body
+                .consume(&this.prefetched[this.prefetched_position..end])?;
+            output.put_slice(&this.prefetched[this.prefetched_position..end]);
+            this.prefetched_position += size;
+            this.idle_sleep
+                .as_mut()
+                .reset(Instant::now() + this.idle_timeout);
+            return Poll::Ready(Ok(()));
+        }
+
+        let maximum = this.body.read_limit(output.remaining());
+        let read = {
+            let destination = output.initialize_unfilled_to(maximum);
+            let mut limited = ReadBuf::new(destination);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => Ok(limited.filled().len()),
+                Poll::Ready(Err(error)) => Err(error),
+                Poll::Pending => {
+                    if this.idle_sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "HTTP request body idle timeout",
+                        )));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        };
+        match read {
+            Ok(0) => Poll::Ready(Err(invalid_data(
+                "client closed before the declared HTTP request body completed",
+            ))),
+            Ok(size) => {
+                let bytes = &output.initialize_unfilled_to(size)[..size];
+                this.body.consume(bytes)?;
+                output.advance(size);
+                this.idle_sleep
+                    .as_mut()
+                    .reset(Instant::now() + this.idle_timeout);
+                Poll::Ready(Ok(()))
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+impl<S> AsyncWrite for HttpSingleRequestStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HttpBodyFraming {
+    Fixed { remaining: u64 },
+    Chunked(ChunkedBodyState),
+}
+
+impl HttpBodyFraming {
+    fn fixed(remaining: u64) -> Self {
+        Self::Fixed { remaining }
+    }
+
+    fn chunked() -> Self {
+        Self::Chunked(ChunkedBodyState::SizeLine { line: Vec::new() })
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::Fixed { remaining: 0 } | Self::Chunked(ChunkedBodyState::Complete)
+        )
+    }
+
+    fn read_limit(&self, output_remaining: usize) -> usize {
+        match self {
+            Self::Fixed { remaining } => {
+                output_remaining.min((*remaining).min(usize::MAX as u64) as usize)
+            }
+            Self::Chunked(ChunkedBodyState::Data { remaining }) => {
+                output_remaining.min((*remaining).min(usize::MAX as u64) as usize)
+            }
+            Self::Chunked(ChunkedBodyState::Complete) => 0,
+            Self::Chunked(_) => output_remaining.min(1),
+        }
+    }
+
+    fn consume(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Fixed { remaining } => {
+                if data.len() as u64 > *remaining {
+                    return Err(invalid_data(
+                        "HTTP request contains bytes beyond its declared body",
+                    ));
+                }
+                *remaining -= data.len() as u64;
+                Ok(())
+            }
+            Self::Chunked(state) => state.consume(data),
+        }
+    }
+
+    fn validate_prefetched(&self, data: &[u8]) -> io::Result<()> {
+        let mut framing = self.clone();
+        for byte in data {
+            if framing.is_complete() {
+                return Err(invalid_data(
+                    "HTTP request contains bytes beyond its declared body",
+                ));
+            }
+            framing.consume(std::slice::from_ref(byte))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ChunkedBodyState {
+    SizeLine {
+        line: Vec<u8>,
+    },
+    Data {
+        remaining: u64,
+    },
+    DataCrlf {
+        position: u8,
+    },
+    Trailers {
+        line: Vec<u8>,
+        bytes: usize,
+        fields: usize,
+    },
+    Complete,
+}
+
+impl ChunkedBodyState {
+    fn consume(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            Self::SizeLine { line } => {
+                if data.len() != 1 {
+                    return Err(invalid_data("invalid chunk-size parser input"));
+                }
+                line.push(data[0]);
+                if line.len() > 1024 {
+                    return Err(invalid_data("HTTP chunk-size line exceeds 1024 bytes"));
+                }
+                if data[0] == b'\n' {
+                    let size = parse_http_chunk_size(line)?;
+                    *self = if size == 0 {
+                        Self::Trailers {
+                            line: Vec::new(),
+                            bytes: 0,
+                            fields: 0,
+                        }
+                    } else {
+                        Self::Data { remaining: size }
+                    };
+                }
+                Ok(())
+            }
+            Self::Data { remaining } => {
+                if data.len() as u64 > *remaining {
+                    return Err(invalid_data("HTTP chunk data exceeds its declared size"));
+                }
+                *remaining -= data.len() as u64;
+                if *remaining == 0 {
+                    *self = Self::DataCrlf { position: 0 };
+                }
+                Ok(())
+            }
+            Self::DataCrlf { position } => {
+                if data.len() != 1 {
+                    return Err(invalid_data("invalid HTTP chunk delimiter input"));
+                }
+                match (*position, data[0]) {
+                    (0, b'\r') => *position = 1,
+                    (1, b'\n') => *self = Self::SizeLine { line: Vec::new() },
+                    _ => {
+                        return Err(invalid_data(
+                            "HTTP chunk data is missing its CRLF delimiter",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Trailers {
+                line,
+                bytes,
+                fields,
+            } => {
+                if data.len() != 1 {
+                    return Err(invalid_data("invalid HTTP trailer parser input"));
+                }
+                line.push(data[0]);
+                *bytes = bytes
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("HTTP trailer size overflow"))?;
+                if *bytes > HTTP_MAX_HEADER_BYTES {
+                    return Err(invalid_data("HTTP chunk trailers exceed 16 KiB"));
+                }
+                if data[0] == b'\n' {
+                    let trailer = parse_http_chunk_trailer(line)?;
+                    if trailer {
+                        *fields += 1;
+                        if *fields > HTTP_MAX_HEADERS {
+                            return Err(invalid_data("too many HTTP chunk trailer fields"));
+                        }
+                        line.clear();
+                    } else {
+                        *self = Self::Complete;
+                    }
+                }
+                Ok(())
+            }
+            Self::Complete => Err(invalid_data(
+                "HTTP request contains bytes beyond its chunked body",
+            )),
+        }
+    }
+}
+
+fn parse_http_chunk_size(line: &[u8]) -> io::Result<u64> {
+    let content = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| invalid_data("HTTP chunk-size line must end in CRLF"))?;
+    if content.iter().any(|byte| *byte < 0x20 || *byte > 0x7e) {
+        return Err(invalid_data("invalid byte in HTTP chunk-size line"));
+    }
+    let size = content
+        .split(|byte| *byte == b';')
+        .next()
+        .ok_or_else(|| invalid_data("HTTP chunk size is missing"))?;
+    if size.is_empty() || size.len() > 16 || !size.iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid_data("invalid HTTP chunk size"));
+    }
+    let size =
+        std::str::from_utf8(size).map_err(|_| invalid_data("HTTP chunk size must be ASCII"))?;
+    u64::from_str_radix(size, 16).map_err(|_| invalid_data("HTTP chunk size overflow"))
+}
+
+/// Returns `true` for a non-empty trailer field and `false` for the terminal
+/// empty line.
+fn parse_http_chunk_trailer(line: &[u8]) -> io::Result<bool> {
+    let content = line
+        .strip_suffix(b"\r\n")
+        .ok_or_else(|| invalid_data("HTTP chunk trailer line must end in CRLF"))?;
+    if content.is_empty() {
+        return Ok(false);
+    }
+    if matches!(content.first(), Some(b' ' | b'\t')) {
+        return Err(invalid_data("folded HTTP chunk trailers are not allowed"));
+    }
+    let colon = content
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or_else(|| invalid_data("HTTP chunk trailer is missing ':'"))?;
+    let name = &content[..colon];
+    let value = trim_http_ows(&content[colon + 1..]);
+    if name.is_empty()
+        || !name.iter().copied().all(is_http_token_byte)
+        || value
+            .iter()
+            .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+    {
+        return Err(invalid_data("invalid HTTP chunk trailer field"));
+    }
+    let name = std::str::from_utf8(name)
+        .map_err(|_| invalid_data("HTTP chunk trailer name must be ASCII"))?;
+    if [
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "trailer",
+        "te",
+        "upgrade",
+        "authorization",
+        "proxy-authorization",
+        "proxy-authenticate",
+    ]
+    .iter()
+    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+    {
+        return Err(invalid_data("forbidden HTTP chunk trailer field"));
+    }
+    Ok(true)
+}
+
+async fn write_http_control(sock: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+    timeout(HTTP_CONTROL_IO_TIMEOUT, sock.write_all(response))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP response write timed out"))?
 }
 
 #[cfg(test)]
@@ -1521,6 +2472,327 @@ route:
             address: SocksAddress::Ip(addr.ip()),
             port: addr.port(),
         }
+    }
+
+    #[test]
+    fn http_absolute_and_origin_forms_route_and_rewrite_strictly() {
+        let request = parse_http_request_head(
+            b"POST http://[2001:db8::1]:8080/upload?x=1 HTTP/1.1\r\n\
+              Host: wrong.example\r\n\
+              Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+              Proxy-Connection: keep-alive\r\n\
+              Connection: X-Hop, keep-alive\r\n\
+              X-Hop: secret\r\n\
+              Content-Length: 4\r\n\r\n",
+        )
+        .unwrap();
+        let route = parse_http_route(&request).unwrap();
+        let HttpRoute::Forward(target) = route else {
+            panic!("absolute-form request did not produce a forward route");
+        };
+        assert_eq!(target.authority.host, "2001:db8::1");
+        assert_eq!(target.authority.port, 8080);
+        assert_eq!(target.authority.host_header, "[2001:db8::1]:8080");
+        assert_eq!(target.origin_form, "/upload?x=1");
+        let rewritten = build_forward_head(&request, &target);
+        let rewritten = std::str::from_utf8(&rewritten).unwrap();
+        assert!(rewritten.starts_with("POST /upload?x=1 HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n"));
+        assert!(rewritten.contains("\r\nConnection: close\r\n"));
+        assert!(rewritten.contains("\r\nVia: 1.1 RPKernel\r\n"));
+        assert!(!rewritten.contains("wrong.example"));
+        assert!(!rewritten.contains("X-Hop"));
+        assert!(!rewritten.to_ascii_lowercase().contains("proxy-"));
+
+        let request =
+            parse_http_request_head(b"GET /status HTTP/1.1\r\nHost: Example.COM:8081\r\n\r\n")
+                .unwrap();
+        assert_eq!(
+            parse_http_route(&request).unwrap(),
+            HttpRoute::Forward(ForwardTarget {
+                authority: ParsedAuthority {
+                    host: "example.com".into(),
+                    port: 8081,
+                    host_header: "example.com:8081".into(),
+                },
+                origin_form: "/status".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn http_connect_and_basic_auth_support_ipv6_and_case_insensitive_scheme() {
+        let request = parse_http_request_head(
+            b"CONNECT [2001:db8::5]:443 HTTP/1.1\r\n\
+              Host: [2001:db8::5]:443\r\n\
+              Proxy-Authorization: bAsIc dXNlcjpwYXNz\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_http_route(&request).unwrap(),
+            HttpRoute::Connect(ParsedAuthority {
+                host: "2001:db8::5".into(),
+                port: 443,
+                host_header: "[2001:db8::5]:443".into(),
+            })
+        );
+        let auth = [core_config::runtime_plan::UserPass {
+            user: "user".into(),
+            pass: "pass".into(),
+        }];
+        assert!(http_proxy_authenticated(&request, Some(&auth)));
+        assert!(!http_proxy_authenticated(
+            &parse_http_request_head(
+                b"CONNECT example.com:443 HTTP/1.1\r\n\
+                  Host: example.com:443\r\n\
+                  Proxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n",
+            )
+            .unwrap(),
+            Some(&auth),
+        ));
+    }
+
+    #[test]
+    fn http_parser_rejects_ambiguous_headers_and_targets() {
+        for malformed in [
+            b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive,,X-Hop\r\n\r\n"
+                .as_slice(),
+            b"GET / HTTP/1.1\nHost: example.com\r\n\r\n".as_slice(),
+            b"GET /\0 HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+        ] {
+            assert!(parse_http_request_head(malformed).is_err(), "{malformed:?}");
+        }
+
+        for malformed_target in [
+            b"GET / HTTP/1.1\r\nUser-Agent: test\r\n\r\n".as_slice(),
+            b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+            b"GET example.com:80 HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+            b"GET http://user@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+            b"GET http://127.000.0.1/ HTTP/1.1\r\nHost: 127.000.0.1\r\n\r\n".as_slice(),
+            b"CONNECT 2001:db8::1:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n".as_slice(),
+            b"CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+        ] {
+            let request = parse_http_request_head(malformed_target).unwrap();
+            assert!(parse_http_route(&request).is_err(), "{malformed_target:?}");
+        }
+    }
+
+    #[test]
+    fn http_forward_body_framing_accepts_bounded_standard_forms() {
+        let content_length = parse_http_request_head(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            content_length.forward_body_framing().unwrap(),
+            HttpBodyFraming::Fixed { remaining: 4 }
+        ));
+
+        let chunked = parse_http_request_head(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            chunked.forward_body_framing().unwrap(),
+            HttpBodyFraming::Chunked(_)
+        ));
+
+        let unsupported = parse_http_request_head(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            unsupported.forward_body_framing().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+
+        let overflow = parse_http_request_head(
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 999999999999999999999999\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            overflow.forward_body_framing().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        for ambiguous in [
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nConnection: Content-Length\r\nContent-Length: 4\r\n\r\n"
+                .as_slice(),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nConnection: Transfer-Encoding\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            b"POST / HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nTrailer: Digest\r\n\r\n".as_slice(),
+        ] {
+            let request = parse_http_request_head(ambiguous).unwrap();
+            assert_eq!(
+                request.forward_body_framing().unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{ambiguous:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_single_request_stream_stops_at_declared_body_boundary() {
+        let (mut client, proxy) = tokio::io::duplex(1024);
+        client.write_all(b"dySECOND").await.unwrap();
+        let mut request = HttpSingleRequestStream::new(
+            proxy,
+            b"bo".to_vec(),
+            HttpBodyFraming::fixed(4),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let mut body = Vec::new();
+        request.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"body");
+
+        let mut proxy = request.into_inner();
+        let mut second = [0u8; 6];
+        proxy.read_exact(&mut second).await.unwrap();
+        assert_eq!(&second, b"SECOND");
+    }
+
+    #[tokio::test]
+    async fn http_single_request_stream_rejects_overread_and_slow_body() {
+        let (_, proxy) = tokio::io::duplex(1024);
+        assert!(
+            HttpSingleRequestStream::new(
+                proxy,
+                b"body plus pipeline".to_vec(),
+                HttpBodyFraming::fixed(4),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+
+        let (_client, proxy) = tokio::io::duplex(1024);
+        let mut request = HttpSingleRequestStream::new(
+            proxy,
+            Vec::new(),
+            HttpBodyFraming::fixed(1),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let mut byte = [0u8; 1];
+        let error = request.read(&mut byte).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn http_chunked_stream_preserves_trailers_and_stops_before_pipeline() {
+        let (mut client, proxy) = tokio::io::duplex(1024);
+        client
+            .write_all(b"dy\r\n0\r\nX-Checksum: yes\r\n\r\nSECOND")
+            .await
+            .unwrap();
+        let mut request = HttpSingleRequestStream::new(
+            proxy,
+            b"4\r\nbo".to_vec(),
+            HttpBodyFraming::chunked(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let mut body = Vec::new();
+        request.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"4\r\nbody\r\n0\r\nX-Checksum: yes\r\n\r\n");
+
+        let mut proxy = request.into_inner();
+        let mut second = [0u8; 6];
+        proxy.read_exact(&mut second).await.unwrap();
+        assert_eq!(&second, b"SECOND");
+    }
+
+    #[test]
+    fn http_chunked_framing_rejects_malformed_or_forbidden_trailers() {
+        for body in [
+            b"z\r\n".as_slice(),
+            b"1\r\naX".as_slice(),
+            b"0\r\nContent-Length: 4\r\n\r\n".as_slice(),
+            b"0\r\nProxy-Connection: keep-alive\r\n\r\n".as_slice(),
+            b"0\n\n".as_slice(),
+        ] {
+            assert!(
+                HttpBodyFraming::chunked()
+                    .validate_prefetched(body)
+                    .is_err(),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_header_reader_preserves_tail_and_enforces_limits() {
+        let payload = b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nbody";
+        let (mut writer, mut reader) = tokio::io::duplex(32 * 1024);
+        writer.write_all(payload).await.unwrap();
+        let (head, tail) = read_http_head(&mut reader, TEST_TIMEOUT).await.unwrap();
+        assert!(head.ends_with(b"\r\n\r\n"));
+        assert_eq!(tail, b"body");
+
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n")
+            .await
+            .unwrap();
+        let error = read_http_head(&mut reader, Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        let (mut writer, mut reader) = tokio::io::duplex(HTTP_MAX_HEADER_BYTES + 1);
+        writer
+            .write_all(&vec![b'a'; HTTP_MAX_HEADER_BYTES])
+            .await
+            .unwrap();
+        let error = read_http_head(&mut reader, TEST_TIMEOUT).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn mixed_listener_shutdown_aborts_open_http_connections() {
+        let _guard = network_test_lock().lock().await;
+        let mut server = spawn_test_mixed(IpAddr::V4(Ipv4Addr::LOCALHOST), true, None).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        server.task.abort();
+        let _ = timeout(TEST_TIMEOUT, &mut server.task).await;
+        let mut byte = [0u8; 1];
+        let closed = timeout(Duration::from_secs(1), client.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "connection task survived listener shutdown: {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_auth_challenge_precedes_target_routing() {
+        let _guard = network_test_lock().lock().await;
+        let auth = vec![core_config::runtime_plan::UserPass {
+            user: "user".into(),
+            pass: "pass".into(),
+        }];
+        let server = spawn_test_mixed(IpAddr::V4(Ipv4Addr::LOCALHOST), true, Some(auth)).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        client
+            .write_all(b"GET invalid-authority HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let (response, tail) = read_http_head(&mut client, TEST_TIMEOUT).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 407 Proxy Authentication Required\r\n"));
+        assert!(tail.is_empty());
     }
 
     #[test]
