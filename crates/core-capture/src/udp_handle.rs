@@ -48,7 +48,7 @@ pub async fn handle_udp_packet(
     outer_dst: SocketAddr,
     payload: Vec<u8>,
 ) {
-    // NAT 表登记（仅记账；session 复用走 udp_sessions）
+    // NAT 表按 flow upsert（仅记账；session 复用走 udp_sessions）。
     let now = Instant::now();
     let _ = ctx.nat.insert(NatEntry {
         source: inner_src,

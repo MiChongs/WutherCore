@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 
 #[derive(Debug, Clone)]
 pub struct NatEntry {
@@ -101,38 +101,90 @@ impl NatTable {
         self.ttl
     }
 
-    /// 插入新会话。如果同 flow 已存在则覆盖（旧 id 保留为孤立 entry，后续 purge 回收）。
+    /// 插入或更新会话。
+    ///
+    /// 同一个 [`FlowKey`] 始终复用首次分配的 id，避免按包记账时不断产生孤立
+    /// entry。更新会保留最早的 `created_at` 和已有的 fake-host，并把
+    /// `last_seen` 单调推进到较新的时间。
     pub fn insert(&self, entry: NatEntry) -> u64 {
         let key = FlowKey::from_entry(&entry);
-        let id = {
-            let mut g = self.next_id.lock();
-            let id = *g;
-            *g = g.wrapping_add(1);
-            id
-        };
-        self.by_flow.insert(key, id);
-        self.map.insert(id, entry);
-        id
+        match self.by_flow.entry(key) {
+            Entry::Occupied(index) => {
+                let id = *index.get();
+                if let Some(mut current) = self.map.get_mut(&id) {
+                    if entry.created_at < current.created_at {
+                        current.created_at = entry.created_at;
+                    }
+                    if entry.last_seen > current.last_seen {
+                        current.last_seen = entry.last_seen;
+                    }
+                    if entry.fake_host.is_some() {
+                        current.fake_host = entry.fake_host;
+                    }
+                } else {
+                    // 修复可能由旧版本或异常中断留下的悬空索引，同时继续复用 id。
+                    self.map.insert(id, entry);
+                }
+                id
+            }
+            Entry::Vacant(index) => {
+                let id = {
+                    let mut g = self.next_id.lock();
+                    let id = *g;
+                    *g = g.wrapping_add(1);
+                    id
+                };
+                // 持有 flow shard 的写锁时先写主表，再发布反向索引。这样 lookup
+                // 不会观察到一个尚无 NatEntry 的新 id。
+                self.map.insert(id, entry);
+                index.insert(id);
+                id
+            }
+        }
     }
 
     pub fn touch(&self, id: u64) {
-        if let Some(mut e) = self.map.get_mut(&id) {
-            e.last_seen = Instant::now();
+        let Some(key) = self.map.get(&id).map(|e| FlowKey::from_entry(&e)) else {
+            return;
+        };
+        if let Entry::Occupied(index) = self.by_flow.entry(key) {
+            if *index.get() == id {
+                if let Some(mut entry) = self.map.get_mut(&id) {
+                    entry.last_seen = Instant::now();
+                }
+            }
         }
     }
 
     /// 通过 5-tuple 找会话，并 touch last_seen。
     pub fn lookup_flow(&self, key: &FlowKey) -> Option<NatEntry> {
-        let id = *self.by_flow.get(key)?;
-        let mut entry_ref = self.map.get_mut(&id)?;
-        entry_ref.last_seen = Instant::now();
-        Some(entry_ref.clone())
+        match self.by_flow.entry(*key) {
+            Entry::Occupied(index) => {
+                let id = *index.get();
+                let Some(mut entry_ref) = self.map.get_mut(&id) else {
+                    // 主表缺失时清理悬空索引，避免之后持续返回伪命中。
+                    index.remove();
+                    return None;
+                };
+                entry_ref.last_seen = Instant::now();
+                Some(entry_ref.clone())
+            }
+            Entry::Vacant(_) => None,
+        }
     }
 
     pub fn remove(&self, id: u64) -> Option<NatEntry> {
-        let entry = self.map.remove(&id).map(|(_, v)| v)?;
-        self.by_flow.remove(&FlowKey::from_entry(&entry));
-        Some(entry)
+        let key = self.map.get(&id).map(|e| FlowKey::from_entry(&e))?;
+        match self.by_flow.entry(key) {
+            Entry::Occupied(index) => {
+                let entry = self.map.remove(&id).map(|(_, value)| value);
+                if *index.get() == id {
+                    index.remove();
+                }
+                entry
+            }
+            Entry::Vacant(_) => self.map.remove(&id).map(|(_, value)| value),
+        }
     }
 
     pub fn get(&self, id: u64) -> Option<NatEntry> {
@@ -151,22 +203,48 @@ impl NatTable {
     pub fn purge(&self) -> usize {
         let now = Instant::now();
         let ttl = self.ttl;
-        let mut removed: Vec<FlowKey> = Vec::new();
-        self.map.retain(|_id, e| {
-            let alive = now.duration_since(e.last_seen) < ttl;
-            if !alive {
-                removed.push(FlowKey::from_entry(e));
+        let candidates: Vec<(u64, FlowKey)> = self
+            .map
+            .iter()
+            .filter_map(|entry| {
+                (now.saturating_duration_since(entry.last_seen) >= ttl)
+                    .then(|| (*entry.key(), FlowKey::from_entry(&entry)))
+            })
+            .collect();
+        let mut removed = 0;
+        for (id, key) in candidates {
+            match self.by_flow.entry(key) {
+                Entry::Occupied(index) => {
+                    // insert/touch/lookup 同样先取得 flow shard，因此这里重新检查
+                    // last_seen 后，旧候选无法误删刚刚 upsert 的活跃 entry。
+                    let expired = self
+                        .map
+                        .get(&id)
+                        .is_some_and(|entry| now.saturating_duration_since(entry.last_seen) >= ttl);
+                    if expired && self.map.remove(&id).is_some() {
+                        removed += 1;
+                        // 仅当索引仍指向被删 id 时移除；兼容旧版本遗留的孤立 entry。
+                        if *index.get() == id {
+                            index.remove();
+                        }
+                    }
+                }
+                Entry::Vacant(_) => {
+                    let expired = self
+                        .map
+                        .get(&id)
+                        .is_some_and(|entry| now.saturating_duration_since(entry.last_seen) >= ttl);
+                    if expired && self.map.remove(&id).is_some() {
+                        removed += 1;
+                    }
+                }
             }
-            alive
-        });
-        for k in &removed {
-            self.by_flow.remove(k);
         }
         let pin_before = self.host_pin.len();
         self.host_pin
-            .retain(|_, p| now.duration_since(p.last_seen) < ttl);
+            .retain(|_, p| now.saturating_duration_since(p.last_seen) < ttl);
         let pin_removed = pin_before - self.host_pin.len();
-        removed.len() + pin_removed
+        removed + pin_removed
     }
 }
 
@@ -182,6 +260,14 @@ mod tests {
             network: net,
             created_at: Instant::now(),
             last_seen: Instant::now(),
+        }
+    }
+
+    fn key(src: &str, dst: &str, net: &'static str) -> FlowKey {
+        FlowKey {
+            network: net,
+            src: src.parse().unwrap(),
+            dst: dst.parse().unwrap(),
         }
     }
 
@@ -225,19 +311,90 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_flow_overwrites_index() {
+    fn same_flow_many_upserts_keep_stable_id_and_single_entry() {
         let t = NatTable::default();
-        let id1 = t.insert(entry("10.0.0.1:1000", "8.8.8.8:53", "udp"));
-        let id2 = t.insert(entry("10.0.0.1:1000", "8.8.8.8:53", "udp"));
-        let key = FlowKey {
-            network: "udp",
-            src: "10.0.0.1:1000".parse().unwrap(),
-            dst: "8.8.8.8:53".parse().unwrap(),
-        };
-        let found = t.lookup_flow(&key).unwrap();
+        let template = entry("10.0.0.1:1000", "8.8.8.8:53", "udp");
+        let id = t.insert(template.clone());
+        for _ in 0..100_000 {
+            let mut update = template.clone();
+            update.last_seen = Instant::now();
+            assert_eq!(t.insert(update), id);
+        }
+
+        let found = t
+            .lookup_flow(&key("10.0.0.1:1000", "8.8.8.8:53", "udp"))
+            .unwrap();
         assert_eq!(found.network, "udp");
-        // 旧 entry 仍可通过 id1 取到（待 purge 回收）；新插入的 id2 正常
-        assert!(t.get(id1).is_some());
-        assert!(t.get(id2).is_some());
+        assert_eq!(t.len(), 1);
+        assert!(t.get(id).is_some());
+    }
+
+    #[test]
+    fn upsert_refreshes_expired_flow_without_old_candidate_removing_it() {
+        let t = NatTable::new(Duration::from_secs(30));
+        let stale_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut stale = entry("10.0.0.1:1000", "8.8.8.8:53", "udp");
+        stale.created_at = stale_at;
+        stale.last_seen = stale_at;
+        let id = t.insert(stale);
+
+        let mut refreshed = entry("10.0.0.1:1000", "8.8.8.8:53", "udp");
+        refreshed.fake_host = Some("dns.example".into());
+        assert_eq!(t.insert(refreshed), id);
+
+        assert_eq!(t.purge(), 0);
+        assert_eq!(t.len(), 1);
+        let current = t.get(id).unwrap();
+        assert_eq!(current.created_at, stale_at);
+        assert_eq!(current.fake_host.as_deref(), Some("dns.example"));
+        assert!(
+            t.lookup_flow(&key("10.0.0.1:1000", "8.8.8.8:53", "udp"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn distinct_flows_remain_independent() {
+        let t = NatTable::default();
+        let udp = t.insert(entry("10.0.0.1:1000", "8.8.8.8:53", "udp"));
+        let tcp = t.insert(entry("10.0.0.1:1000", "8.8.8.8:53", "tcp"));
+        let other_dst = t.insert(entry("10.0.0.1:1000", "1.1.1.1:53", "udp"));
+
+        assert_ne!(udp, tcp);
+        assert_ne!(udp, other_dst);
+        assert_ne!(tcp, other_dst);
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn purge_keeps_flow_index_consistent_with_main_table() {
+        let t = NatTable::new(Duration::from_secs(30));
+        let stale_at = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut stale = entry("10.0.0.1:1000", "8.8.8.8:53", "udp");
+        stale.created_at = stale_at;
+        stale.last_seen = stale_at;
+        let stale_id = t.insert(stale);
+        let live_id = t.insert(entry("10.0.0.2:2000", "1.1.1.1:53", "udp"));
+
+        assert_eq!(t.purge(), 1);
+        assert!(t.get(stale_id).is_none());
+        assert!(
+            t.lookup_flow(&key("10.0.0.1:1000", "8.8.8.8:53", "udp"))
+                .is_none()
+        );
+        assert_eq!(
+            t.lookup_flow(&key("10.0.0.2:2000", "1.1.1.1:53", "udp"))
+                .map(|entry| entry.original_dst),
+            Some("1.1.1.1:53".parse().unwrap())
+        );
+        assert!(t.get(live_id).is_some());
+
+        let replacement = t.insert(entry("10.0.0.1:1000", "8.8.8.8:53", "udp"));
+        assert_ne!(replacement, stale_id);
+        assert_eq!(t.len(), 2);
+        assert!(
+            t.lookup_flow(&key("10.0.0.1:1000", "8.8.8.8:53", "udp"))
+                .is_some()
+        );
     }
 }
