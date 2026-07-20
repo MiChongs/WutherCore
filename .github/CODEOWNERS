@@ -1,0 +1,7 @@
+# Default reviewers. CODEOWNERS review is requested automatically but is not
+# required, so the documented administrator break-glass path remains usable.
+* @MiChongs @Tools-cx-app
+
+/.github/ @MiChongs @Tools-cx-app
+/SECURITY.md @MiChongs @Tools-cx-app
+/GOVERNANCE.md @MiChongs @Tools-cx-app

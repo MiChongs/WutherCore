@@ -1,0 +1,96 @@
+name: Bug 报告
+description: 报告可以稳定复现的错误、回归或平台问题。
+title: "[Bug]: "
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请搜索现有 Issue，并删除订阅地址、节点凭据、访问令牌、私钥和其他敏感信息。
+
+  - type: input
+    id: version
+    attributes:
+      label: WutherCore 版本
+      description: 填写版本号或 `git rev-parse --short HEAD` 的结果。
+      placeholder: v0.3.0 / 1a2b3c4
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、版本、CPU 架构以及是否使用容器。
+      placeholder: Windows 11 24H2, x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: capture
+    attributes:
+      label: 流量接管方式
+      options:
+        - 未启用（HTTP / SOCKS5）
+        - TUN
+        - TPROXY
+        - REDIRECT
+        - Android VpnService
+        - Android root
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 说明实际发生了什么，以及它为什么是错误行为。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      placeholder: |
+        1. 使用以下最小配置……
+        2. 运行……
+        3. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 已脱敏的最小配置
+      description: 删除或替换 URL、域名、IP、凭据、密钥和个人路径。
+      render: yaml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏的日志
+      description: 请包含错误前后的上下文，不要上传凭据。
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue，确认没有相同报告。
+          required: true
+        - label: 我已删除配置、日志和截图中的敏感信息。
+          required: true
+        - label: 我同意遵守项目行为准则。
+          required: true

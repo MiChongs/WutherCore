@@ -5,10 +5,12 @@ WutherCore 是一个用 Rust 编写的代理内核。它读取 YAML 配置，负
 这个仓库只提供内核和命令行工具，不包含桌面或移动端 GUI。如果你想自己搭一套代理客户端、路由器网关，或者研究透明代理的实现，可以从这里开始。
 
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Build](https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml/badge.svg)](https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml)
+[![Required CI](https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml/badge.svg)](https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > WutherCore 仍在开发中。现阶段更适合愿意阅读日志、自己维护配置的用户；稳定版之前，配置结构和 API 都可能调整。
+
+[快速开始](#快速开始) · [配置示例](#配置) · [参与贡献](CONTRIBUTING.md) · [问题反馈](https://github.com/MiChongs/WutherCore/issues/new/choose) · [交流讨论](https://github.com/MiChongs/WutherCore/discussions)
 
 ## 能做什么
 
@@ -171,17 +173,18 @@ WutherCore 使用 Cargo workspace 拆分各个模块：
 
 ```bash
 cargo fmt --all --check
+cargo check --workspace --all-targets
 cargo test --workspace
 cargo build --release -p wuther-core
 ```
 
 端到端测试位于 `tests-e2e`。构建脚本和交叉编译说明位于 [`scripts/README.md`](scripts/README.md)，编译配置说明见 [`docs/BUILD-PERF.md`](docs/BUILD-PERF.md)。
 
-提交改动时，请尽量做到：
+准备提交代码前，请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)。其中说明了开发环境、测试范围、提交方式和 Pull Request 要求。
 
-- 新增配置项时，同时补充反序列化和运行时计划测试。
-- 修改协议实现时，覆盖握手、异常输入和连接关闭路径。
-- 修复平台相关问题时，在说明中写清系统版本、权限和流量接管方式。
+使用中遇到问题时，请根据类型选择 [Bug 报告或功能建议](https://github.com/MiChongs/WutherCore/issues/new/choose)；配置讨论和一般问题更适合放在 [Discussions](https://github.com/MiChongs/WutherCore/discussions)。安全问题不要公开提交 Issue，请按照 [`SECURITY.md`](SECURITY.md) 私下报告。
+
+项目的维护方式、合并规则和紧急合并流程见 [`GOVERNANCE.md`](GOVERNANCE.md)。
 
 ## License
 
