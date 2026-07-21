@@ -78,7 +78,7 @@ clap = { version = "4", features = ["derive"] }
 # Web / API
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 # 自研 core-fetch 用的 HTTP 1.1 client 栈 —— 直接走 hyper 1.x，注入
 # bind_outbound_socket，关掉所有平台（含 Windows）订阅 / 规则集拉取的 TUN
 # 自循环。已经替代 reqwest，依赖也跟着移除。
