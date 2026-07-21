@@ -104,6 +104,9 @@ pub struct CapturePlan {
     pub route_address_set: Vec<String>,
     pub route_exclude_address_set: Vec<String>,
     pub loopback_addresses: Vec<IpAddr>,
+    /// 包设备是否允许把 loopback 地址作为目标。系统 TUN 必须关闭以防代理回环；
+    /// 已认证的 WireGuard 入站不是宿主机回注路径，可安全访问本机服务。
+    pub allow_loopback_destination: bool,
 
     /* ---- NAT ---- */
     pub endpoint_independent_nat: bool,
@@ -294,6 +297,7 @@ impl CapturePlan {
             route_address_set: c.tun.route_address_set.clone(),
             route_exclude_address_set: c.tun.route_exclude_address_set.clone(),
             loopback_addresses,
+            allow_loopback_destination: false,
 
             endpoint_independent_nat: c.tun.endpoint_independent_nat,
             udp_timeout: c.tun.udp_timeout,

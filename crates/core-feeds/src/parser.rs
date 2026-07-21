@@ -140,7 +140,7 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
     node.method = str_g("cipher").or_else(|| str_g("method"));
     node.tls = g("tls").and_then(|v| v.as_bool()).unwrap_or(false)
         || matches!(
-            proto,
+            &proto,
             NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
         );
     node.sni = str_g("sni").or_else(|| str_g("servername"));
@@ -183,6 +183,21 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         }
         if let Some(s) = scalar_to_string(v) {
             node.params.insert(key.to_string(), s);
+        }
+    }
+
+    // WireGuard 的标准多 peer / 列表字段不能按普通“仅标量”路径丢弃。
+    // 统一保存为 JSON，registry 再做严格别名、类型和冲突校验。
+    if matches!(&proto, NodeProtocol::Wireguard) {
+        if let Some(network) = str_g("network") {
+            node.params.insert("network".into(), network);
+        }
+        for key in ["allowed-ips", "dns", "reserved", "peers"] {
+            if let Some(value) = g(key)
+                && let Ok(json) = serde_json::to_string(&value)
+            {
+                node.params.insert(key.into(), json);
+            }
         }
     }
 
@@ -428,6 +443,54 @@ proxies:
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].protocol, NodeProtocol::Trojan);
         assert_eq!(nodes[1].method.as_deref(), Some("aes-256-gcm"));
+    }
+
+    #[test]
+    fn parse_clash_wireguard_preserves_lists_and_multi_peer_objects() {
+        let yaml = r#"
+proxies:
+  - name: WG-full
+    type: wireguard
+    server: 127.0.0.1
+    port: 51820
+    private-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+    ip: 10.0.0.2/32
+    ipv6: fd00::2/128
+    mtu: 1380
+    udp: true
+    network: tcp,udp
+    dns: [10.0.0.53, "fd00::53"]
+    remote-dns-resolve: true
+    peers:
+      - server: 192.0.2.1
+        port: 51820
+        public-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+        allowed-ips: [10.0.0.0/8]
+        reserved: [1, 2, 3]
+      - server: "2001:db8::1"
+        port: 51821
+        public-key: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+        allowed-ips: ["fd00::/8"]
+        persistent-keepalive: 0
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::ClashYaml);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.protocol, NodeProtocol::Wireguard);
+        assert_eq!(
+            node.params.get("network").map(String::as_str),
+            Some("tcp,udp")
+        );
+        assert_eq!(
+            node.params.get("remote-dns-resolve").map(String::as_str),
+            Some("1")
+        );
+        let dns: serde_json::Value = serde_json::from_str(node.params.get("dns").unwrap()).unwrap();
+        assert_eq!(dns.as_array().unwrap().len(), 2);
+        let peers: serde_json::Value =
+            serde_json::from_str(node.params.get("peers").unwrap()).unwrap();
+        assert_eq!(peers.as_array().unwrap().len(), 2);
+        assert_eq!(peers[0]["reserved"], serde_json::json!([1, 2, 3]));
     }
 
     #[test]

@@ -211,6 +211,93 @@ pub struct Listen {
     /// `protocol` 指定的内层代理协议。
     #[serde(default, alias = "reality-inbounds", alias = "reality_inbounds")]
     pub reality: Vec<RealityListen>,
+    /// WireGuard 服务端入站。每个条目绑定一个 UDP 端口，并把已认证对端的
+    /// IPv4/IPv6 包交给 WutherCore 的 TCP/UDP 路由运行时。
+    #[serde(default, alias = "wireguard-inbounds", alias = "wireguard_inbounds")]
+    pub wireguard: Vec<WireGuardListen>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireGuardListen {
+    #[serde(default = "default_wireguard_listen_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(rename = "privateKey", alias = "private_key", alias = "private-key")]
+    pub private_key: String,
+    pub peers: Vec<WireGuardListenPeer>,
+    #[serde(default = "default_wireguard_mtu")]
+    pub mtu: usize,
+    #[serde(
+        default = "default_wireguard_packet_queue",
+        rename = "packetQueue",
+        alias = "packet_queue",
+        alias = "packet-queue"
+    )]
+    pub packet_queue: usize,
+    #[serde(
+        default = "default_wireguard_handshake_rate_limit",
+        rename = "handshakeRateLimit",
+        alias = "handshake_rate_limit",
+        alias = "handshake-rate-limit"
+    )]
+    pub handshake_rate_limit: u64,
+}
+
+impl std::fmt::Debug for WireGuardListen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireGuardListen")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("private_key", &"<redacted>")
+            .field("peers", &self.peers)
+            .field("mtu", &self.mtu)
+            .field("packet_queue", &self.packet_queue)
+            .field("handshake_rate_limit", &self.handshake_rate_limit)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireGuardListenPeer {
+    #[serde(rename = "publicKey", alias = "public_key", alias = "public-key")]
+    pub public_key: String,
+    #[serde(
+        default,
+        rename = "presharedKey",
+        alias = "preshared_key",
+        alias = "preshared-key"
+    )]
+    pub preshared_key: Option<String>,
+    #[serde(rename = "allowedIPs", alias = "allowed_ips", alias = "allowed-ips")]
+    pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub reserved: Vec<u8>,
+    #[serde(
+        default,
+        rename = "persistentKeepalive",
+        alias = "persistent_keepalive",
+        alias = "persistent-keepalive"
+    )]
+    pub persistent_keepalive: Option<u16>,
+}
+
+impl std::fmt::Debug for WireGuardListenPeer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireGuardListenPeer")
+            .field("public_key", &self.public_key)
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allowed_ips", &self.allowed_ips)
+            .field("reserved", &self.reserved)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .finish()
+    }
 }
 
 /// Xray REALITY 服务端监听配置。
@@ -584,6 +671,10 @@ pub struct NodeDetail {
     pub transport: Option<NodeTransport>,
     #[serde(default)]
     pub network: Option<NodeNetwork>,
+    /// 协议专属字段。标量保持文本语义，数组/对象会被编译为 JSON 后交给
+    /// 对应协议注册器做严格校验；用于 WireGuard peers/allowed-ips 等结构。
+    #[serde(default, alias = "protocol-options", alias = "protocol_options")]
+    pub params: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1744,6 +1835,22 @@ fn default_localhost() -> String {
 }
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()
+}
+
+fn default_wireguard_listen_host() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_wireguard_mtu() -> usize {
+    1_420
+}
+
+fn default_wireguard_packet_queue() -> usize {
+    1_024
+}
+
+fn default_wireguard_handshake_rate_limit() -> u64 {
+    100
 }
 fn default_reality_inner_protocol() -> String {
     "vless".into()

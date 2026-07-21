@@ -7,7 +7,11 @@
 //! 这里产出的结构是给 `core-runtime` / `core-route` / `core-outbound`
 //! 共同消费的 *已展开* 数据，而非 YAML 原貌。
 
-use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,9 +45,60 @@ pub struct ListenPlan {
     pub mixed: Option<MixedListen>,
     #[serde(default)]
     pub reality: Vec<RealityListen>,
+    #[serde(default)]
+    pub wireguard: Vec<WireGuardListenPlan>,
     pub panel: Option<PanelListen>,
     pub share: Share,
     pub auth: Vec<UserPass>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WireGuardListenPlan {
+    pub bind: SocketAddr,
+    pub private_key: [u8; 32],
+    pub peers: Vec<WireGuardListenPeerPlan>,
+    pub mtu: usize,
+    pub packet_queue: usize,
+    pub handshake_rate_limit: u64,
+}
+
+impl std::fmt::Debug for WireGuardListenPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireGuardListenPlan")
+            .field("bind", &self.bind)
+            .field("private_key", &"<redacted>")
+            .field("peers", &self.peers)
+            .field("mtu", &self.mtu)
+            .field("packet_queue", &self.packet_queue)
+            .field("handshake_rate_limit", &self.handshake_rate_limit)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WireGuardListenPeerPlan {
+    pub public_key: [u8; 32],
+    pub preshared_key: Option<[u8; 32]>,
+    pub allowed_ips: Vec<ipnet::IpNet>,
+    pub reserved: [u8; 3],
+    pub persistent_keepalive: Option<u16>,
+}
+
+impl std::fmt::Debug for WireGuardListenPeerPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireGuardListenPeerPlan")
+            .field("public_key", &self.public_key)
+            .field(
+                "preshared_key",
+                &self.preshared_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allowed_ips", &self.allowed_ips)
+            .field("reserved", &self.reserved)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +261,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         share: None,
         auth: vec![],
         reality: vec![],
+        wireguard: vec![],
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -280,14 +336,154 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         .collect();
 
     let reality = compile_reality_listeners(&listen.reality)?;
+    let wireguard = compile_wireguard_listeners(&listen.wireguard)?;
 
     Ok(ListenPlan {
         mixed,
         reality,
+        wireguard,
         panel,
         share,
         auth,
     })
+}
+
+fn compile_wireguard_listeners(
+    listeners: &[WireGuardListen],
+) -> ConfigResult<Vec<WireGuardListenPlan>> {
+    let mut result = Vec::with_capacity(listeners.len());
+    let mut binds = HashSet::new();
+    for (index, source) in listeners.iter().enumerate() {
+        let location = format!("listen.wireguard[{index}]");
+        let host = source.host.trim().parse::<IpAddr>().map_err(|_| {
+            ConfigError::invalid("WireGuard 服务端 host 必须是 IPv4 或 IPv6 地址")
+                .at(format!("{location}.host"))
+        })?;
+        if source.port == 0 {
+            return Err(ConfigError::invalid("WireGuard 服务端监听端口不能为 0")
+                .at(format!("{location}.port")));
+        }
+        let bind = SocketAddr::new(host, source.port);
+        if !binds.insert(bind) {
+            return Err(ConfigError::invalid("重复的 WireGuard 服务端监听地址").at(location));
+        }
+        let private_key =
+            decode_wireguard_key(&source.private_key, &format!("{location}.privateKey"))?;
+        if private_key == [0; 32] {
+            return Err(ConfigError::invalid("WireGuard privateKey 不能全为 0")
+                .at(format!("{location}.privateKey")));
+        }
+        if source.peers.is_empty() || source.peers.len() > 256 {
+            return Err(ConfigError::invalid("WireGuard peers 数量必须在 1..=256")
+                .at(format!("{location}.peers")));
+        }
+        if !(576..=65_535).contains(&source.mtu) {
+            return Err(ConfigError::invalid("WireGuard mtu 必须在 576..=65535")
+                .at(format!("{location}.mtu")));
+        }
+        if !(16..=65_536).contains(&source.packet_queue) {
+            return Err(
+                ConfigError::invalid("WireGuard packetQueue 必须在 16..=65536")
+                    .at(format!("{location}.packetQueue")),
+            );
+        }
+        if !(1..=1_000_000).contains(&source.handshake_rate_limit) {
+            return Err(
+                ConfigError::invalid("WireGuard handshakeRateLimit 必须在 1..=1000000")
+                    .at(format!("{location}.handshakeRateLimit")),
+            );
+        }
+
+        let mut peers = Vec::with_capacity(source.peers.len());
+        let mut public_keys = HashSet::new();
+        let mut exact_routes = HashSet::new();
+        let mut has_ipv6 = false;
+        for (peer_index, peer) in source.peers.iter().enumerate() {
+            let peer_location = format!("{location}.peers[{peer_index}]");
+            let public_key =
+                decode_wireguard_key(&peer.public_key, &format!("{peer_location}.publicKey"))?;
+            if public_key == [0; 32] || !public_keys.insert(public_key) {
+                return Err(ConfigError::invalid(
+                    "WireGuard 对端公钥不能全为 0，且每个监听器内必须唯一",
+                )
+                .at(format!("{peer_location}.publicKey")));
+            }
+            let preshared_key = peer
+                .preshared_key
+                .as_deref()
+                .map(|key| decode_wireguard_key(key, &format!("{peer_location}.presharedKey")))
+                .transpose()?;
+            if peer.allowed_ips.is_empty() {
+                return Err(
+                    ConfigError::invalid("WireGuard 对端至少需要一个 allowedIPs")
+                        .at(format!("{peer_location}.allowedIPs")),
+                );
+            }
+            let mut allowed_ips = Vec::with_capacity(peer.allowed_ips.len());
+            for (route_index, route) in peer.allowed_ips.iter().enumerate() {
+                let network = route.parse::<ipnet::IpNet>().map_err(|error| {
+                    ConfigError::invalid(format!("非法 WireGuard allowedIPs：{error}"))
+                        .at(format!("{peer_location}.allowedIPs[{route_index}]"))
+                })?;
+                let network = network.trunc();
+                has_ipv6 |= network.addr().is_ipv6();
+                if !exact_routes.insert(network) {
+                    return Err(ConfigError::invalid(
+                        "同一 WireGuard allowedIPs 不能分配给多个对端",
+                    )
+                    .at(format!("{peer_location}.allowedIPs[{route_index}]")));
+                }
+                allowed_ips.push(network);
+            }
+            let reserved: [u8; 3] = match peer.reserved.as_slice() {
+                [] => [0; 3],
+                [a, b, c] => [*a, *b, *c],
+                _ => {
+                    return Err(
+                        ConfigError::invalid("WireGuard reserved 必须为空或恰好 3 个字节")
+                            .at(format!("{peer_location}.reserved")),
+                    );
+                }
+            };
+            peers.push(WireGuardListenPeerPlan {
+                public_key,
+                preshared_key,
+                allowed_ips,
+                reserved,
+                persistent_keepalive: peer.persistent_keepalive,
+            });
+        }
+        if has_ipv6 && source.mtu < 1_280 {
+            return Err(
+                ConfigError::invalid("WireGuard IPv6 allowedIPs 要求 mtu 至少为 1280")
+                    .at(format!("{location}.mtu")),
+            );
+        }
+        result.push(WireGuardListenPlan {
+            bind,
+            private_key,
+            peers,
+            mtu: source.mtu,
+            packet_queue: source.packet_queue,
+            handshake_rate_limit: source.handshake_rate_limit,
+        });
+    }
+    Ok(result)
+}
+
+fn decode_wireguard_key(value: &str, location: &str) -> ConfigResult<[u8; 32]> {
+    use base64::{Engine as _, engine::general_purpose};
+
+    let value = value.trim();
+    let decoded = general_purpose::STANDARD
+        .decode(value)
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(value.trim_end_matches('=')))
+        .map_err(|error| {
+            ConfigError::invalid(format!("WireGuard 密钥不是合法 base64：{error}")).at(location)
+        })?;
+    decoded
+        .try_into()
+        .map_err(|_| ConfigError::invalid("WireGuard 密钥必须解码为 32 字节").at(location))
 }
 
 fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
@@ -591,22 +787,66 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
         .as_deref()
         .map(NodeProtocol::from_scheme)
         .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 protocol", d.name)))?;
-    let address = d
-        .address
-        .as_deref()
-        .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 address", d.name)))?;
-    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
-        ConfigError::bad_node(format!("node {} address 缺少端口: {}", d.name, address))
-    })?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| ConfigError::bad_node(format!("node {} 端口非法: {}", d.name, port)))?;
-    let mut node = ParsedNode::new(
-        d.name.clone(),
-        proto,
-        host.trim_matches(|c| c == '[' || c == ']'),
-        port,
-    );
+    let mut params = BTreeMap::new();
+    for (key, value) in &d.params {
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                serde_json::to_string(value).map_err(|error| {
+                    ConfigError::bad_node(format!("node {} params.{key} 无法编码: {error}", d.name))
+                })?
+            }
+            serde_json::Value::Null => {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} params.{key} 不能为 null",
+                    d.name
+                )));
+            }
+        };
+        params.insert(key.clone(), value);
+    }
+    if let Some(private_key) = d
+        .login
+        .as_ref()
+        .and_then(|login| login.private_key.as_ref())
+    {
+        if let Some(existing) = params.get("private-key")
+            && existing != private_key
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 的 login.private-key 与 params.private-key 冲突",
+                d.name
+            )));
+        }
+        params.insert("private-key".into(), private_key.clone());
+    }
+    let (host, port) = match d.address.as_deref() {
+        Some(address) => {
+            let (host, port) = address.rsplit_once(':').ok_or_else(|| {
+                ConfigError::bad_node(format!("node {} address 缺少端口: {}", d.name, address))
+            })?;
+            let port: u16 = port.parse().map_err(|_| {
+                ConfigError::bad_node(format!("node {} 端口非法: {}", d.name, port))
+            })?;
+            (
+                host.trim_matches(|c| c == '[' || c == ']').to_string(),
+                port,
+            )
+        }
+        None if proto == NodeProtocol::Wireguard && params.contains_key("peers") => {
+            ("0.0.0.0".into(), 1)
+        }
+        None => {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 缺少 address",
+                d.name
+            )));
+        }
+    };
+    let mut node = ParsedNode::new(d.name.clone(), proto, host, port);
+    node.params = params;
     if let Some(login) = &d.login {
         node.user = login.user.clone();
         node.password = login.password.clone();
@@ -2786,5 +3026,120 @@ route:
         apply_defaults(&mut cfg);
         let err = compile(cfg).unwrap_err();
         assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn structured_wireguard_node_preserves_all_protocol_options() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes:
+  - name: wg-full
+    protocol: wireguard
+    login:
+      private_key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+    params:
+      local-address: [10.0.0.2/32, "fd00::2/128"]
+      mtu: 1280
+      workers: 4
+      remote-dns-resolve: true
+      dns: [10.0.0.53]
+      peers:
+        - server: 192.0.2.1
+          port: 51820
+          public-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+          allowed-ips: [10.0.0.0/8]
+          reserved: [1, 2, 3]
+"#,
+        );
+        let node = &plan.nodes[0];
+        assert_eq!(node.protocol, NodeProtocol::Wireguard);
+        assert_eq!(node.host, "0.0.0.0");
+        assert_eq!(node.params.get("workers").map(String::as_str), Some("4"));
+        assert_eq!(
+            node.params.get("private-key").map(String::as_str),
+            Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+        );
+        let peers: serde_json::Value =
+            serde_json::from_str(node.params.get("peers").unwrap()).unwrap();
+        assert_eq!(peers.as_array().unwrap().len(), 1);
+        assert_eq!(peers[0]["reserved"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn wireguard_inbound_compiles_every_server_field() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  wireguard:
+    - host: "::1"
+      port: 51820
+      privateKey: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      mtu: 1280
+      packetQueue: 2048
+      handshakeRateLimit: 250
+      peers:
+        - publicKey: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+          presharedKey: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+          allowedIPs: [10.77.0.2/32, "fd77::2/128"]
+          reserved: [1, 2, 3]
+          persistentKeepalive: 25
+route: {preset: direct}
+"#,
+        );
+        let listener = &plan.listen.wireguard[0];
+        assert_eq!(listener.bind, "[::1]:51820".parse().unwrap());
+        assert_eq!(listener.private_key, [1; 32]);
+        assert_eq!(listener.mtu, 1280);
+        assert_eq!(listener.packet_queue, 2048);
+        assert_eq!(listener.handshake_rate_limit, 250);
+        assert_eq!(listener.peers[0].public_key, [2; 32]);
+        assert_eq!(listener.peers[0].preshared_key, Some([3; 32]));
+        assert_eq!(listener.peers[0].reserved, [1, 2, 3]);
+        assert_eq!(listener.peers[0].persistent_keepalive, Some(25));
+        assert_eq!(listener.peers[0].allowed_ips.len(), 2);
+    }
+
+    #[test]
+    fn wireguard_inbound_rejects_unknown_and_ambiguous_routes() {
+        let unknown = r#"
+version: 1
+profile: server
+listen:
+  wireguard:
+    - host: 127.0.0.1
+      port: 51820
+      privateKey: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      silentlyIgnored: true
+      peers: []
+route: {preset: direct}
+"#;
+        let error = serde_yaml::from_str::<UserConfig>(unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("silentlyIgnored"), "error = {error}");
+
+        let duplicated = r#"
+version: 1
+profile: server
+listen:
+  wireguard:
+    - host: 127.0.0.1
+      port: 51820
+      privateKey: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      peers:
+        - publicKey: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+          allowedIPs: [10.77.0.0/24]
+        - publicKey: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+          allowedIPs: [10.77.0.0/24]
+route: {preset: direct}
+"#;
+        let mut config: UserConfig = serde_yaml::from_str(duplicated).unwrap();
+        apply_defaults(&mut config);
+        let error = compile(config).unwrap_err().to_string();
+        assert!(error.contains("不能分配给多个对端"), "error = {error}");
     }
 }

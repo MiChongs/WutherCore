@@ -292,6 +292,9 @@ impl TunInbound {
     /// `Some(TunBypassReason)`，后续由 `ListenerHandler` 强制 DIRECT。
     pub fn route_policy(&self, ip: IpAddr) -> Result<Option<TunBypassReason>, TunDropReason> {
         if self.plan.is_loopback_ip(ip) {
+            if self.plan.allow_loopback_destination {
+                return Ok(None);
+            }
             return Err(TunDropReason::Loopback);
         }
         // sing-tun 入口过滤等价物 —— 与 `stack_system.go::processIPv4*` 的
@@ -422,7 +425,9 @@ impl TunInbound {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Result<(), TunDropReason> {
-        if self.plan.is_loopback_ip(source.ip()) || self.plan.is_loopback_ip(destination.ip()) {
+        if self.plan.is_loopback_ip(source.ip())
+            || (!self.plan.allow_loopback_destination && self.plan.is_loopback_ip(destination.ip()))
+        {
             return Err(TunDropReason::Loopback);
         }
         Ok(())

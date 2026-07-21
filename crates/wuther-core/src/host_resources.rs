@@ -42,6 +42,14 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
         ));
     }
 
+    for listener in &plan.listen.wireguard {
+        claims.insert(socket_claim(
+            host_owner("wuther.wireguard"),
+            SocketTransport::Udp,
+            listener.bind,
+        ));
+    }
+
     if plan.ui.on {
         if let Some(panel) = &plan.listen.panel {
             let address = panel
@@ -415,5 +423,30 @@ ui:
                 .to_string()
                 .contains("非法面板地址")
         );
+    }
+
+    #[test]
+    fn declares_wireguard_udp_listener() {
+        let plan = plan(
+            r#"
+version: 1
+profile: server
+listen:
+  wireguard:
+    - host: 127.0.0.1
+      port: 51820
+      privateKey: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      peers:
+        - publicKey: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+          allowedIPs: [10.77.0.2/32]
+route: {preset: direct}
+"#,
+        );
+        let claims = sockets(&listener_resource_claims(&plan).unwrap());
+        assert!(claims.contains(&(
+            "wuther.wireguard".to_owned(),
+            SocketTransport::Udp,
+            "127.0.0.1:51820".parse().unwrap(),
+        )));
     }
 }

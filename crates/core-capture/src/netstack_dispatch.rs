@@ -314,8 +314,8 @@ async fn run_tcp_accept_loop(
         tokio::spawn(async move {
             handle_netstack_tcp(
                 stream,
-                remote_addr,
                 local_addr,
+                remote_addr,
                 handler,
                 inbound,
                 dns_service,
