@@ -1061,9 +1061,9 @@ fn install_auto_route(routes: &RouteTable, plan: &CapturePlan) {
     // 避免与已有 0.0.0.0/0 互相覆盖；同时统一使用自定义路由表 + ip rule。
     let table = plan.iproute2_table_index;
     let rule_idx = plan.iproute2_rule_index;
-    let mut cidrs: Vec<&str> = vec!["0.0.0.0/1", "128.0.0.0/1"];
+    let mut cidrs: Vec<&str> = crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V4.to_vec();
     if plan.tun_v6_cidr.is_some() && is_ipv6_available(&plan.interface_name) {
-        cidrs.extend_from_slice(&["::/1", "8000::/1"]);
+        cidrs.extend_from_slice(&crate::resource_claims::LINUX_TUN_SPLIT_DEFAULT_V6);
     }
     for cidr in cidrs {
         if let Ok(net) = cidr.parse() {
@@ -1230,9 +1230,7 @@ fn install_auto_route(routes: &RouteTable, plan: &CapturePlan) {
 }
 
 fn tun_outbound_mark(plan: &CapturePlan) -> u32 {
-    plan.auto_redirect_marks
-        .output
-        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+    crate::resource_claims::tun_outbound_mark(plan)
 }
 
 fn outbound_bypass_rule_priority(rule_idx: u32) -> u32 {
@@ -1331,7 +1329,7 @@ fn route_rule_family(net: &ipnet::IpNet) -> &'static str {
 }
 
 fn auto_route_uses_catch_all_rule(plan: &CapturePlan) -> bool {
-    plan.route_addresses.is_empty() || !plan.route_address_set.is_empty()
+    crate::resource_claims::linux_auto_route_is_catch_all(plan)
 }
 
 fn should_cleanup_legacy_catch_all_rule(plan: &CapturePlan) -> bool {
@@ -1671,6 +1669,700 @@ fn revert_strict_route(plan: &CapturePlan) {
     let prio_s = (plan.iproute2_rule_index + 1).to_string();
     for fam in ["", "-6"] {
         let _ = run_ip_quiet(fam, &["rule", "del", "priority", &prio_s]);
+    }
+}
+
+const NFT_REDIRECT_TABLE: &str = "wuthercore_redirect";
+
+fn install_auto_redirect(plan: &CapturePlan) -> Result<(), CaptureError> {
+    let marks = &plan.auto_redirect_marks;
+    let in_mark = marks
+        .input
+        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK);
+    let out_mark = tun_outbound_mark(plan);
+    let reset_mark = marks
+        .reset
+        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK);
+
+    let mut script = String::new();
+    use std::fmt::Write;
+    let t = NFT_REDIRECT_TABLE;
+    let iface = &plan.interface_name;
+
+    // 1. 创建独立 inet 表 + prerouting / output / mark chain
+    let _ = writeln!(script, "add table inet {t}");
+    let _ = writeln!(
+        script,
+        "add chain inet {t} prerouting {{ type filter hook prerouting priority -150; }}"
+    );
+    let _ = writeln!(
+        script,
+        "add chain inet {t} output {{ type filter hook output priority -150; }}"
+    );
+    let _ = writeln!(script, "add chain inet {t} mark_chain");
+    let _ = writeln!(
+        script,
+        "add rule inet {t} prerouting iifname != \"{iface}\" jump mark_chain"
+    );
+
+    // 2. include / exclude 接口过滤（mark_chain 入口前拒绝）
+    for excl in &plan.filters.exclude_interface {
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain iifname \"{excl}\" return"
+        );
+    }
+    if !plan.filters.include_interface.is_empty() {
+        let names: Vec<String> = plan
+            .filters
+            .include_interface
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect();
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain iifname != {{ {} }} return",
+            names.join(", ")
+        );
+    }
+
+    // 3. UID 过滤（exclude 优先；include 限定）
+    for u in &plan.filters.exclude_uid {
+        let _ = writeln!(script, "add rule inet {t} mark_chain meta skuid {u} return");
+    }
+    for (a, b) in &plan.filters.exclude_uid_range {
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain meta skuid {a}-{b} return"
+        );
+    }
+    if !plan.filters.include_uid.is_empty() || !plan.filters.include_uid_range.is_empty() {
+        // 把允许的 UID 集生成元素 set
+        let mut allow: Vec<String> = plan
+            .filters
+            .include_uid
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        for (a, b) in &plan.filters.include_uid_range {
+            allow.push(format!("{a}-{b}"));
+        }
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain meta skuid != {{ {} }} return",
+            allow.join(", ")
+        );
+    }
+
+    // 3b. GID 过滤（exclude 优先；include 限定）—— mihomo `meta skgid` 等价。
+    for g in &plan.filters.exclude_gid {
+        let _ = writeln!(script, "add rule inet {t} mark_chain meta skgid {g} return");
+    }
+    for (a, b) in &plan.filters.exclude_gid_range {
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain meta skgid {a}-{b} return"
+        );
+    }
+    if !plan.filters.include_gid.is_empty() || !plan.filters.include_gid_range.is_empty() {
+        let mut allow: Vec<String> = plan
+            .filters
+            .include_gid
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        for (a, b) in &plan.filters.include_gid_range {
+            allow.push(format!("{a}-{b}"));
+        }
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain meta skgid != {{ {} }} return",
+            allow.join(", ")
+        );
+    }
+
+    // 4. loopback_address 排除（保留地址 / lan）
+    for ip in &plan.loopback_addresses {
+        let proto = match ip {
+            std::net::IpAddr::V4(_) => "ip",
+            std::net::IpAddr::V6(_) => "ip6",
+        };
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain {proto} daddr {ip} return"
+        );
+    }
+
+    // 4b. MAC 地址过滤（路由器 / LAN 接管场景）。
+    for mac in &plan.filters.exclude_mac {
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain ether saddr {mac} return"
+        );
+    }
+    if !plan.filters.include_mac.is_empty() {
+        let macs: Vec<String> = plan.filters.include_mac.iter().map(|m| m.clone()).collect();
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain ether saddr != {{ {} }} return",
+            macs.join(", ")
+        );
+    }
+
+    // 4c. Android user → UID 偶合：Android user N 的 UID = N * 100000 + appUid。
+    // include_android_user 字段当用户没有显式指定 include_uid 时生效。
+    if plan.filters.include_uid.is_empty()
+        && plan.filters.include_uid_range.is_empty()
+        && !plan.filters.include_android_user.is_empty()
+    {
+        let mut ranges: Vec<String> = Vec::new();
+        for u in &plan.filters.include_android_user {
+            let lo = u * 100_000;
+            let hi = lo + 99_999;
+            ranges.push(format!("{lo}-{hi}"));
+        }
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain meta skuid != {{ {} }} return",
+            ranges.join(", ")
+        );
+    }
+
+    // 5. exclude_mptcp：透传 MPTCP 不接管
+    if plan.exclude_mptcp {
+        let _ = writeln!(
+            script,
+            "add rule inet {t} mark_chain tcp option mptcp exists return"
+        );
+    }
+
+    // 6. 主标记：进入 TUN 表
+    let _ = writeln!(
+        script,
+        "add rule inet {t} mark_chain meta mark set {in_mark:#x}"
+    );
+    let _ = writeln!(
+        script,
+        "add rule inet {t} mark_chain ct state new tcp flags syn meta mark set {reset_mark:#x}"
+    );
+    // 7. 出方向：output 上 outbound mark 自身流量直接 accept，避免回环
+    let _ = writeln!(
+        script,
+        "add rule inet {t} output meta mark {out_mark:#x} accept"
+    );
+
+    let create = script;
+    // —— 后端选择：nft → iptables(+ip6tables) TPROXY → iptables NAT REDIRECT 三级降级。
+    let nft_ok = has_tool("nft") && nft_load(&create);
+    if nft_ok {
+        // ip rule fwmark <in_mark> 走 TUN 自定义表
+        if ip_rule_supported() {
+            let table_s = plan.iproute2_table_index.to_string();
+            let mark_s = format!("{in_mark:#x}");
+            for fam in ["", "-6"] {
+                let _ = run_ip_quiet(fam, &["rule", "add", "fwmark", &mark_s, "lookup", &table_s]);
+            }
+            if let Some(fb) = marks.fallback_rule_index {
+                let prio_s = fb.to_string();
+                for fam in ["", "-6"] {
+                    let _ = run_ip_quiet(
+                        fam,
+                        &["rule", "add", "priority", &prio_s, "lookup", &table_s],
+                    );
+                }
+            }
+        }
+        if let Some(q) = marks.nfqueue {
+            let qs = q.to_string();
+            let _ = run_quiet(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_REDIRECT_TABLE,
+                    "prerouting",
+                    "queue",
+                    "num",
+                    &qs,
+                ],
+            );
+        }
+        info!(
+            target: "capture::linux",
+            backend = "nftables",
+            in_mark = format_args!("{in_mark:#x}"),
+            out_mark = format_args!("{out_mark:#x}"),
+            reset_mark = format_args!("{reset_mark:#x}"),
+            "auto_redirect installed"
+        );
+        return Ok(());
+    }
+
+    // —— 回落 1：iptables + ip6tables TPROXY（双栈、Android root 通用）
+    if has_tool("iptables") && install_iptables_tproxy(plan, in_mark, out_mark) {
+        if ip_rule_supported() {
+            let table_s = plan.iproute2_table_index.to_string();
+            let mark_s = format!("{in_mark:#x}");
+            for fam in ["", "-6"] {
+                let _ = run_ip_quiet(fam, &["rule", "add", "fwmark", &mark_s, "lookup", &table_s]);
+            }
+        }
+        info!(
+            target: "capture::linux",
+            backend = "iptables-tproxy",
+            in_mark = format_args!("{in_mark:#x}"),
+            out_mark = format_args!("{out_mark:#x}"),
+            "auto_redirect installed (iptables/ip6tables TPROXY fallback; nft 不可用)"
+        );
+        return Ok(());
+    }
+
+    // —— 回落 2：iptables NAT REDIRECT（仅 TCP；UDP 走 fake-ip + TUN）
+    if has_tool("iptables") && install_iptables_redirect(plan) {
+        warn!(
+            target: "capture::linux",
+            backend = "iptables-nat-redirect",
+            "auto_redirect installed (NAT REDIRECT；仅 TCP；UDP 由 fake-ip+TUN 承担)"
+        );
+        return Ok(());
+    }
+
+    Err(CaptureError::Doctor(
+        "auto_redirect 全部后端失败：nft / iptables 都不可用。\
+         Android 设备请确认已 root 且安装 magisk 模块 iptables 或 nftables；\
+         否则请关掉 auto_redirect，使用 method=virtual_nic + stack=mixed 走纯 TUN。"
+            .into(),
+    ))
+}
+
+/// 把 nft 脚本通过 stdin 喂给 nft -f -；返回是否成功。
+fn nft_load(script: &str) -> bool {
+    use std::io::Write;
+    let child = std::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = sin.write_all(script.as_bytes());
+    }
+    matches!(child.wait(), Ok(s) if s.success())
+}
+
+const IPT_CHAIN: &str = "WUTHERCORE_REDIR";
+const IPT_TPROXY_PORT: &str = "7894";
+
+/// iptables(+ip6tables) TPROXY 注入：mihomo 等价 Android `IptablesV4V6Tproxy` Tier。
+fn install_iptables_tproxy(plan: &CapturePlan, in_mark: u32, out_mark: u32) -> bool {
+    let in_mark_s = format!("{in_mark:#x}");
+    let out_mark_s = format!("{out_mark:#x}");
+    let mut all_ok = true;
+    for ipt in iptables_binaries() {
+        // 创建 / 复用 chain（已存在 → silent ok）
+        let _ = run_quiet(ipt, &["-t", "mangle", "-N", IPT_CHAIN]);
+        // 自身流量（mark 命中 out_mark）跳过
+        let r1 = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "mangle",
+                "-A",
+                IPT_CHAIN,
+                "-m",
+                "mark",
+                "--mark",
+                &out_mark_s,
+                "-j",
+                "RETURN",
+            ],
+        );
+        // loopback / TUN iif 跳过
+        let _ = run_quiet(
+            ipt,
+            &["-t", "mangle", "-A", IPT_CHAIN, "-i", "lo", "-j", "RETURN"],
+        );
+        let _ = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "mangle",
+                "-A",
+                IPT_CHAIN,
+                "-i",
+                &plan.interface_name,
+                "-j",
+                "RETURN",
+            ],
+        );
+
+        // UID/GID exclude
+        for u in &plan.filters.exclude_uid {
+            let val = u.to_string();
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "mangle",
+                    "-A",
+                    IPT_CHAIN,
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        for (a, b) in &plan.filters.exclude_uid_range {
+            let val = format!("{a}-{b}");
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "mangle",
+                    "-A",
+                    IPT_CHAIN,
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        for g in &plan.filters.exclude_gid {
+            let val = g.to_string();
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "mangle",
+                    "-A",
+                    IPT_CHAIN,
+                    "-m",
+                    "owner",
+                    "--gid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        for (a, b) in &plan.filters.exclude_gid_range {
+            let val = format!("{a}-{b}");
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "mangle",
+                    "-A",
+                    IPT_CHAIN,
+                    "-m",
+                    "owner",
+                    "--gid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        // include_uid / include_gid 用 ! 否定 RETURN 实现"只放行集合"语义。
+        if !plan.filters.include_uid.is_empty() || !plan.filters.include_uid_range.is_empty() {
+            for u in &plan.filters.include_uid {
+                let val = u.to_string();
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "mangle",
+                        "-A",
+                        IPT_CHAIN,
+                        "-m",
+                        "owner",
+                        "!",
+                        "--uid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+            for (a, b) in &plan.filters.include_uid_range {
+                let val = format!("{a}-{b}");
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "mangle",
+                        "-A",
+                        IPT_CHAIN,
+                        "-m",
+                        "owner",
+                        "!",
+                        "--uid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+        }
+        if !plan.filters.include_gid.is_empty() || !plan.filters.include_gid_range.is_empty() {
+            for g in &plan.filters.include_gid {
+                let val = g.to_string();
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "mangle",
+                        "-A",
+                        IPT_CHAIN,
+                        "-m",
+                        "owner",
+                        "!",
+                        "--gid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+            for (a, b) in &plan.filters.include_gid_range {
+                let val = format!("{a}-{b}");
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "mangle",
+                        "-A",
+                        IPT_CHAIN,
+                        "-m",
+                        "owner",
+                        "!",
+                        "--gid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+        }
+
+        // TPROXY mark + 投递到本地端口
+        let r2 = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "mangle",
+                "-A",
+                IPT_CHAIN,
+                "-p",
+                "tcp",
+                "-j",
+                "TPROXY",
+                "--on-port",
+                IPT_TPROXY_PORT,
+                "--tproxy-mark",
+                &in_mark_s,
+            ],
+        );
+        let r3 = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "mangle",
+                "-A",
+                IPT_CHAIN,
+                "-p",
+                "udp",
+                "-j",
+                "TPROXY",
+                "--on-port",
+                IPT_TPROXY_PORT,
+                "--tproxy-mark",
+                &in_mark_s,
+            ],
+        );
+        // PREROUTING 跳本 chain
+        let r4 = run_quiet(ipt, &["-t", "mangle", "-A", "PREROUTING", "-j", IPT_CHAIN]);
+        for r in [r1, r2, r3, r4] {
+            if !matches!(r, Some(s) if s.success()) {
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
+}
+
+/// iptables NAT REDIRECT 注入（只 TCP，UDP 不支持）—— Android 旧设备 / kernel 阉割时。
+fn install_iptables_redirect(plan: &CapturePlan) -> bool {
+    let mut all_ok = true;
+    for ipt in iptables_binaries() {
+        let _ = run_quiet(ipt, &["-t", "nat", "-N", IPT_CHAIN]);
+        let _ = run_quiet(
+            ipt,
+            &["-t", "nat", "-A", IPT_CHAIN, "-i", "lo", "-j", "RETURN"],
+        );
+        let _ = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "nat",
+                "-A",
+                IPT_CHAIN,
+                "-i",
+                &plan.interface_name,
+                "-j",
+                "RETURN",
+            ],
+        );
+        // UID/GID 排除：owner-match 在 nat 表只对 OUTPUT 链有效。
+        for u in &plan.filters.exclude_uid {
+            let val = u.to_string();
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-m",
+                    "owner",
+                    "--uid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        for g in &plan.filters.exclude_gid {
+            let val = g.to_string();
+            let _ = run_quiet(
+                ipt,
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-m",
+                    "owner",
+                    "--gid-owner",
+                    &val,
+                    "-j",
+                    "RETURN",
+                ],
+            );
+        }
+        let r = run_quiet(
+            ipt,
+            &[
+                "-t",
+                "nat",
+                "-A",
+                IPT_CHAIN,
+                "-p",
+                "tcp",
+                "-j",
+                "REDIRECT",
+                "--to-ports",
+                IPT_TPROXY_PORT,
+            ],
+        );
+        let r2 = run_quiet(ipt, &["-t", "nat", "-A", "PREROUTING", "-j", IPT_CHAIN]);
+        for x in [r, r2] {
+            if !matches!(x, Some(s) if s.success()) {
+                all_ok = false;
+            }
+        }
+    }
+    all_ok
+}
+
+/// 返回当前可用的 iptables binaries：iptables / ip6tables（v6 可选）。
+fn iptables_binaries() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if has_tool("iptables") {
+        out.push("iptables");
+    }
+    if has_tool("ip6tables") {
+        out.push("ip6tables");
+    }
+    out
+}
+
+fn revert_auto_redirect(plan: &CapturePlan) {
+    // nft：best-effort 删表
+    let _ = run_quiet("nft", &["delete", "table", "inet", NFT_REDIRECT_TABLE]);
+
+    // iptables 后端 best-effort 卸载（chain 不存在的报错全部静默）
+    for ipt in iptables_binaries() {
+        for table in ["mangle", "nat"] {
+            let _ = run_quiet(ipt, &["-t", table, "-D", "PREROUTING", "-j", IPT_CHAIN]);
+            // NAT 模式下 owner-match 写在 OUTPUT 链 → 也撤掉
+            for u in &plan.filters.exclude_uid {
+                let val = u.to_string();
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "nat",
+                        "-D",
+                        "OUTPUT",
+                        "-m",
+                        "owner",
+                        "--uid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+            for g in &plan.filters.exclude_gid {
+                let val = g.to_string();
+                let _ = run_quiet(
+                    ipt,
+                    &[
+                        "-t",
+                        "nat",
+                        "-D",
+                        "OUTPUT",
+                        "-m",
+                        "owner",
+                        "--gid-owner",
+                        &val,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
+            }
+            let _ = run_quiet(ipt, &["-t", table, "-F", IPT_CHAIN]);
+            let _ = run_quiet(ipt, &["-t", table, "-X", IPT_CHAIN]);
+        }
+    }
+
+    // ip rule 撤销
+    if ip_rule_supported() {
+        let table_s = plan.iproute2_table_index.to_string();
+        let mark_s = format!(
+            "{:#x}",
+            plan.auto_redirect_marks
+                .input
+                .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK)
+        );
+        for fam in ["", "-6"] {
+            let _ = run_ip_quiet(fam, &["rule", "del", "fwmark", &mark_s, "lookup", &table_s]);
+        }
+        if let Some(fb) = plan.auto_redirect_marks.fallback_rule_index {
+            let prio_s = fb.to_string();
+            for fam in ["", "-6"] {
+                let _ = run_ip_quiet(fam, &["rule", "del", "priority", &prio_s]);
+            }
+        }
     }
 }
 

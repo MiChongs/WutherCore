@@ -7,8 +7,21 @@ license.workspace = true
 [dependencies]
 core-config = { workspace = true }
 async-trait = { workspace = true }
+command-group = { workspace = true }
 ipnet       = { workspace = true }
 once_cell   = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+tempfile    = { workspace = true }
+url         = { workspace = true }
+zeroize     = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

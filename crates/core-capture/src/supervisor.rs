@@ -628,7 +628,7 @@ impl CaptureSupervisor {
                 .with_fake_pool(self.fake_pool.clone()),
         );
         if self.plan.hijack_dns {
-            for &listen_addr in fake_dns_listen_addrs() {
+            for &listen_addr in crate::capture_dns::fake_dns_listen_addrs() {
                 let listener = core_runtime::spawn_dns_listener(listen_addr, dns_service.clone())
                     .await
                     .map_err(|error| {
@@ -921,17 +921,6 @@ impl CaptureSupervisor {
     }
 }
 
-fn fake_dns_listen_addrs() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        // WindowsTun points both IPv4 and IPv6 resolver families at these
-        // loopback listeners.
-        &["127.0.0.1:53", "[::1]:53"]
-    } else {
-        // Preserve the existing private capture listener on Unix platforms.
-        &["127.0.0.1:5454"]
-    }
-}
-
 /// 工具：把字符串地址解析。
 pub fn first_addr(s: &str) -> Option<SocketAddr> {
     s.to_socket_addrs().ok().and_then(|mut it| it.next())
@@ -1185,9 +1174,15 @@ route:
     #[test]
     fn windows_fake_dns_matches_system_dns_target() {
         if cfg!(target_os = "windows") {
-            assert_eq!(fake_dns_listen_addrs(), ["127.0.0.1:53", "[::1]:53"]);
+            assert_eq!(
+                crate::capture_dns::fake_dns_listen_addrs(),
+                ["127.0.0.1:53", "[::1]:53"]
+            );
         } else {
-            assert_eq!(fake_dns_listen_addrs(), ["127.0.0.1:5454"]);
+            assert_eq!(
+                crate::capture_dns::fake_dns_listen_addrs(),
+                ["127.0.0.1:5454"]
+            );
         }
     }
 

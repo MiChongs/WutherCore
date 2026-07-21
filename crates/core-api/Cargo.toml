@@ -10,6 +10,7 @@ core-smart   = { workspace = true }
 core-runtime = { workspace = true }
 core-route   = { workspace = true }
 core-capture = { workspace = true }
+core-mesh    = { workspace = true }
 core-feeds   = { workspace = true }
 core-observe = { workspace = true }
 tokio        = { workspace = true }
@@ -27,4 +28,5 @@ bytes        = { workspace = true }
 dashmap      = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 http-body-util = "0.1"

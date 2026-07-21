@@ -6,6 +6,8 @@
 //! * `explain <yaml>`：输出编译后的 RuntimePlan（JSON，便于排错）。
 //! * `migrate mihomo <old.yaml> -o <friendly.yaml>`：旧配置迁移。
 
+mod host_resources;
+
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
@@ -19,6 +21,8 @@ use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
 use tracing::{info, warn};
+
+use crate::host_resources::listener_resource_claims;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -463,10 +467,101 @@ mod tests {
         assert!(tracing.stdout);
         assert!(tracing.file.is_some());
     }
+
+    #[test]
+    fn capture_claims_only_attach_the_static_host_owner() {
+        let config = core_config::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+capture:
+  on: true
+  method: virtual_nic
+  tun:
+    interface_name: mesh-arbitration-test
+    address: [198.19.0.0/30, "fd00:1234::/126"]
+    auto_route: true
+groups:
+  main:
+    choose: manual
+nodes: []
+"#,
+        )
+        .expect("valid capture config");
+        let capture =
+            core_capture::CapturePlan::from_config(&config.capture).expect("capture plan compiles");
+
+        let unowned = core_capture::host_resource_claims(&capture);
+        let owned = capture_resource_claims(&capture);
+
+        assert!(!unowned.is_empty());
+        assert_eq!(
+            owned
+                .iter()
+                .map(|owned| owned.claim.clone())
+                .collect::<Vec<_>>(),
+            unowned
+        );
+        assert!(
+            owned
+                .iter()
+                .all(|claim| claim.owner.as_str() == "wuther.capture")
+        );
+    }
+
+    #[test]
+    fn disabled_capture_reserves_no_mesh_resources() {
+        let config = core_config::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+capture:
+  on: false
+groups:
+  main:
+    choose: manual
+nodes: []
+"#,
+        )
+        .expect("valid capture config");
+        let capture =
+            core_capture::CapturePlan::from_config(&config.capture).expect("capture plan compiles");
+
+        assert!(capture_resource_claims(&capture).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mesh_fail_stop_observes_an_already_failed_snapshot() {
+        let (sender, mut updates) = tokio::sync::watch::channel(core_mesh::MeshSnapshot::new(
+            7,
+            core_mesh::MeshSupervisorPhase::Failed,
+            false,
+        ));
+
+        let snapshot = wait_for_mesh_fail_stop(&mut updates)
+            .await
+            .expect("failed snapshot");
+        assert_eq!(snapshot.generation, 7);
+        assert!(!snapshot.running);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn mesh_fail_stop_treats_a_closed_status_channel_as_fatal() {
+        let (sender, mut updates) = tokio::sync::watch::channel(core_mesh::MeshSnapshot::new(
+            1,
+            core_mesh::MeshSupervisorPhase::Running,
+            true,
+        ));
+        drop(sender);
+
+        assert!(wait_for_mesh_fail_stop(&mut updates).await.is_none());
+    }
 }
 
 fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    listener_resource_claims(&plan).context("listener resource validation failed")?;
     println!(
         "OK: {} 节点 / {} 分组 / {} 条规则",
         plan.nodes.len(),
@@ -512,6 +607,17 @@ fn tracing_config_from_user_log(log: &core_config::model::Log) -> core_observe::
         file,
         format,
     }
+}
+
+/// Attach the process-level host owner to capture's platform-specific claims.
+fn capture_resource_claims(plan: &core_capture::CapturePlan) -> Vec<core_mesh::HostResourceClaim> {
+    use core_mesh::{HostResourceClaim, HostSubsystemId};
+    let owner =
+        HostSubsystemId::new("wuther.capture").expect("static capture subsystem id is valid");
+    core_capture::host_resource_claims(plan)
+        .into_iter()
+        .map(|claim| HostResourceClaim::new(owner.clone(), claim))
+        .collect()
 }
 
 async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
@@ -574,6 +680,32 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         Err(e) => warn!(target: "capture", error = %e, "diagnose failed"),
     }
     info!(target: "mesh", "{}", core_mesh::diagnose(&plan.mesh));
+
+    // 组网监督器必须在 runtime/capture/监听器之前启动。当前公共层注册 capture
+    // 对宿主路由、接口和防火墙的保留，以及 DNS、Mixed、API 的固定监听端口；
+    // 后续具体产品后端按独立 PR 加入 registry。即使 registry 为空，保留资源也会
+    // 出现在 /v1/mesh/status，且同一条事务路径已经覆盖未来后端的
+    // probe -> preflight -> reconcile。
+    let mut capture_plan = core_capture::CapturePlan::from_config(&plan.capture)
+        .map_err(|error| anyhow::anyhow!("capture resource declaration failed: {error}"))?;
+    capture_plan.ipv6_enabled = plan.resolver.ipv6;
+    let mut host_claims = capture_resource_claims(&capture_plan);
+    host_claims.extend(listener_resource_claims(&plan)?);
+    let mesh_supervisor = Arc::new(core_mesh::MeshSupervisor::new(
+        core_mesh::BackendRegistry::new(),
+        host_claims,
+    ));
+    let mesh_snapshot = mesh_supervisor
+        .start()
+        .await
+        .map_err(|error| anyhow::anyhow!("mesh preflight failed: {error}"))?;
+    info!(
+        target: "mesh",
+        generation = mesh_snapshot.generation,
+        reservations = mesh_snapshot.reservations.len(),
+        backends = mesh_snapshot.statuses.len(),
+        "mesh supervisor ready"
+    );
 
     // 打开持久化 store（默认 data/state/wuthercore.redb）。
     let store = match Store::open("data/state/wuthercore.redb") {
@@ -767,6 +899,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 clash_compat: plan.ui.api.clash_compat,
                 urltest: urltest.clone(),
                 capture: capture_handle.clone(),
+                mesh: Some(mesh_supervisor.clone()),
                 feeds: Some(feed_mgr_handle.clone()),
                 cors_origins: plan.ui.cors.clone(),
             };
@@ -780,19 +913,59 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     info!("WutherCore started, press Ctrl-C to stop.");
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown signal, bye.");
+    let mut mesh_updates = mesh_supervisor.subscribe();
+    let shutdown_signal = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            info!("shutdown signal, bye.");
+            signal
+        }
+        snapshot = wait_for_mesh_fail_stop(&mut mesh_updates) => {
+            if let Some(snapshot) = snapshot {
+                warn!(
+                    target: "mesh",
+                    generation = snapshot.generation,
+                    phase = ?snapshot.supervisor_phase,
+                    conflicts = snapshot.conflicts.len(),
+                    "mesh supervision was lost; stopping host capture and runtime fail-closed"
+                );
+            } else {
+                warn!(
+                    target: "mesh",
+                    "mesh status channel closed; stopping host capture and runtime fail-closed"
+                );
+            }
+            Ok(())
+        }
+    };
     if let Some(sup) = capture_handle {
         if let Err(e) = sup.stop().await {
             warn!(target: "capture", error = %e, "capture stop failed");
         }
+    }
+    if let Err(error) = mesh_supervisor.stop().await {
+        warn!(target: "mesh", error = %error, "mesh supervisor stop failed");
     }
     feed_mgr_handle.stop();
     runtime.shutdown().await;
     for h in handles {
         h.abort();
     }
+    shutdown_signal?;
     Ok(())
+}
+
+async fn wait_for_mesh_fail_stop(
+    updates: &mut tokio::sync::watch::Receiver<core_mesh::MeshSnapshot>,
+) -> Option<core_mesh::MeshSnapshot> {
+    loop {
+        let snapshot = updates.borrow_and_update().clone();
+        if !snapshot.running {
+            return Some(snapshot);
+        }
+        if updates.changed().await.is_err() {
+            return None;
+        }
+    }
 }
 
 /// 把 [`core_ruleset::RulesetIndex`] 适配为 [`core_capture::IpSetProvider`]。
