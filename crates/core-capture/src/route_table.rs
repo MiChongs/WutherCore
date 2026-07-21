@@ -193,10 +193,28 @@ fn platform_add(r: &ManagedRoute) -> Result<(), String> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
     let dest = r.dest.to_string();
+    let metric = r.metric.to_string();
     let mut args: Vec<&str> = if r.dest.addr().is_ipv6() {
-        vec!["-6", "route", "del", &dest, "dev", &r.interface]
+        vec![
+            "-6",
+            "route",
+            "del",
+            &dest,
+            "dev",
+            &r.interface,
+            "metric",
+            &metric,
+        ]
     } else {
-        vec!["route", "del", &dest, "dev", &r.interface]
+        vec![
+            "route",
+            "del",
+            &dest,
+            "dev",
+            &r.interface,
+            "metric",
+            &metric,
+        ]
     };
     let table_str;
     if let Some(table) = r.table {

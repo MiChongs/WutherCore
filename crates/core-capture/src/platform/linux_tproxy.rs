@@ -1,5 +1,8 @@
-//! Linux 完整 TPROXY socket —— 真正接管被 nftables / iptables `TPROXY` 标记
-//! 重定向到本地端口的连接。
+//! Linux TCP/UDP TPROXY socket 与 TCP NAT REDIRECT listener。
+//!
+//! TPROXY socket 真正接管被 nftables / iptables `TPROXY` 标记并路由到本地
+//! 端口的连接；普通 TCP REDIRECT listener 则供 TUN `auto_redirect` 的 NAT
+//! 链使用，不设置 `IP_TRANSPARENT`。
 //!
 //! ## 工作流
 //!
@@ -76,6 +79,31 @@ impl TproxyListeners {
     }
 }
 
+/// One ordinary TCP listener used by Linux NAT `REDIRECT`.
+///
+/// Unlike [`TproxyListeners`], this socket deliberately has neither
+/// `IP_TRANSPARENT` nor either UDP original-destination socket option. The
+/// kernel records the pre-NAT TCP destination in conntrack and the accept loop
+/// retrieves it with `SO_ORIGINAL_DST`.
+pub(crate) struct RedirectTcpListener {
+    listener: TcpListener,
+    local_addr: SocketAddr,
+}
+
+impl RedirectTcpListener {
+    /// Return the address actually selected by the kernel for this family.
+    ///
+    /// Redirect listeners always bind port zero, so firewall rules must use
+    /// this address's port rather than the requested bind address.
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub(crate) fn into_parts(self) -> (TcpListener, SocketAddr) {
+        (self.listener, self.local_addr)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransparentSocketKind {
     Tcp,
@@ -116,6 +144,24 @@ fn configure_transparent_socket<O: TransparentSocketOps>(
     if kind == TransparentSocketKind::Tcp {
         ops.listen(&socket)?;
     }
+    Ok(socket)
+}
+
+fn configure_redirect_tcp_socket<O: TransparentSocketOps>(
+    ops: &mut O,
+    addr: SocketAddr,
+) -> io::Result<O::Socket> {
+    let socket = ops.socket(addr, TransparentSocketKind::Tcp)?;
+    if addr.is_ipv6() {
+        // Keep IPv4 and IPv6 REDIRECT sockets independent even on hosts whose
+        // net.ipv6.bindv6only sysctl defaults to zero.
+        ops.set_ipv6_only(&socket)?;
+    }
+    // A NAT REDIRECT listener is an ordinary local TCP socket. In particular,
+    // do not call set_ip_transparent or set_recv_original_dst here.
+    ops.set_reuse_addr(&socket)?;
+    ops.bind(&socket, addr)?;
+    ops.listen(&socket)?;
     Ok(socket)
 }
 
@@ -236,6 +282,85 @@ pub(crate) fn bind_tproxy_listener_set(
     bind_tproxy_listener_set_with(port, ipv6_enabled, bind_tproxy_listeners)
 }
 
+fn redirect_tcp_bind_addrs(ipv6_enabled: bool) -> Vec<SocketAddr> {
+    let mut binds = vec![ipv4_tproxy_bind_addr(0)];
+    if ipv6_enabled {
+        binds.push(ipv6_tproxy_bind_addr(0));
+    }
+    binds
+}
+
+fn bind_tcp_redirect_listener(bind: SocketAddr) -> Result<RedirectTcpListener, CaptureError> {
+    let mut ops = LibcTransparentSocketOps;
+    let fd = configure_redirect_tcp_socket(&mut ops, bind).map_err(|error| {
+        CaptureError::DeviceFailed(format!("prepare TCP REDIRECT listener {bind}: {error}"))
+    })?;
+    let listener: std::net::TcpListener = fd.into();
+    let local_addr = listener.local_addr().map_err(|error| {
+        CaptureError::DeviceFailed(format!(
+            "read TCP REDIRECT listener address for {bind}: {error}"
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        CaptureError::DeviceFailed(format!(
+            "make TCP REDIRECT listener {local_addr} nonblocking: {error}"
+        ))
+    })?;
+    let listener = TcpListener::from_std(listener).map_err(|error| {
+        CaptureError::DeviceFailed(format!(
+            "register TCP REDIRECT listener {local_addr} with Tokio: {error}"
+        ))
+    })?;
+    Ok(RedirectTcpListener {
+        listener,
+        local_addr,
+    })
+}
+
+fn bind_tcp_redirect_listener_set_with<L>(
+    ipv6_enabled: bool,
+    mut bind: impl FnMut(SocketAddr) -> Result<L, CaptureError>,
+) -> Result<Vec<L>, CaptureError> {
+    redirect_tcp_bind_addrs(ipv6_enabled)
+        .into_iter()
+        .map(&mut bind)
+        .collect()
+}
+
+/// Pre-bind one ordinary, ephemeral TCP REDIRECT listener per enabled family.
+///
+/// IPv4 and IPv6 deliberately receive independent kernel-selected ports. The
+/// caller must install each family's NAT rule with [`RedirectTcpListener::local_addr`]
+/// before starting [`run_tcp_redirect`]. If any family fails, already-bound
+/// listeners are dropped before this function returns.
+pub(crate) fn bind_tcp_redirect_listener_set(
+    ipv6_enabled: bool,
+) -> Result<Vec<RedirectTcpListener>, CaptureError> {
+    bind_tcp_redirect_listener_set_with(ipv6_enabled, bind_tcp_redirect_listener)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpInterceptMode {
+    Tproxy,
+    Redirect,
+}
+
+impl TcpInterceptMode {
+    fn log_name(self) -> &'static str {
+        match self {
+            Self::Tproxy => "tproxy",
+            Self::Redirect => "redirect",
+        }
+    }
+
+    fn metadata(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Tproxy => ("tproxy", "TPROXY"),
+            Self::Redirect => ("redirect", "REDIRECT"),
+        }
+    }
+}
+
 /// 启动一个 TPROXY TCP listener；accept 后立即 dial 出站并双向 splice，
 /// 同时推一条事件给 supervisor 用于 NAT / 调试日志。
 ///
@@ -245,25 +370,59 @@ pub(crate) async fn run_tcp_tproxy(
     listener: TcpListener,
     events: mpsc::Sender<CaptureEvent>,
     runtime: Arc<core_runtime::Runtime>,
+    stop: oneshot::Receiver<()>,
+) -> Result<(), CaptureError> {
+    run_tcp_intercept(listener, events, runtime, stop, TcpInterceptMode::Tproxy).await
+}
+
+/// Run an ordinary TCP NAT REDIRECT listener.
+///
+/// The listener itself is not transparent. Every accepted connection must
+/// have a distinct, valid `SO_ORIGINAL_DST`; direct access to the internal
+/// ephemeral endpoint is rejected instead of being proxied recursively.
+pub(crate) async fn run_tcp_redirect(
+    listener: TcpListener,
+    events: mpsc::Sender<CaptureEvent>,
+    runtime: Arc<core_runtime::Runtime>,
+    stop: oneshot::Receiver<()>,
+) -> Result<(), CaptureError> {
+    run_tcp_intercept(listener, events, runtime, stop, TcpInterceptMode::Redirect).await
+}
+
+async fn run_tcp_intercept(
+    listener: TcpListener,
+    events: mpsc::Sender<CaptureEvent>,
+    runtime: Arc<core_runtime::Runtime>,
     mut stop: oneshot::Receiver<()>,
+    mode: TcpInterceptMode,
 ) -> Result<(), CaptureError> {
     let bind = listener.local_addr()?;
-    // JoinSet owns every accepted relay. The engine stop path drops this
-    // listener future, and JoinSet::drop aborts all relays so none survive a
-    // reported TPROXY shutdown.
+    // JoinSet owns every accepted relay. Dropping this listener future aborts
+    // all relays, while the explicit stop path closes the accept socket first
+    // and then waits for every abort to finish.
     let mut connections = JoinSet::new();
-    info!(target: "capture::tproxy", addr = %bind, "tcp tproxy listening (dial+splice inline)");
+    info!(
+        target: "capture::tproxy",
+        addr = %bind,
+        mode = mode.log_name(),
+        "tcp transparent listener started (dial+splice inline)"
+    );
 
     loop {
         let accepted = tokio::select! {
+            biased;
             _ = &mut stop => {
-                connections.shutdown().await;
-                return Ok(());
+                break;
             }
             accepted = listener.accept() => Some(accepted),
             joined = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = joined {
-                    debug!(target: "capture::tproxy", %error, "tcp relay task ended unexpectedly");
+                    debug!(
+                        target: "capture::tproxy",
+                        mode = mode.log_name(),
+                        %error,
+                        "tcp relay task ended unexpectedly"
+                    );
                 }
                 None
             }
@@ -274,7 +433,12 @@ pub(crate) async fn run_tcp_tproxy(
         let (stream, peer) = match accepted {
             Ok(p) => p,
             Err(e) => {
-                warn!(target: "capture::tproxy", error = %e, "accept failed");
+                warn!(
+                    target: "capture::tproxy",
+                    mode = mode.log_name(),
+                    error = %e,
+                    "accept failed"
+                );
                 continue;
             }
         };
@@ -283,6 +447,7 @@ pub(crate) async fn run_tcp_tproxy(
             Err(error) => {
                 warn!(
                     target: "capture::tproxy",
+                    mode = mode.log_name(),
                     %peer,
                     %error,
                     "cannot read accepted TCP local address; closing inbound"
@@ -291,11 +456,12 @@ pub(crate) async fn run_tcp_tproxy(
             }
         };
         let fd = stream.as_raw_fd();
-        let original_dst = match resolve_tcp_original_dst(fd, accepted_local, bind) {
+        let original_dst = match resolve_tcp_original_dst(fd, accepted_local, bind, mode) {
             Ok(addr) => addr,
             Err(error) => {
                 warn!(
                     target: "capture::tproxy",
+                    mode = mode.log_name(),
                     %peer,
                     local = %accepted_local,
                     %error,
@@ -318,16 +484,24 @@ pub(crate) async fn run_tcp_tproxy(
             let host = original_dst.ip().to_string();
             let port = original_dst.port();
             let handler = ListenerHandler::new(runtime);
-            let metadata =
-                InboundMetadata::tcp("tproxy", "TPROXY", peer, bind_local, host.clone(), port)
-                    .with_destination_ip(Some(original_dst.ip()))
-                    .with_route_ip(Some(original_dst.ip()));
+            let (inbound_tag, inbound_kind) = mode.metadata();
+            let metadata = InboundMetadata::tcp(
+                inbound_tag,
+                inbound_kind,
+                peer,
+                bind_local,
+                host.clone(),
+                port,
+            )
+            .with_destination_ip(Some(original_dst.ip()))
+            .with_route_ip(Some(original_dst.ip()));
             match handler.prepare_tcp(metadata).await {
                 Ok(prepared) => {
                     let outbound = prepared.result.outbound.clone();
                     if let Err(e) = handler.relay_prepared_tcp(stream, prepared).await {
                         debug!(
                             target: "capture::tproxy",
+                            mode = mode.log_name(),
                             %host, port, outbound = %outbound,
                             error = %e,
                             "splice ended (inbound/outbound EOF or error)"
@@ -337,14 +511,26 @@ pub(crate) async fn run_tcp_tproxy(
                 Err(e) => {
                     warn!(
                         target: "capture::tproxy",
+                        mode = mode.log_name(),
                         %host, port,
                         error = %e,
-                        "tproxy dial failed; closing inbound"
+                        "transparent TCP dial failed; closing inbound"
                     );
                 }
             }
         });
     }
+
+    shutdown_tcp_listener(listener, &mut connections).await;
+    Ok(())
+}
+
+async fn shutdown_tcp_listener(listener: TcpListener, connections: &mut JoinSet<()>) {
+    // Close the ingress endpoint before waiting for accepted relays. This
+    // makes stop externally visible immediately and prevents a final accept
+    // racing with relay cancellation.
+    drop(listener);
+    connections.shutdown().await;
 }
 
 /// UDP TPROXY —— `IP_TRANSPARENT` + `IP_RECVORIGDSTADDR`，`recvmsg` 解析 cmsg
@@ -1014,13 +1200,21 @@ fn resolve_tcp_original_dst(
     fd: RawFd,
     accepted_local: SocketAddr,
     listener_bind: SocketAddr,
+    mode: TcpInterceptMode,
 ) -> std::io::Result<SocketAddr> {
     let socket_original = if accepted_local.is_ipv4() {
         get_orig_dst_v4(fd).map(SocketAddr::V4)
     } else {
         get_orig_dst_v6(fd).map(SocketAddr::V6)
     };
-    select_tcp_original_dst(socket_original, accepted_local, listener_bind)
+    match mode {
+        TcpInterceptMode::Tproxy => {
+            select_tcp_original_dst(socket_original, accepted_local, listener_bind)
+        }
+        TcpInterceptMode::Redirect => {
+            select_tcp_redirect_original_dst(socket_original, accepted_local, listener_bind)
+        }
+    }
 }
 
 fn select_tcp_original_dst(
@@ -1061,6 +1255,45 @@ fn select_tcp_original_dst(
              accepted local address {accepted_local} is not a safe fallback"
         ),
     ))
+}
+
+fn select_tcp_redirect_original_dst(
+    socket_original: std::io::Result<SocketAddr>,
+    accepted_local: SocketAddr,
+    listener_bind: SocketAddr,
+) -> std::io::Result<SocketAddr> {
+    let addr = socket_original.map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("SO_ORIGINAL_DST failed for TCP REDIRECT: {error}"),
+        )
+    })?;
+    if addr.is_ipv4() != listener_bind.is_ipv4() || addr.ip().is_unspecified() || addr.port() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("SO_ORIGINAL_DST returned unusable TCP REDIRECT address {addr}"),
+        ));
+    }
+
+    // A direct connection to the internal listener has no pre-NAT destination:
+    // Linux reports that listener endpoint as SO_ORIGINAL_DST. Never feed it
+    // back through routing. Compare IP and port rather than SocketAddr equality
+    // so IPv6 flowinfo cannot disguise the same endpoint.
+    if same_socket_endpoint(addr, accepted_local) || same_socket_endpoint(addr, listener_bind) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "SO_ORIGINAL_DST {addr} points at the internal TCP REDIRECT listener; \
+                 direct listener access is not proxyable"
+            ),
+        ));
+    }
+
+    Ok(addr)
+}
+
+fn same_socket_endpoint(left: SocketAddr, right: SocketAddr) -> bool {
+    left.ip() == right.ip() && left.port() == right.port()
 }
 
 #[allow(unsafe_code)]
@@ -1268,6 +1501,45 @@ mod tests {
     }
 
     #[test]
+    fn tcp_redirect_socket_never_enables_transparent_or_udp_original_dst_options() {
+        let mut ops = RecordingSocketOps::default();
+
+        configure_redirect_tcp_socket(&mut ops, ipv4_tproxy_bind_addr(0)).unwrap();
+
+        assert_eq!(
+            ops.steps,
+            [
+                SocketStep::Socket,
+                SocketStep::ReuseAddr,
+                SocketStep::Bind,
+                SocketStep::Listen,
+            ]
+        );
+        assert!(!ops.steps.contains(&SocketStep::Transparent));
+        assert!(!ops.steps.contains(&SocketStep::RecvOriginalDst));
+    }
+
+    #[test]
+    fn ipv6_tcp_redirect_sets_v6only_before_bind_without_transparent_options() {
+        let mut ops = RecordingSocketOps::default();
+
+        configure_redirect_tcp_socket(&mut ops, ipv6_tproxy_bind_addr(0)).unwrap();
+
+        assert_eq!(
+            ops.steps,
+            [
+                SocketStep::Socket,
+                SocketStep::Ipv6Only,
+                SocketStep::ReuseAddr,
+                SocketStep::Bind,
+                SocketStep::Listen,
+            ]
+        );
+        assert!(!ops.steps.contains(&SocketStep::Transparent));
+        assert!(!ops.steps.contains(&SocketStep::RecvOriginalDst));
+    }
+
+    #[test]
     fn udp_transparent_options_are_set_before_bind() {
         let mut ops = RecordingSocketOps::default();
 
@@ -1330,6 +1602,21 @@ mod tests {
     }
 
     #[test]
+    fn redirect_listener_set_uses_independent_ephemeral_family_binds() {
+        assert_eq!(
+            redirect_tcp_bind_addrs(true),
+            [
+                "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
+                "[::]:0".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            redirect_tcp_bind_addrs(false),
+            ["0.0.0.0:0".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
     fn ipv6_bind_failure_drops_the_already_bound_ipv4_listener() {
         struct DropProbe(Arc<AtomicBool>);
 
@@ -1353,6 +1640,48 @@ mod tests {
 
         assert!(matches!(result, Err(CaptureError::DeviceFailed(_))));
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn redirect_ipv6_bind_failure_drops_the_already_bound_ipv4_listener() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = dropped.clone();
+        let result = bind_tcp_redirect_listener_set_with(true, |addr| {
+            if addr.is_ipv4() {
+                Ok(DropProbe(probe.clone()))
+            } else {
+                Err(CaptureError::DeviceFailed(
+                    "injected REDIRECT IPv6 bind failure".into(),
+                ))
+            }
+        });
+
+        assert!(matches!(result, Err(CaptureError::DeviceFailed(_))));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn redirect_listener_reports_the_kernel_selected_ephemeral_port() {
+        let mut listeners = bind_tcp_redirect_listener_set(false).unwrap();
+        assert_eq!(listeners.len(), 1);
+
+        let listener = listeners.pop().unwrap();
+        let local_addr = listener.local_addr();
+        assert!(local_addr.is_ipv4());
+        assert!(local_addr.ip().is_unspecified());
+        assert_ne!(local_addr.port(), 0);
+
+        let (socket, parts_addr) = listener.into_parts();
+        assert_eq!(parts_addr, local_addr);
+        assert_eq!(socket.local_addr().unwrap(), local_addr);
     }
 
     #[test]
@@ -1412,6 +1741,98 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("safe fallback"));
+    }
+
+    #[test]
+    fn tcp_intercept_metadata_preserves_tproxy_and_distinguishes_redirect() {
+        assert_eq!(TcpInterceptMode::Tproxy.metadata(), ("tproxy", "TPROXY"));
+        assert_eq!(
+            TcpInterceptMode::Redirect.metadata(),
+            ("redirect", "REDIRECT")
+        );
+    }
+
+    #[test]
+    fn tcp_redirect_requires_so_original_dst_without_local_fallback() {
+        let accepted_local: SocketAddr = "127.0.0.1:45123".parse().unwrap();
+        let listener_bind = ipv4_tproxy_bind_addr(45123);
+
+        let error = select_tcp_redirect_original_dst(
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no conntrack original destination",
+            )),
+            accepted_local,
+            listener_bind,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("SO_ORIGINAL_DST failed"));
+    }
+
+    #[test]
+    fn tcp_redirect_rejects_direct_access_to_its_internal_listener() {
+        let internal: SocketAddr = "127.0.0.1:45123".parse().unwrap();
+
+        let error =
+            select_tcp_redirect_original_dst(Ok(internal), internal, ipv4_tproxy_bind_addr(45123))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("internal TCP REDIRECT listener"));
+    }
+
+    #[test]
+    fn tcp_redirect_accepts_a_distinct_valid_socket_original_destination() {
+        let original: SocketAddr = "198.51.100.20:443".parse().unwrap();
+
+        let selected = select_tcp_redirect_original_dst(
+            Ok(original),
+            "127.0.0.1:45123".parse().unwrap(),
+            ipv4_tproxy_bind_addr(45123),
+        )
+        .unwrap();
+
+        assert_eq!(selected, original);
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_shutdown_closes_ingress_and_aborts_all_relays() {
+        struct RelayDropProbe(Arc<AtomicBool>);
+
+        impl Drop for RelayDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut listeners = bind_tcp_redirect_listener_set(false).unwrap();
+        let (listener, local_addr) = listeners.pop().unwrap().into_parts();
+        let connect_addr =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_addr.port()));
+        let relay_dropped = Arc::new(AtomicBool::new(false));
+        let relay_probe = relay_dropped.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut connections = JoinSet::new();
+        connections.spawn(async move {
+            let _probe = RelayDropProbe(relay_probe);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        shutdown_tcp_listener(listener, &mut connections).await;
+
+        assert!(relay_dropped.load(Ordering::SeqCst));
+        assert!(connections.is_empty());
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(connect_addr),
+        )
+        .await
+        .expect("closed local listener must refuse promptly");
+        assert!(connect_result.is_err());
     }
 
     #[tokio::test]

@@ -857,7 +857,7 @@ impl Default for FakeIpFilterMode {
 
 /* ---------------- capture ---------------- */
 
-/// Capture / TUN 入站 —— 与 mihomo / sing-box `inbounds[type=tun]` 字段全量对齐。
+/// Capture / TUN 入站 —— 兼容 mihomo / sing-box 常用 `inbounds[type=tun]` 字段。
 ///
 /// Friendly 字段（顶层）保留 WutherCore 简洁语义；`tun` 子字段对齐 sing-box JSON。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -959,31 +959,32 @@ pub struct CaptureExclude {
     pub process: Vec<String>,
 }
 
-/* ---------------- sing-box 完整 TUN 字段 ---------------- */
+/* -------- sing-box 风格 TUN 字段模型（各数据面按能力校验） -------- */
 
 /// sing-tun auto_redirect input mark 默认值（`DefaultAutoRedirectInputMark`）。
 ///
-/// 进入 redirect chain 的入站 fwmark；TUN 抓包后由 nftables / iptables 给
-/// 入站方向的会话打标，`ip rule fwmark <input_mark> lookup <tun_table>` 把这
-/// 些会话回送到 TUN 表完成代理。对应 sing-tun `redirect.go::13`。
+/// auto_redirect mark/NFQUEUE 数据面的连接入站 mark。当前 Linux 安全子集
+/// 使用 TCP NAT REDIRECT、UDP TUN，并且不为 ICMP/其他协议添加导流 rule；
+/// 后者继续按已有主路由策略处理。显式配置
+/// input mark 会在配置编译阶段失败，避免伪装成已生效。
 pub const DEFAULT_AUTO_REDIRECT_INPUT_MARK: u32 = 0x2023;
 
 /// sing-tun auto_redirect output mark 默认值（`DefaultAutoRedirectOutputMark`）。
 ///
-/// TUN auto_route 下 outbound socket 必须使用同一个 mark 绕开 TUN 路由表；
-/// 即使未启用 auto_redirect，也复用该默认值保证与 mihomo/sing-tun 行为一致。
-/// 对应 sing-tun `redirect.go::14`。
+/// auto_redirect 的连接出站 mark；同时复用于 TUN outbound socket 的
+/// auto_route 绕行，避免代理自身流量再次进入 TUN。
 pub const DEFAULT_AUTO_REDIRECT_OUTPUT_MARK: u32 = 0x2024;
 
 /// sing-tun auto_redirect reset mark 默认值（`DefaultAutoRedirectResetMark`）。
 ///
-/// 用于 conntrack RST 包标记，避免 TPROXY 模式下 reset 包反复进入 redirect
-/// chain。对应 sing-tun `redirect.go::15`。
+/// auto_redirect 预匹配的连接 reset mark。只有启用配套 NFQUEUE
+/// 预匹配消费者时才生效；当前数据面保留该字段但不会静默安装队列规则。
 pub const DEFAULT_AUTO_REDIRECT_RESET_MARK: u32 = 0x2025;
 
 /// sing-tun auto_redirect nfqueue 默认编号（`DefaultAutoRedirectNFQueue`）。
 ///
-/// nf_queue 用户态 fast-fail 队列编号；对应 sing-tun `redirect.go::16`。
+/// NFQUEUE 预匹配消费者的默认队列编号。当前数据面尚未提供消费者，因此
+/// 显式配置该字段会在配置编译阶段失败，避免把流量送入无人读取的队列。
 pub const DEFAULT_AUTO_REDIRECT_NFQUEUE: u16 = 100;
 
 /// sing-tun fallback ip rule 优先级（`DefaultIPRoute2AutoRedirectFallbackRuleIndex`）。
@@ -993,9 +994,38 @@ pub const DEFAULT_AUTO_REDIRECT_NFQUEUE: u16 = 100;
 /// 把流量送回 TUN 表。对应 sing-tun `tun.go::70`。
 pub const DEFAULT_IPROUTE2_AUTO_REDIRECT_FALLBACK_RULE_INDEX: u32 = 32768;
 
-/// sing-box `inbounds[type=tun]` 全字段映射 —— 见
+/// Linux 内置 `main` rule 默认优先级为 32766；capture rule 必须排在它之前。
+pub const MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX: u32 = 32765;
+
+/// 解析 sing-box/mihomo 兼容的十进制或 `0x` 十六进制 mark。
+pub fn parse_auto_redirect_mark(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+/// 解析并归一化 auto_redirect mark。
+///
+/// sing-tun 与 mihomo 都把未设置或显式 `0` 视作“使用默认值”。无效文本返回
+/// `None`，由配置编译器决定是否在当前激活的数据面上报错。
+pub fn normalize_auto_redirect_mark(value: Option<&str>, default: u32) -> Option<u32> {
+    match value {
+        None => Some(default),
+        Some(value) => {
+            parse_auto_redirect_mark(value).map(|mark| if mark == 0 { default } else { mark })
+        }
+    }
+}
+
+/// sing-box `inbounds[type=tun]` 兼容字段映射 —— 见
 /// <https://sing-box.sagernet.org/configuration/inbound/tun/>
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunInboundOptions {
     /// `interface_name` —— 优先级高于 WutherCore 默认 `rpktun0/utun7/WutherCoreTun`。
@@ -1018,19 +1048,22 @@ pub struct TunInboundOptions {
     /// `iproute2_rule_index` —— `ip rule` 优先级起始 id。
     #[serde(default = "default_iproute2_rule")]
     pub iproute2_rule_index: u32,
-    /// `auto_redirect` —— 自动注入 nftables redirect 规则（更优于 `auto_route`）。
+    /// `auto_redirect` —— 在 auto_route TUN 数据面上，为 TCP 注入
+    /// nftables NAT REDIRECT。当前安全契约只把本机 UDP 送入 TUN；
+    /// ICMP/其他协议不新增导流 rule，继续按已有主路由策略处理。
     #[serde(default)]
     pub auto_redirect: bool,
-    /// `auto_redirect_input_mark` —— 进入 redirect chain 的 fwmark（hex 字串如 `"0x2023"`）。
+    /// `auto_redirect_input_mark` —— 保留的 mark/NFQUEUE 入站 mark；当前
+    /// Linux REDIRECT 安全子集不消费，显式配置会失败。
     #[serde(default)]
     pub auto_redirect_input_mark: Option<String>,
     /// `auto_redirect_output_mark` —— 跳过 redirect chain 的 fwmark。
     #[serde(default)]
     pub auto_redirect_output_mark: Option<String>,
-    /// `auto_redirect_reset_mark` —— RST 包 fwmark（用于 conntrack reset）。
+    /// `auto_redirect_reset_mark` —— NFQUEUE 预匹配的连接 reset mark（保留字段）。
     #[serde(default)]
     pub auto_redirect_reset_mark: Option<String>,
-    /// `auto_redirect_nfqueue` —— nfqueue 编号（用户态 fast-fail）。
+    /// `auto_redirect_nfqueue` —— NFQUEUE 预匹配队列编号（当前无消费者）。
     #[serde(default)]
     pub auto_redirect_nfqueue: Option<u16>,
     /// `auto_redirect_iproute2_fallback_rule_index` —— fallback ip rule 优先级。
@@ -1116,6 +1149,50 @@ pub struct TunInboundOptions {
     /// `platform.http_proxy` —— iOS/Android 系统代理透传。
     #[serde(default)]
     pub platform: Option<TunPlatformOptions>,
+}
+
+impl Default for TunInboundOptions {
+    fn default() -> Self {
+        Self {
+            interface_name: None,
+            address: Vec::new(),
+            inet6: true,
+            auto_route: true,
+            iproute2_table_index: default_iproute2_table(),
+            iproute2_rule_index: default_iproute2_rule(),
+            auto_redirect: false,
+            auto_redirect_input_mark: None,
+            auto_redirect_output_mark: None,
+            auto_redirect_reset_mark: None,
+            auto_redirect_nfqueue: None,
+            auto_redirect_iproute2_fallback_rule_index: None,
+            strict_route: false,
+            route_address: Vec::new(),
+            route_exclude_address: Vec::new(),
+            route_address_set: Vec::new(),
+            route_exclude_address_set: Vec::new(),
+            endpoint_independent_nat: false,
+            udp_timeout: default_udp_timeout(),
+            exclude_mptcp: false,
+            loopback_address: Vec::new(),
+            include_interface: Vec::new(),
+            exclude_interface: Vec::new(),
+            include_uid: Vec::new(),
+            include_uid_range: Vec::new(),
+            exclude_uid: Vec::new(),
+            exclude_uid_range: Vec::new(),
+            include_gid: Vec::new(),
+            include_gid_range: Vec::new(),
+            exclude_gid: Vec::new(),
+            exclude_gid_range: Vec::new(),
+            include_android_user: Vec::new(),
+            include_package: Vec::new(),
+            exclude_package: Vec::new(),
+            include_mac_address: Vec::new(),
+            exclude_mac_address: Vec::new(),
+            platform: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
