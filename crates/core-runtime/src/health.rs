@@ -46,6 +46,8 @@ use crate::{engine::Runtime, int_ranges::IntRanges};
 
 /// `LastDelayForTestUrl` 死节点返回值；与 mihomo `0xFFFF` 等价语义但宽度扩为 u32。
 pub const DEAD_DELAY: u32 = u32::MAX;
+/// 拨号失败后的短期 dead TTL —— 避免 Manual/粘性策略反复撞同一坏节点。
+pub const TEMP_DEAD_TTL: Duration = Duration::from_secs(30);
 /// 单个节点最多保留多少条历史（与 mihomo `defaultHistoriesNum = 10`）。
 pub const HISTORY_CAP: usize = 10;
 /// `single_flight` 缓存窗口（与 mihomo `singledo.NewSingle(time.Second * 10)`）。
@@ -59,6 +61,8 @@ pub enum DelayError {
     UnknownNode(String),
     #[error("URL 非法: {0}")]
     BadUrl(String),
+    #[error("目标被安全策略拒绝: {0}")]
+    BlockedTarget(String),
     #[error("dial 失败: {0}")]
     Dial(String),
     #[error("HTTP 失败: {0}")]
@@ -117,6 +121,8 @@ pub struct NodeUrlStats {
     pub alive: AtomicBool,
     pub last_delay_ms: AtomicU32, // 0 = 未测；DEAD_DELAY = 死
     pub last_seen_ms: AtomicU64,
+    /// 临时 dead 截止时间（unix ms）；0 表示无临时 dead。
+    temp_dead_until_ms: AtomicU64,
     history: Mutex<std::collections::VecDeque<HistoryEntry>>,
 }
 
@@ -132,6 +138,7 @@ impl Default for NodeUrlStats {
             alive: AtomicBool::new(true),
             last_delay_ms: AtomicU32::new(0),
             last_seen_ms: AtomicU64::new(0),
+            temp_dead_until_ms: AtomicU64::new(0),
             history: Mutex::new(std::collections::VecDeque::with_capacity(HISTORY_CAP)),
         }
     }
@@ -144,6 +151,9 @@ impl NodeUrlStats {
         self.last_delay_ms
             .store(if alive { delay_ms } else { DEAD_DELAY }, Ordering::Release);
         self.last_seen_ms.store(now, Ordering::Release);
+        if alive {
+            self.temp_dead_until_ms.store(0, Ordering::Release);
+        }
         let mut g = self.history.lock();
         g.push_back(HistoryEntry {
             time_ms: now,
@@ -153,14 +163,37 @@ impl NodeUrlStats {
             g.pop_front();
         }
     }
+
+    /// 拨号失败后的短期排除，不永久杀死节点。
+    pub fn mark_temp_dead(&self, ttl: Duration) {
+        let until = now_ms().saturating_add(ttl.as_millis() as u64);
+        self.temp_dead_until_ms.store(until, Ordering::Release);
+        self.alive.store(false, Ordering::Release);
+        self.last_delay_ms.store(DEAD_DELAY, Ordering::Release);
+        self.last_seen_ms.store(now_ms(), Ordering::Release);
+    }
+
     pub fn last_delay(&self) -> u32 {
-        if self.alive.load(Ordering::Acquire) {
+        if self.is_alive() {
             self.last_delay_ms.load(Ordering::Acquire)
         } else {
             DEAD_DELAY
         }
     }
     pub fn is_alive(&self) -> bool {
+        let until = self.temp_dead_until_ms.load(Ordering::Acquire);
+        if until != 0 {
+            let now = now_ms();
+            if now < until {
+                return false;
+            }
+            // TTL 过期：清掉临时 dead，回到 alive=true（除非正式 probe 仍标记失败）。
+            self.temp_dead_until_ms.store(0, Ordering::Release);
+            // 若 last formal record 是 failure 且没有成功过，仍看 alive 原子位。
+            // mark_temp_dead 把 alive 置 false；TTL 到期后恢复 true。
+            self.alive.store(true, Ordering::Release);
+            return true;
+        }
         self.alive.load(Ordering::Acquire)
     }
     pub fn history(&self) -> Vec<HistoryEntry> {
@@ -241,6 +274,24 @@ impl UrlTester {
             .unwrap_or(true)
     }
 
+    /// 将节点在默认 probe URL 上标记为短期 dead，供 dial 失败后的排除集使用。
+    pub fn mark_temp_dead(&self, node: &str) {
+        let url = self.cfg.read().default_url.clone();
+        self.mark_temp_dead_for_url(node, &url);
+    }
+
+    pub fn mark_temp_dead_for_url(&self, node: &str, url: &str) {
+        let stats = self.ensure_stats(node, url);
+        stats.mark_temp_dead(TEMP_DEAD_TTL);
+        debug!(
+            target: "urltest",
+            node,
+            url,
+            ttl_secs = TEMP_DEAD_TTL.as_secs(),
+            "marked temporarily dead after dial failure"
+        );
+    }
+
     pub fn history(&self, node: &str, url: &str) -> Vec<HistoryEntry> {
         self.stats
             .read()
@@ -285,6 +336,38 @@ impl UrlTester {
         let unified = opts.unified_delay.unwrap_or(cfg.default_unified_delay);
 
         let parsed = parse_test_url(&url)?;
+        // 主机名字面量阶段先拦 loopback/metadata；解析后的 IP 在 dial 前再拦。
+        if core_outbound::is_blocked_host_literal(&parsed.host) {
+            return Err(DelayError::BlockedTarget(
+                core_outbound::blocked_target_message(&parsed.host),
+            ));
+        }
+        // 对字面 IP 的 URL 立即拒绝；域名则在 resolve 后由 dial 路径自然失败前
+        // 再做一次 resolve 复查（避免通过 DNS rebinding 打到 169.254.169.254）。
+        if let Ok(ip) = parsed.host.parse::<std::net::IpAddr>() {
+            if core_outbound::is_blocked_ip(ip) {
+                return Err(DelayError::BlockedTarget(
+                    core_outbound::blocked_target_message(&parsed.host),
+                ));
+            }
+        } else {
+            // 域名：先解析再判定，防止 URLTest 当 SSRF 原语。
+            match core_outbound::resolve_host(&parsed.host, parsed.port).await {
+                Ok(addrs) => {
+                    if addrs
+                        .iter()
+                        .any(|a| core_outbound::is_blocked_ip(a.ip()))
+                    {
+                        return Err(DelayError::BlockedTarget(
+                            core_outbound::blocked_target_message(&parsed.host),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(DelayError::Dial(format!("resolve {}: {e}", parsed.host)));
+                }
+            }
+        }
         let ob = runtime
             .outbounds
             .read()
@@ -730,6 +813,16 @@ mod tests {
     #[test]
     fn rejects_unsupported_scheme() {
         assert!(parse_test_url("ws://x").is_err());
+    }
+
+    #[test]
+    fn temp_dead_expires() {
+        let stats = NodeUrlStats::default();
+        assert!(stats.is_alive());
+        stats.mark_temp_dead(Duration::from_millis(1));
+        assert!(!stats.is_alive());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(stats.is_alive(), "temp dead must expire");
     }
 
     #[test]

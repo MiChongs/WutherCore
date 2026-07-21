@@ -6,7 +6,7 @@
 //! | `url-test`            | `Smart` / `Fast`               | URLTest 最低延迟 + tolerance + singledo              |
 //! | `fallback`            | `Stable`                       | 顺序找首个 alive；fixed 选择优先                     |
 //! | `load-balance`        | `Spread`                       | consistent-hashing / round-robin / sticky-sessions   |
-//! | `relay` (chain)       | `Chain`                        | 按 path 顺序拼链                                     |
+//! | `relay` (chain)       | `Chain`                        | **未实现**；配置编译拒绝，运行时返回 None              |
 //!
 //! ## 关键能力（与 mihomo 等价）
 //!
@@ -412,7 +412,7 @@ impl GroupSelector {
                 unresolved_feeds,
                 candidates_before_eligibility = before_eligibility,
                 network = meta.network,
-                "no selectable members after filter/provider expansion -> caller will fall back",
+                "no selectable members after filter/provider/capability expansion",
             );
             return None;
         }
@@ -421,6 +421,24 @@ impl GroupSelector {
                 .map(|t| t.current_config().default_url)
                 .unwrap_or_default()
         });
+        // 排除本轮 dial 已失败 / 短期 dead 的节点。Manual 若固定节点已在排除集，
+        // 会落到其它成员；全灭时返回 None，由上层 BLOCK 而不是死循环。
+        if !members.is_empty() {
+            if let Some(t) = tester {
+                let before = members.len();
+                members.retain(|m| t.alive_for_url(m, &url));
+                if members.is_empty() {
+                    tracing::warn!(
+                        target: "group::pick",
+                        group = %self.plan.name,
+                        host = %meta.host,
+                        candidates_before_alive = before,
+                        "all candidates temporarily dead / excluded"
+                    );
+                    return None;
+                }
+            }
+        }
         let started = std::time::Instant::now();
         let chosen = match self.plan.choose {
             ChooseStrategy::Manual => self.pick_manual(&members, &url, tester.map(|t| t.as_ref())),
@@ -685,13 +703,15 @@ impl GroupSelector {
     Chain / Relay
     ==================================================================== */
 
-    fn pick_chain(&self, members: &[String]) -> Option<String> {
-        // chain 第一跳 = path[0]；具体 outbound 拼接由 dispatcher / runtime.dial 完成。
-        self.plan
-            .path
-            .first()
-            .cloned()
-            .or_else(|| members.first().cloned())
+    fn pick_chain(&self, _members: &[String]) -> Option<String> {
+        // 多跳 relay 尚未实现。配置编译期会拒绝 `choose: chain`；
+        // 这里再返回 None，避免运行时静默退化成单跳第一节点。
+        tracing::warn!(
+            target: "group::pick",
+            group = %self.plan.name,
+            "choose=chain is not implemented; blocking instead of silent single-hop"
+        );
+        None
     }
 
     /* ====================================================================
@@ -1007,12 +1027,16 @@ mod tests {
     }
 
     #[test]
-    fn chain_returns_path_first() {
+    fn chain_does_not_silently_pick_first_hop() {
         let mut p = plan(ChooseStrategy::Chain, &["a", "b"]);
         p.path = vec!["hop1".into(), "hop2".into()];
         let g = GroupSelector::new(p);
         let s = smart();
-        assert_eq!(g.pick(&meta("h"), &s, None).as_deref(), Some("hop1"));
+        assert_eq!(
+            g.pick(&meta("h"), &s, None),
+            None,
+            "chain must not degrade to path[0] / members[0]"
+        );
     }
 
     #[test]

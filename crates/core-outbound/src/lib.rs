@@ -13,6 +13,7 @@
 #[allow(unsafe_code)]
 pub mod adapter;
 pub mod loopback;
+pub mod net_guard;
 pub mod registry;
 
 pub mod block;
@@ -36,6 +37,7 @@ pub use adapter::{
     set_outbound_fwmark, set_outbound_interface, set_outbound_interface_index,
     set_socket_protector, should_mark_outbound_addr,
 };
+pub use net_guard::{blocked_target_message, is_blocked_host_literal, is_blocked_ip};
 pub use dns_hijack::{
     DnsHijackOutbound, DnsResponder, global_dns_responder, set_global_dns_responder,
 };

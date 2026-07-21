@@ -195,8 +195,10 @@ impl Runtime {
         }
 
         let mutable = MutableConfig {
+            // share=home/all 时 Mixed/API 绑定 0.0.0.0，与 Clash allow-lan 语义对齐。
+            allow_lan: !matches!(plan.listen.share, core_config::model::Share::False),
             tun_enable: plan.capture.on,
-            ipv6: true,
+            ipv6: plan.resolver.ipv6,
             ..MutableConfig::default()
         };
         let node_info = initial_node_info(&plan);
@@ -439,12 +441,27 @@ impl Runtime {
 
     pub fn pick_outbound_for_context(&self, ctx: FlowContext) -> RoutePick {
         self.metrics.inc_route();
-        let (decision, kind, source) = self.route.decide(&ctx);
+        // Clash `/configs` mode：rule 走规则；global 强制 route.final 组；direct 强制 DIRECT。
+        // 未接线前 dashboard 改 mode 是假热改；这里让 mode 真正影响选路。
+        let mode = self.mutable.read().mode.clone();
+        let (decision, kind, source) = match mode.to_ascii_lowercase().as_str() {
+            "direct" => (RouteDecision::Direct, "MODE", "mode:direct".into()),
+            "global" => (
+                global_mode_decision(&self.plan.route.r#final),
+                "MODE",
+                "mode:global".into(),
+            ),
+            _ => {
+                let (decision, kind, source) = self.route.decide(&ctx);
+                (decision, kind, source)
+            }
+        };
         debug!(
             target: "route",
             host = %ctx.host,
             port = ctx.port,
             network = ctx.network.as_str(),
+            mode = %mode,
             ?decision,
             kind,
             source = %source,
@@ -479,6 +496,8 @@ impl Runtime {
         meta.dst_ip = ctx.ip;
         let tester = self.urltest.read().clone();
         let registry = self.outbounds.read();
+        // UDP 只允许具备 UDP 能力的节点。过滤后不得再回退到任意 TCP-only 成员，
+        // 否则会静默选中无 UDP relay 的协议，最终 Unsupported 或错误转发。
         let pick = if ctx.network == NetworkKind::Udp {
             g.pick_eligible(&meta, &self.smart, tester.as_ref(), |name| {
                 registry
@@ -486,7 +505,6 @@ impl Runtime {
                     .map(|ob| ob.capabilities().udp)
                     .unwrap_or(false)
             })
-            .or_else(|| g.pick(&meta, &self.smart, tester.as_ref()))
         } else {
             g.pick(&meta, &self.smart, tester.as_ref())
         };
@@ -495,6 +513,12 @@ impl Runtime {
                 return (name, ob);
             }
             warn!(target: "route", node = %name, "节点未注册，阻断流量避免回退 DIRECT");
+        } else if ctx.network == NetworkKind::Udp {
+            warn!(
+                target: "route",
+                group,
+                "分组内无支持 UDP 的节点，阻断流量避免回退 TCP-only 出站"
+            );
         } else if g.has_unresolved_feed_placeholders() {
             warn!(target: "route", group, "订阅节点尚未加载或为空，阻断流量避免回退 DIRECT");
         }
@@ -544,6 +568,8 @@ impl Runtime {
         let mut attempted = BTreeSet::new();
         let mut last_err: Option<std::io::Error> = None;
         for attempt in 1..=DIAL_MAX_RETRIES {
+            // 已失败节点通过 UrlTester 短期 dead + pick_eligible 的 alive 过滤排除；
+            // attempted 仍作本轮硬排除，防止 Manual 固定节点在 mark_temp_dead 前再次命中。
             let pick = self.pick_outbound_for_context(ctx.clone());
             info!(
                 target: "dial",
@@ -562,7 +588,7 @@ impl Runtime {
                     "blocked",
                 ));
             }
-            if !attempted.insert(pick.label.clone()) {
+            if attempted.contains(&pick.label) {
                 if let Some(err) = last_err {
                     debug!(
                         target: "dial",
@@ -571,11 +597,12 @@ impl Runtime {
                         %host, port,
                         outbound = %pick.label,
                         error = %err,
-                        "retry stopped because group selected the same outbound again",
+                        "retry stopped because group selected an already-failed outbound",
                     );
                     return Err(err);
                 }
             }
+            attempted.insert(pick.label.clone());
             let dial_ctx = DialContext {
                 host: host.to_string(),
                 port,
@@ -642,6 +669,10 @@ impl Runtime {
                     );
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
+                        // 短期 mark_dead，让后续 pick 跳过本节点。
+                        if let Some(t) = self.urltest.read().clone() {
+                            t.mark_temp_dead(&pick.label);
+                        }
                     }
                     if let Some(name) = &group_for_event {
                         if let Some(g) = self.groups.read().get(name).cloned() {
@@ -1074,7 +1105,17 @@ fn route_rule_name(kind: &str) -> &'static str {
         "network" | "proto" => "NETWORK",
         "process" => "PROCESS-NAME",
         "set" => "RULE-SET",
+        "MODE" | "mode" => "MODE",
         _ => "MATCH",
+    }
+}
+
+/// Clash `mode=global`：全部流量进 `route.final`（组 / DIRECT / BLOCK）。
+fn global_mode_decision(final_target: &str) -> RouteDecision {
+    match final_target {
+        "direct" | "DIRECT" => RouteDecision::Direct,
+        "block" | "BLOCK" | "REJECT" | "reject" => RouteDecision::Block,
+        other => RouteDecision::Group(other.to_string()),
     }
 }
 
@@ -1771,6 +1812,95 @@ find-process-mode: strict
         assert!(
             runtime.process_finder.is_some(),
             "find-process-mode: strict → finder 必须构建"
+        );
+    }
+
+    #[test]
+    fn mutable_mode_direct_bypasses_rules() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        // rule 模式应进 main 组。
+        let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(rule_pick.label, "HK");
+
+        runtime.mutable.write().mode = "direct".into();
+        let direct_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(direct_pick.label, "DIRECT");
+        assert_eq!(direct_pick.rule, "MODE");
+    }
+
+    #[test]
+    fn mutable_mode_global_forces_final_group() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: direct
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        // direct preset 默认应 DIRECT。
+        let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(rule_pick.label, "DIRECT");
+
+        runtime.mutable.write().mode = "global".into();
+        let global_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(global_pick.label, "HK");
+        assert_eq!(global_pick.rule, "MODE");
+    }
+
+    #[test]
+    fn udp_pick_does_not_fall_back_to_tcp_only_member() {
+        // VLESS 出站 capabilities.udp=false；组内只有 VLESS 时 UDP 必须 BLOCK，
+        // 不得回退到 TCP-only 成员。
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?security=tls&type=tcp#vless-only"
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        let tcp = runtime.pick_outbound("1.1.1.1", 443, NetworkKind::Tcp);
+        assert_eq!(tcp.label, "vless-only");
+        let udp = runtime.pick_outbound("1.1.1.1", 443, NetworkKind::Udp);
+        assert_eq!(
+            udp.label, "BLOCK",
+            "UDP must not fall back to TCP-only nodes"
         );
     }
 

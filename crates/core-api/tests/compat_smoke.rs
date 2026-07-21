@@ -332,7 +332,9 @@ async fn configs_get_and_put_round_trip() {
     let v = body_json(resp).await;
     assert_eq!(v["mode"], "rule");
     assert_eq!(v["log-level"], "info");
-    // PUT 修改 mode + log-level
+    // authentication 必须是用户名列表，不能回传 password 字段对象。
+    assert!(v["authentication"].is_array());
+    // PUT 修改 mode + log-level（allow-lan 热切换已禁用，见下测）
     let resp = app
         .clone()
         .oneshot(
@@ -340,9 +342,7 @@ async fn configs_get_and_put_round_trip() {
                 .method("PUT")
                 .uri("/configs")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"mode":"global","log-level":"debug","allow-lan":true}"#,
-                ))
+                .body(Body::from(r#"{"mode":"global","log-level":"debug"}"#))
                 .unwrap(),
         )
         .await
@@ -350,6 +350,7 @@ async fn configs_get_and_put_round_trip() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     // 再 GET
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/configs")
@@ -361,7 +362,70 @@ async fn configs_get_and_put_round_trip() {
     let v = body_json(resp).await;
     assert_eq!(v["mode"], "global");
     assert_eq!(v["log-level"], "debug");
-    assert_eq!(v["allow-lan"], true);
+}
+
+#[tokio::test]
+async fn configs_put_rejects_allow_lan_hot_toggle() {
+    let app = core_api::compat::router(build_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"allow-lan":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let v = body_json(resp).await;
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("allow-lan cannot be changed"),
+        "unexpected body: {v}"
+    );
+}
+
+#[tokio::test]
+async fn configs_authentication_never_returns_passwords() {
+    let yaml = r#"
+version: 1
+profile: desktop
+listen:
+  local: 7890
+  panel: 9090
+  auth:
+    - "alice:super-secret-password"
+groups:
+  main:
+    choose: manual
+nodes: []
+"#;
+    let plan = load_from_str(yaml).expect("plan");
+    let runtime = Arc::new(Runtime::build(plan));
+    let state = NativeState::for_tests(runtime, UrlTester::new(Default::default()), None);
+    let app = core_api::compat::router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/configs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let auth = v["authentication"].as_array().expect("authentication array");
+    assert_eq!(auth.len(), 1);
+    assert_eq!(auth[0], "alice");
+    let body = serde_json::to_string(&v).unwrap();
+    assert!(
+        !body.contains("super-secret-password"),
+        "password must not appear in /configs body: {body}"
+    );
 }
 
 #[tokio::test]

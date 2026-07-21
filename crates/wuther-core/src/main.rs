@@ -801,7 +801,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     };
 
     // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
+    // auto_route / auto_redirect 会改系统路由：启动失败必须 fail-closed，
+    // 不能 warn 后继续跑“半透明代理”状态。
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
+    let capture_fail_closed = plan.capture.on
+        && (plan.capture.tun.auto_route
+            || plan.capture.tun.auto_redirect
+            || matches!(
+                plan.capture.method,
+                core_config::model::CaptureMethod::Tproxy
+                    | core_config::model::CaptureMethod::Redirect
+            ));
     match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6) {
         Ok(Some(sup)) => {
             // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
@@ -809,6 +819,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 index: ruleset_index.clone(),
             }));
             if let Err(e) = sup.start(runtime.clone()).await {
+                if capture_fail_closed {
+                    // 尽力停掉可能半装好的状态，再把错误抛给 CLI。
+                    let _ = sup.stop().await;
+                    let _ = mesh_supervisor.stop().await;
+                    runtime.shutdown().await;
+                    anyhow::bail!(
+                        "capture supervisor start failed under auto_route/tproxy/redirect \
+                         (fail-closed): {e}"
+                    );
+                }
                 warn!(target: "capture", error = %e, "capture supervisor start failed");
                 // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
                 // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
@@ -825,7 +845,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             }
         }
         Ok(None) => {}
-        Err(e) => warn!(target: "capture", error = %e, "capture supervisor build failed"),
+        Err(e) => {
+            if capture_fail_closed {
+                let _ = mesh_supervisor.stop().await;
+                runtime.shutdown().await;
+                anyhow::bail!(
+                    "capture supervisor build failed under auto_route/tproxy/redirect \
+                     (fail-closed): {e}"
+                );
+            }
+            warn!(target: "capture", error = %e, "capture supervisor build failed");
+        }
     }
 
     let mut handles = Vec::new();

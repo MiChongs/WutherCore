@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Security
+
+- 非本机管理面板（`listen.share: home|all` 或非 loopback `listen.panel`）在 `ui.secret` 为空时拒绝编译/启动；
+- Clash 兼容 `GET /configs` 的 `authentication` 只返回用户名，不再回传明文密码；
+- URLTest 与订阅/规则集 fetch 默认拒绝 loopback/私网/链路本地/云元数据目标（含 redirect 跳后复查）；
+- fetch 日志只记录 host，避免订阅 token 落入 debug/warn。
+
+### Fixed
+
+- UDP 选路在过滤无 UDP 能力节点后，不再回退到任意 TCP-only 成员；
+- `groups.*.choose: chain` 在配置编译期拒绝，避免静默退化为单跳第一节点；
+- Clash `PUT /configs` 的 `mode`（rule/global/direct）接入真实选路；
+- dial 失败后短期 mark_dead，选点跳过已失败节点，避免 Manual/粘性死循环；
+- `allow-lan` / `tun.enable` 热切换改为 `501`，不再写成功假象；
+- `auto_route` / TPROXY / REDIRECT 下 capture 启动失败改为 fail-closed。
+
 ### Added
 
 - 组网后端能力/附件模型、冻结 descriptor、强类型宿主资源声明与语义化系统资源冲突预检；

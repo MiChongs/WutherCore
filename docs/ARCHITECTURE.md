@@ -111,7 +111,7 @@ sequenceDiagram
 ## 安全边界
 
 - API 密钥、订阅、节点密码、UUID、PSK 和私钥不得写入普通日志。
-- 管理 API 暴露到非本机地址时必须配置 `ui.secret` 和 CORS allowlist。
+- 管理 API 暴露到非本机地址时必须配置 `ui.secret` 和 CORS allowlist；缺少 `ui.secret` 时配置编译失败。
 - 系统路由与防火墙修改应保留恢复路径。
 - 协议规定的固定向量、测试凭据和真实硬编码凭据必须在安全扫描中区分处理。
 - 外部输入包括 YAML、订阅、规则集、DNS 响应和管理 API；解析失败应返回边界清楚的错误。
