@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use core_config::model::{
     Capture, CaptureMethod, CaptureStack, CaptureTraffic, TunHttpProxyOptions,
+    normalize_auto_redirect_mark,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -128,33 +129,36 @@ impl CapturePlan {
     /// 由 [`Capture`] 配置 + 平台决议得到的执行计划。
     pub fn from_config(c: &Capture) -> Result<Self, CaptureError> {
         let kind = decide_kind(c)?;
-        let mut excludes: Vec<ipnet::IpNet> = c
-            .exclude
-            .cidr
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let mut excludes = parse_cidr_list("capture.exclude.cidr", &c.exclude.cidr, c.on)?;
         // §9.1：默认排除 Tailnet。
         for s in ["100.64.0.0/10", "fd7a:115c:a1e0::/48"] {
-            if let Ok(n) = s.parse() {
-                if !excludes.contains(&n) {
-                    excludes.push(n);
-                }
+            let n = s.parse().expect("static Tailnet CIDR must be valid");
+            if !excludes.contains(&n) {
+                excludes.push(n);
             }
         }
 
         // 解析 sing-box `address` 列表 —— 首条 v4 + 首条 v6 生效。
-        let (mut tun_v4, mut tun_v6) = (
-            "198.18.0.0/15".parse::<ipnet::Ipv4Net>().unwrap(),
-            "fc00:1::/64".parse::<ipnet::Ipv6Net>().unwrap(),
-        );
-        for s in &c.tun.address {
+        let mut tun_v4: Option<ipnet::Ipv4Net> = None;
+        let mut tun_v6: Option<ipnet::Ipv6Net> = None;
+        for (index, s) in c.tun.address.iter().enumerate() {
             if let Ok(n) = s.parse::<ipnet::Ipv4Net>() {
-                tun_v4 = n;
-            } else if let Ok(n) = s.parse::<ipnet::Ipv6Net>() {
-                tun_v6 = n;
+                tun_v4.get_or_insert(n);
+                continue;
+            }
+            if let Ok(n) = s.parse::<ipnet::Ipv6Net>() {
+                tun_v6.get_or_insert(n);
+                continue;
+            }
+            if c.on {
+                return Err(CaptureError::Route(format!(
+                    "capture.tun.address[{index}] 不是合法的 IPv4/IPv6 CIDR: {s}"
+                )));
             }
         }
+        let tun_v4 =
+            tun_v4.unwrap_or_else(|| "198.18.0.0/15".parse().expect("static IPv4 TUN CIDR"));
+        let tun_v6 = tun_v6.unwrap_or_else(|| "fc00:1::/64".parse().expect("static IPv6 TUN CIDR"));
         let tun_v6: Option<ipnet::Ipv6Net> = if c.tun.inet6 { Some(tun_v6) } else { None };
 
         let interface_name = c
@@ -163,14 +167,18 @@ impl CapturePlan {
             .clone()
             .unwrap_or_else(default_iface_name);
 
-        let route_addresses = parse_cidr_list(&c.tun.route_address);
-        let route_exclude_addresses = parse_cidr_list(&c.tun.route_exclude_address);
-        let loopback_addresses = c
-            .tun
-            .loopback_address
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let route_addresses =
+            parse_cidr_list("capture.tun.route_address", &c.tun.route_address, c.on)?;
+        let route_exclude_addresses = parse_cidr_list(
+            "capture.tun.route_exclude_address",
+            &c.tun.route_exclude_address,
+            c.on,
+        )?;
+        let loopback_addresses = parse_ip_list(
+            "capture.tun.loopback_address",
+            &c.tun.loopback_address,
+            c.on,
+        )?;
 
         // 配置缺省时回填 sing-tun 默认值；与 mihomo `listener/sing_tun/server.go::202-221`
         // 一致——0 视为未设置，回退到 `tun.DefaultXxx` 常量。
@@ -181,28 +189,39 @@ impl CapturePlan {
                 _ => default_v,
             }
         }
+        fn mark_or_default(
+            field: &str,
+            value: Option<&str>,
+            default: u32,
+            strict: bool,
+        ) -> Result<u32, CaptureError> {
+            match normalize_auto_redirect_mark(value, default) {
+                Some(mark) => Ok(mark),
+                None if !strict => Ok(default),
+                None => Err(CaptureError::Nat(format!(
+                    "{field} 不是合法的 u32/十六进制 mark"
+                ))),
+            }
+        }
         let auto_redirect_marks = AutoRedirectMarks {
-            input: Some(nonzero_or(
-                c.tun
-                    .auto_redirect_input_mark
-                    .as_deref()
-                    .and_then(parse_hex_mark),
+            input: Some(mark_or_default(
+                "capture.tun.auto_redirect_input_mark",
+                c.tun.auto_redirect_input_mark.as_deref(),
                 core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK,
-            )),
-            output: Some(nonzero_or(
-                c.tun
-                    .auto_redirect_output_mark
-                    .as_deref()
-                    .and_then(parse_hex_mark),
+                c.on,
+            )?),
+            output: Some(mark_or_default(
+                "capture.tun.auto_redirect_output_mark",
+                c.tun.auto_redirect_output_mark.as_deref(),
                 core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
-            )),
-            reset: Some(nonzero_or(
-                c.tun
-                    .auto_redirect_reset_mark
-                    .as_deref()
-                    .and_then(parse_hex_mark),
+                c.on,
+            )?),
+            reset: Some(mark_or_default(
+                "capture.tun.auto_redirect_reset_mark",
+                c.tun.auto_redirect_reset_mark.as_deref(),
                 core_config::model::DEFAULT_AUTO_REDIRECT_RESET_MARK,
-            )),
+                c.on,
+            )?),
             nfqueue: Some(nonzero_or(
                 c.tun.auto_redirect_nfqueue,
                 core_config::model::DEFAULT_AUTO_REDIRECT_NFQUEUE,
@@ -217,13 +236,29 @@ impl CapturePlan {
             include_interface: c.tun.include_interface.clone(),
             exclude_interface: c.tun.exclude_interface.clone(),
             include_uid: c.tun.include_uid.clone(),
-            include_uid_range: parse_uid_ranges(&c.tun.include_uid_range),
+            include_uid_range: parse_uid_ranges(
+                "capture.tun.include_uid_range",
+                &c.tun.include_uid_range,
+                c.on,
+            )?,
             exclude_uid: c.tun.exclude_uid.clone(),
-            exclude_uid_range: parse_uid_ranges(&c.tun.exclude_uid_range),
+            exclude_uid_range: parse_uid_ranges(
+                "capture.tun.exclude_uid_range",
+                &c.tun.exclude_uid_range,
+                c.on,
+            )?,
             include_gid: c.tun.include_gid.clone(),
-            include_gid_range: parse_uid_ranges(&c.tun.include_gid_range),
+            include_gid_range: parse_uid_ranges(
+                "capture.tun.include_gid_range",
+                &c.tun.include_gid_range,
+                c.on,
+            )?,
             exclude_gid: c.tun.exclude_gid.clone(),
-            exclude_gid_range: parse_uid_ranges(&c.tun.exclude_gid_range),
+            exclude_gid_range: parse_uid_ranges(
+                "capture.tun.exclude_gid_range",
+                &c.tun.exclude_gid_range,
+                c.on,
+            )?,
             include_android_user: c.tun.include_android_user.clone(),
             include_package: c.tun.include_package.clone(),
             exclude_package: c.tun.exclude_package.clone(),
@@ -319,29 +354,61 @@ impl CapturePlan {
     }
 }
 
-fn parse_cidr_list(items: &[String]) -> Vec<ipnet::IpNet> {
-    items.iter().filter_map(|s| s.parse().ok()).collect()
-}
-
-/// `"start:end"` → `(start, end)`。
-fn parse_uid_ranges(items: &[String]) -> Vec<(u32, u32)> {
+fn parse_cidr_list(
+    field: &str,
+    items: &[String],
+    strict: bool,
+) -> Result<Vec<ipnet::IpNet>, CaptureError> {
     items
         .iter()
-        .filter_map(|s| {
-            let (a, b) = s.split_once(':')?;
-            Some((a.parse().ok()?, b.parse().ok()?))
+        .enumerate()
+        .filter_map(|(index, value)| match value.parse() {
+            Ok(network) => Some(Ok(network)),
+            Err(_) if !strict => None,
+            Err(_) => Some(Err(CaptureError::Route(format!(
+                "{field}[{index}] 不是合法的 CIDR: {value}"
+            )))),
         })
         .collect()
 }
 
-/// `"0x2023"` 或 `"8227"` → `0x2023`。
-fn parse_hex_mark(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u32::from_str_radix(rest, 16).ok()
-    } else {
-        s.parse().ok()
-    }
+fn parse_ip_list(field: &str, items: &[String], strict: bool) -> Result<Vec<IpAddr>, CaptureError> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| match value.parse() {
+            Ok(address) => Some(Ok(address)),
+            Err(_) if !strict => None,
+            Err(_) => Some(Err(CaptureError::Route(format!(
+                "{field}[{index}] 不是合法的 IP 地址: {value}"
+            )))),
+        })
+        .collect()
+}
+
+/// `"start:end"` → `(start, end)`。
+fn parse_uid_ranges(
+    field: &str,
+    items: &[String],
+    strict: bool,
+) -> Result<Vec<(u32, u32)>, CaptureError> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let parsed = value
+                .split_once(':')
+                .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)))
+                .filter(|(start, end)| start <= end);
+            match parsed {
+                Some(range) => Some(Ok(range)),
+                None if !strict => None,
+                None => Some(Err(CaptureError::Route(format!(
+                    "{field}[{index}] 必须是 start:end 闭区间且 start <= end: {value}"
+                )))),
+            }
+        })
+        .collect()
 }
 
 fn default_mtu(kind: EngineKind) -> u32 {
@@ -417,7 +484,28 @@ pub trait CaptureEngine: Send + Sync {
         events: mpsc::Sender<CaptureEvent>,
         runtime: Arc<core_runtime::Runtime>,
     ) -> Result<(), CaptureError>;
+    /// 第二阶段激活入口规则。
+    ///
+    /// TUN 后端必须先让 dispatcher 接管设备读写，再把系统流量导入数据面；
+    /// 默认实现为空，只有需要这种两阶段事务的后端才覆写。实现必须能处理
+    /// 任意部分启动状态：失败时保留仍归本进程所有的资源账本，允许清理后重试。
+    async fn post_start(
+        self: Arc<Self>,
+        _events: mpsc::Sender<CaptureEvent>,
+        _runtime: Arc<core_runtime::Runtime>,
+    ) -> Result<(), CaptureError> {
+        Ok(())
+    }
+    /// 在 dispatcher 停止前撤销平台入口。
+    ///
+    /// 需要内核导流规则的后端必须先停止接收新流量，才能安全拆除承载
+    /// 数据面的 dispatcher。实现必须幂等，并在部分清理失败时保留未撤销的
+    /// 所有权账本，后续调用只重试残余资源。默认实现为空。
+    async fn pre_stop(self: Arc<Self>) -> Result<(), CaptureError> {
+        Ok(())
+    }
     /// 优雅停止：撤销路由 / 清除防火墙规则 / 关 TUN。
+    /// 实现必须可重复调用，并安全处理 `start` / `post_start` 的部分成功状态。
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError>;
     /// （仅 TUN engine）返回底层 `TunIo` 设备，供 user-stack / UDP forwarder 直接读写。
     /// 默认 None —— Tproxy/Redirect 等不需要直接访问 TUN。
@@ -541,6 +629,21 @@ mod tests {
     }
 
     #[test]
+    fn first_tun_address_per_family_wins() {
+        let mut c = base();
+        c.tun.address = vec![
+            "172.19.0.1/30".into(),
+            "172.20.0.1/30".into(),
+            "fdfe:dcba:9876::1/126".into(),
+            "fdfe:dcba:9877::1/126".into(),
+        ];
+        let plan = CapturePlan::from_config(&c).unwrap();
+
+        assert_eq!(plan.tun_v4_addr_cidr(), "172.19.0.1/30");
+        assert_eq!(plan.tun_v6_addr_cidr().unwrap(), "fdfe:dcba:9876::1/126");
+    }
+
+    #[test]
     fn route_allows_with_blacklist() {
         let mut c = base();
         c.tun.route_exclude_address = vec!["192.168.0.0/16".into()];
@@ -559,18 +662,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_decimal_marks_too() {
-        assert_eq!(parse_hex_mark("0x2023"), Some(0x2023));
-        assert_eq!(parse_hex_mark("8227"), Some(8227));
-        assert_eq!(parse_hex_mark("garbage"), None);
+    fn parses_decimal_marks_and_normalizes_zero() {
+        assert_eq!(
+            normalize_auto_redirect_mark(Some("0x2023"), 7),
+            Some(0x2023)
+        );
+        assert_eq!(normalize_auto_redirect_mark(Some("8227"), 7), Some(8227));
+        assert_eq!(normalize_auto_redirect_mark(Some("0"), 7), Some(7));
+        assert_eq!(normalize_auto_redirect_mark(Some("garbage"), 7), None);
     }
 
     #[test]
     fn parses_uid_range() {
         assert_eq!(
-            parse_uid_ranges(&["1000:99999".into(), "bad".into(), "0:10".into()]),
+            parse_uid_ranges("test.range", &["1000:99999".into(), "0:10".into()], true).unwrap(),
             vec![(1000, 99999), (0, 10)]
         );
+        assert!(parse_uid_ranges("test.range", &["bad".into()], true).is_err());
+        assert!(parse_uid_ranges("test.range", &["10:0".into()], true).is_err());
     }
 
     #[test]
@@ -585,6 +694,42 @@ mod tests {
         assert_eq!(plan.filters.include_gid_range, vec![(10000u32, 19999u32)]);
         assert_eq!(plan.filters.exclude_gid, vec![1000u32]);
         assert_eq!(plan.filters.exclude_gid_range, vec![(2000u32, 2099u32)]);
+    }
+
+    #[test]
+    fn active_capture_literals_fail_closed_in_execution_plan() {
+        let mut invalid_route = base();
+        invalid_route.tun.route_address = vec!["not-a-cidr".into()];
+        let error = CapturePlan::from_config(&invalid_route).unwrap_err();
+        assert!(error.to_string().contains("route_address[0]"));
+
+        let mut reversed_range = base();
+        reversed_range.tun.include_uid_range = vec!["2000:1000".into()];
+        let error = CapturePlan::from_config(&reversed_range).unwrap_err();
+        assert!(error.to_string().contains("start <= end"));
+
+        let mut invalid_mark = base();
+        invalid_mark.tun.auto_redirect_output_mark = Some("not-a-mark".into());
+        let error = CapturePlan::from_config(&invalid_mark).unwrap_err();
+        assert!(error.to_string().contains("output_mark"));
+    }
+
+    #[test]
+    fn disabled_capture_ignores_dormant_invalid_literals() {
+        let mut capture = base();
+        capture.on = false;
+        capture.tun.route_address = vec!["not-a-cidr".into()];
+        capture.tun.include_uid_range = vec!["backwards".into()];
+        capture.tun.auto_redirect_output_mark = Some("not-a-mark".into());
+
+        let plan = CapturePlan::from_config(&capture).unwrap();
+
+        assert!(plan.route_addresses.is_empty());
+        assert!(plan.filters.include_uid_range.is_empty());
+        assert_eq!(
+            plan.auto_redirect_marks.output,
+            Some(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+        );
     }
 
     #[test]

@@ -13,6 +13,12 @@ use crate::engine::{CaptureEngine, CaptureError, CapturePlan};
 // Linux 与 Android 共享 /dev/net/tun + nftables 路径。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux;
+// Linux TUN auto_redirect 的规则生成器在测试构建中也参与编译，便于在
+// 非 Linux 主机验证命令账本；真实安装入口仅由 Linux/Android 后端调用。
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_auto_redirect;
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_auto_redirect_route;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux_identity_bypass;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -66,6 +72,13 @@ pub mod android_tun_io;
 pub mod vpnservice_tun_io;
 
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
+    #[cfg(not(target_os = "linux"))]
+    if plan.auto_redirect {
+        return Err(CaptureError::Unsupported(
+            "capture.tun.auto_redirect is supported only by root-managed Linux TUN".into(),
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     {
         return linux::build_engine(plan);
@@ -147,6 +160,8 @@ fn strip_ip_family_prefix<'a, 'b>(args: &'a [&'b str]) -> &'a [&'b str] {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "linux"))]
+    use super::build_engine;
     use super::is_absent_ip_rule_delete;
 
     #[test]
@@ -180,5 +195,29 @@ mod tests {
             &["rule", "add", "fwmark", "0xff", "lookup", "main"],
             "RTNETLINK answers: No such file or directory\n",
         ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_low_level_engine_build_rejects_auto_redirect() {
+        let capture = core_config::model::Capture {
+            on: true,
+            method: core_config::model::CaptureMethod::VirtualNic,
+            traffic: core_config::model::CaptureTraffic::System,
+            tun: core_config::model::TunInboundOptions {
+                auto_route: true,
+                auto_redirect: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = crate::engine::CapturePlan::from_config(&capture).unwrap();
+
+        let error = match build_engine(plan) {
+            Ok(_) => panic!("non-Linux auto_redirect must fail at the platform boundary"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, crate::engine::CaptureError::Unsupported(_)));
+        assert!(error.to_string().contains("root-managed Linux"));
     }
 }

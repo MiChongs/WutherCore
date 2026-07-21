@@ -28,8 +28,9 @@ pub mod transport;
 pub use adapter::{
     BoxedStream, BoxedUdp, Capabilities, DialContext, DialResolver, OutboundAdapter,
     ProtectedSocket, ProxyStream, SocketProtector, UdpSocketLike, apply_outbound_mark,
-    apply_outbound_mark_for_addr, bind_outbound_socket, bind_to_device, create_outbound_udp_socket,
-    global_dial_resolver, has_socket_protector, next_dial_id, outbound_fwmark, outbound_interface,
+    apply_outbound_mark_for_addr, bind_outbound_socket, bind_to_device,
+    compare_exchange_outbound_fwmark, create_outbound_udp_socket, global_dial_resolver,
+    has_socket_protector, next_dial_id, outbound_fwmark, outbound_interface,
     outbound_interface_index_v4, outbound_interface_index_v6, prepare_outbound_udp_socket,
     prepare_outbound_udp_socket_for_addr, protect_socket, resolve_host, set_global_dial_resolver,
     set_outbound_fwmark, set_outbound_interface, set_outbound_interface_index,

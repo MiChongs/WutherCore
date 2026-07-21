@@ -812,6 +812,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             }));
             if let Err(e) = sup.start(runtime.clone()).await {
                 warn!(target: "capture", error = %e, "capture supervisor start failed");
+                // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
+                // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
+                // 否则 drop supervisor 会同时丢失路由/fwmark 的恢复入口。
+                if let Err(cleanup_error) = sup.stop().await {
+                    return Err(anyhow::anyhow!(
+                        "capture start failed ({e}); cleanup retry also failed \
+                         ({cleanup_error}); refusing to continue with possibly active \
+                         transparent-capture state"
+                    ));
+                }
             } else {
                 capture_handle = Some(sup);
             }
