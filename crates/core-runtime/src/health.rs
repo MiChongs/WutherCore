@@ -354,10 +354,7 @@ impl UrlTester {
             // 域名：先解析再判定，防止 URLTest 当 SSRF 原语。
             match core_outbound::resolve_host(&parsed.host, parsed.port).await {
                 Ok(addrs) => {
-                    if addrs
-                        .iter()
-                        .any(|a| core_outbound::is_blocked_ip(a.ip()))
-                    {
+                    if addrs.iter().any(|a| core_outbound::is_blocked_ip(a.ip())) {
                         return Err(DelayError::BlockedTarget(
                             core_outbound::blocked_target_message(&parsed.host),
                         ));

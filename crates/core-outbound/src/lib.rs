@@ -37,7 +37,6 @@ pub use adapter::{
     set_outbound_fwmark, set_outbound_interface, set_outbound_interface_index,
     set_socket_protector, should_mark_outbound_addr,
 };
-pub use net_guard::{blocked_target_message, is_blocked_host_literal, is_blocked_ip};
 pub use dns_hijack::{
     DnsHijackOutbound, DnsResponder, global_dns_responder, set_global_dns_responder,
 };
@@ -45,4 +44,5 @@ pub use loopback::{
     LoopbackTcpGuard, LoopbackUdpGuard, TrackedTcpStream, is_loopback_tcp_source,
     is_loopback_udp_source, register_tcp, register_udp,
 };
+pub use net_guard::{blocked_target_message, is_blocked_host_literal, is_blocked_ip};
 pub use registry::{OutboundRegistry, ResolveFn};

@@ -418,7 +418,9 @@ nodes: []
         .await
         .unwrap();
     let v = body_json(resp).await;
-    let auth = v["authentication"].as_array().expect("authentication array");
+    let auth = v["authentication"]
+        .as_array()
+        .expect("authentication array");
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0], "alice");
     let body = serde_json::to_string(&v).unwrap();

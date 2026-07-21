@@ -383,16 +383,14 @@ fn compile_groups(
         cfg.feeds.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
         if g.choose == ChooseStrategy::Chain {
-            return Err(
-                ConfigError::invalid(format!(
-                    "groups.{name}.choose = chain 尚未实现多跳 relay"
-                ))
-                .at(format!("groups.{name}.choose"))
-                .hint(
-                    "请改用 manual / smart / fast / stable / spread；\
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.choose = chain 尚未实现多跳 relay"
+            ))
+            .at(format!("groups.{name}.choose"))
+            .hint(
+                "请改用 manual / smart / fast / stable / spread；\
                      多跳链路实现前不会静默退化为单跳",
-                ),
-            );
+            ));
         }
         let mut members = Vec::new();
         for src in &g.r#use {
@@ -997,16 +995,14 @@ fn validate_ui_secret_for_bind(listen: &ListenPlan, ui: &Ui) -> ConfigResult<()>
     if secret_ok {
         return Ok(());
     }
-    Err(
-        ConfigError::invalid(
-            "管理 API 绑定了非本机地址，但 ui.secret 为空；拒绝启动以避免未鉴权控制面",
-        )
-        .at("ui.secret")
-        .hint(
-            "为 ui.secret 设置足够长的随机串，或把 listen.panel / listen.share 限制在 127.0.0.1 / ::1；\
-             share: home|all 会把面板绑到 0.0.0.0",
-        ),
+    Err(ConfigError::invalid(
+        "管理 API 绑定了非本机地址，但 ui.secret 为空；拒绝启动以避免未鉴权控制面",
     )
+    .at("ui.secret")
+    .hint(
+        "为 ui.secret 设置足够长的随机串，或把 listen.panel / listen.share 限制在 127.0.0.1 / ::1；\
+             share: home|all 会把面板绑到 0.0.0.0",
+    ))
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -1602,10 +1598,7 @@ ui:
 "#,
         );
         assert_eq!(plan.listen.panel.as_ref().unwrap().host, "0.0.0.0");
-        assert_eq!(
-            plan.ui.secret.as_deref(),
-            Some("test-secret-please-change")
-        );
+        assert_eq!(plan.ui.secret.as_deref(), Some("test-secret-please-change"));
     }
 
     #[test]
