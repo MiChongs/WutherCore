@@ -5,6 +5,9 @@ use serde::Serialize;
 
 use crate::engine::CapturePlan;
 
+const VPN_SERVICE_DEFAULT_ROUTE_V4: &str = "0.0.0.0/0";
+const VPN_SERVICE_DEFAULT_ROUTE_V6: &str = "::/0";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AndroidIpPrefix {
     pub address: IpAddr,
@@ -40,30 +43,15 @@ pub fn build_vpn_service_config(plan: &CapturePlan) -> AndroidVpnServiceConfig {
     }
     addresses.sort_by_key(prefix_sort_key);
 
-    let mut base_routes = if !plan.route_addresses.is_empty() {
-        plan.route_addresses.clone()
-    } else if plan.auto_route {
-        let mut r = vec!["0.0.0.0/0".parse::<IpNet>().unwrap()];
-        if plan.tun_v6_cidr.is_some() {
-            r.push("::/0".parse::<IpNet>().unwrap());
-        }
-        r
-    } else {
+    if plan.route_addresses.is_empty() && !plan.auto_route {
         warnings.push(
             "auto_route=false 且 route_address 为空；VpnService.Builder 不会添加接管路由".into(),
         );
-        Vec::new()
-    };
-    base_routes.sort_by_key(net_sort_key);
-
-    let mut static_excludes = plan.exclude_cidrs.clone();
-    static_excludes.extend(plan.route_exclude_addresses.iter().copied());
-
-    let mut routes = subtract_routes(&base_routes, &static_excludes)
+    }
+    let routes = vpn_service_route_nets(plan)
         .into_iter()
         .map(AndroidIpPrefix::from_net)
         .collect::<Vec<_>>();
-    routes.sort_by_key(prefix_sort_key);
 
     let mut dns_servers = Vec::new();
     if plan.hijack_dns {
@@ -126,6 +114,41 @@ pub fn build_vpn_service_config(plan: &CapturePlan) -> AndroidVpnServiceConfig {
         disallowed_applications,
         warnings,
     }
+}
+
+/// Return the exact static routes exported to `VpnService.Builder`.
+///
+/// This function is deliberately pure and shared with host-resource preflight:
+/// declaring the Android framework fallback must never probe root capabilities,
+/// and it must stay in lock-step with the routes the embedding app installs.
+pub(crate) fn vpn_service_route_nets(plan: &CapturePlan) -> Vec<IpNet> {
+    let mut base_routes = if !plan.route_addresses.is_empty() {
+        plan.route_addresses.clone()
+    } else if plan.auto_route {
+        let mut routes = vec![
+            VPN_SERVICE_DEFAULT_ROUTE_V4
+                .parse::<IpNet>()
+                .expect("Android VpnService IPv4 default route must be valid"),
+        ];
+        if plan.tun_v6_cidr.is_some() {
+            routes.push(
+                VPN_SERVICE_DEFAULT_ROUTE_V6
+                    .parse::<IpNet>()
+                    .expect("Android VpnService IPv6 default route must be valid"),
+            );
+        }
+        routes
+    } else {
+        Vec::new()
+    };
+    base_routes.sort_by_key(net_sort_key);
+
+    let mut static_excludes = plan.exclude_cidrs.clone();
+    static_excludes.extend(plan.route_exclude_addresses.iter().copied());
+
+    let mut routes = subtract_routes(&base_routes, &static_excludes);
+    routes.sort_by_key(net_sort_key);
+    routes
 }
 
 pub fn build_vpn_service_config_json(plan: &CapturePlan) -> Result<String, serde_json::Error> {

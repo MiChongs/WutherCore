@@ -34,6 +34,21 @@ pub enum DnsListenerError {
     TcpBind(SocketAddr, std::io::Error),
 }
 
+/// Parse the configured DNS listen address without binding a socket.
+///
+/// This is the single source of truth shared by startup and host-resource
+/// arbitration. Empty input and port `0` are disabled, matching mihomo.
+pub fn parse_dns_listen_addr(listen: &str) -> Result<Option<SocketAddr>, DnsListenerError> {
+    let trimmed = listen.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let addr: SocketAddr = trimmed.parse().map_err(|e: std::net::AddrParseError| {
+        DnsListenerError::InvalidAddr(trimmed.to_string(), e.to_string())
+    })?;
+    Ok((addr.port() != 0).then_some(addr))
+}
+
 /// 同时持有 UDP + TCP listener 句柄，drop 时取消两个后台 task。
 ///
 /// `Disabled` 变体表示"配置上不启动"——按 mihomo 默认行为，空地址或 port=0
@@ -126,23 +141,20 @@ pub async fn spawn_dns_listener(
     listen: &str,
     service: Arc<DnsService>,
 ) -> Result<DnsListener, DnsListenerError> {
-    let trimmed = listen.trim();
-    if trimmed.is_empty() {
-        debug!(target: "dns::listener", "listen empty; DNS server disabled (mihomo-aligned)");
+    let Some(addr) = parse_dns_listen_addr(listen)? else {
+        let trimmed = listen.trim();
+        if trimmed.is_empty() {
+            debug!(target: "dns::listener", "listen empty; DNS server disabled (mihomo-aligned)");
+        } else {
+            // mihomo `dns/server.go:73-77`: port == "0" → return early, no listener.
+            info!(
+                target: "dns::listener",
+                listen = %trimmed,
+                "port=0 视为 disabled（mihomo 行为）；如需 OS 选端口请显式指定 :PORT"
+            );
+        }
         return Ok(DnsListener::disabled());
-    }
-    let addr: SocketAddr = trimmed.parse().map_err(|e: std::net::AddrParseError| {
-        DnsListenerError::InvalidAddr(trimmed.to_string(), e.to_string())
-    })?;
-    if addr.port() == 0 {
-        // mihomo `dns/server.go:73-77`: port == "0" → return early, no listener.
-        info!(
-            target: "dns::listener",
-            listen = %trimmed,
-            "port=0 视为 disabled（mihomo 行为）；如需 OS 选端口请显式指定 :PORT"
-        );
-        return Ok(DnsListener::disabled());
-    }
+    };
 
     // ---- UDP ----
     let udp = UdpSocket::bind(addr)
@@ -335,6 +347,20 @@ mod tests {
         let p = l.local_addr().unwrap().port();
         drop(l);
         p
+    }
+
+    #[test]
+    fn parser_matches_disabled_and_active_listener_semantics() {
+        assert_eq!(parse_dns_listen_addr("   ").unwrap(), None);
+        assert_eq!(parse_dns_listen_addr("127.0.0.1:0").unwrap(), None);
+        assert_eq!(
+            parse_dns_listen_addr(" 127.0.0.1:5353 ").unwrap(),
+            Some("127.0.0.1:5353".parse().unwrap())
+        );
+        assert!(matches!(
+            parse_dns_listen_addr("localhost:5353"),
+            Err(DnsListenerError::InvalidAddr(_, _))
+        ));
     }
 
     #[tokio::test]

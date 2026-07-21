@@ -151,7 +151,7 @@ impl CaptureEngine for MacUtun {
         Self::configure(&self.plan, &real_name)?;
 
         // 默认路由 → utunN
-        if let Ok(default4) = "0.0.0.0/0".parse() {
+        if let Ok(default4) = crate::resource_claims::DEFAULT_ROUTE_V4.parse() {
             let _ = self.routes.add(ManagedRoute {
                 dest: default4,
                 gateway: None,

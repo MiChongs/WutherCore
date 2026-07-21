@@ -63,6 +63,7 @@ WebSocket/SSE 因浏览器协议限制，可使用 `?token=<secret>`。普通 GE
 | `GET` | `/v1/resolver/query` | 调试 DNS 查询 |
 | `GET` | `/v1/route/check` | 调试路由结果 |
 | `GET` | `/v1/capture/state` | 流量接管状态 |
+| `GET` | `/v1/mesh/status` | 组网监督器、后端、动态附件、资源声明与冲突快照 |
 | `GET` | `/v1/smart/why` | 查看 Smart 选择理由 |
 | `POST` | `/v1/smart/pin` | 固定节点 |
 | `POST` | `/v1/smart/avoid` | 临时回避节点 |
@@ -71,6 +72,12 @@ WebSocket/SSE 因浏览器协议限制，可使用 `?token=<secret>`。普通 GE
 | `GET` | `/v1/smart/nodes/:group` | 查看组内 Smart 节点 |
 
 请求参数和响应结构在 1.0 前仍可能变化。集成时应保留未知字段，并对非 2xx 响应记录状态码和脱敏后的消息。
+
+`/v1/mesh/status` 只返回监督器当前内存快照的安全公开投影：handler 调用 `MeshSupervisor::snapshot().public_view()`，不会执行 `probe`、`status` 或 `refresh`，不会访问外部 daemon、触发后端启停/隔离，也不会推进快照 generation。启动、停止和默认 5 秒一次的后台监控负责发布新的内部快照。
+
+公开投影会解析 URL endpoint，只保留 scheme、host 和 port，删除 userinfo、path、query、fragment；非法 URL、Unix socket、named pipe 与 `Opaque` endpoint 只返回无 value 的 `hidden`。version 和所有自定义字符串有长度上限并清理控制字符；diagnostic 只公开 level、安全 code 和固定 message；资源声明与冲突均不公开 `coordination_key`。响应模型也没有命令环境或秘密文件字段。
+
+主程序未注入组网监督器时，该端点明确返回 `503 mesh_supervisor_unavailable`，不会把“未初始化”误报成“所有后端正常”。当前基础设施阶段没有注册具体产品后端，因此 `statuses` 可以为空；capture 以及 DNS/Mixed/API 固定监听的 reservations 仍会正常出现在快照中。
 
 ## 示例
 

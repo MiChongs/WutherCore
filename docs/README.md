@@ -17,6 +17,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [架构说明](ARCHITECTURE.md) | workspace 边界、连接数据流与主要扩展点 |
+| [组网后端基础设施](mesh-backend-foundation.md) | 后端能力、系统资源仲裁、进程所有权与事务生命周期 |
 | [内核设计文档](../RP内核设计文档.md) | 完整设计背景和实现细节 |
 | [构建性能](BUILD-PERF.md) | Cargo profile、缓存与编译性能 |
 | [构建脚本](../scripts/README.md) | 多平台构建方式和产物 |

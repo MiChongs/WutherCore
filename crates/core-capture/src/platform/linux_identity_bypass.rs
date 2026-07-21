@@ -131,17 +131,8 @@ pub fn revert(plan: &CapturePlan) {
     }
 }
 
-fn has_identity_filters(f: &CaptureFilters) -> bool {
-    !f.include_uid.is_empty()
-        || !f.include_uid_range.is_empty()
-        || !f.exclude_uid.is_empty()
-        || !f.exclude_uid_range.is_empty()
-        || !f.include_gid.is_empty()
-        || !f.include_gid_range.is_empty()
-        || !f.exclude_gid.is_empty()
-        || !f.exclude_gid_range.is_empty()
-        || !f.include_package.is_empty()
-        || !f.exclude_package.is_empty()
+fn has_identity_filters(filters: &CaptureFilters) -> bool {
+    crate::resource_claims::has_linux_identity_filters(filters)
 }
 
 fn install_for_family(

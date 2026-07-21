@@ -231,31 +231,41 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
             udp: d.udp,
         },
     });
+    if mixed.as_ref().is_some_and(|listener| listener.port == 0) {
+        return Err(ConfigError::invalid(
+            "listen.local 端口不能为 0；删除 local 配置可禁用 Mixed 入站",
+        ));
+    }
 
-    let panel = listen.panel.and_then(|p| match p {
-        PanelBind::Off(false) => None,
-        PanelBind::Off(true) => Some(PanelListen {
+    let panel = match listen.panel {
+        None | Some(PanelBind::Off(false)) => None,
+        Some(PanelBind::Off(true)) => Some(PanelListen {
             host: host_for(share).into(),
             port: 9090,
         }),
-        PanelBind::Port(port) => Some(PanelListen {
+        Some(PanelBind::Port(port)) => Some(PanelListen {
             host: host_for(share).into(),
             port,
         }),
-        PanelBind::Address(addr) => {
-            let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-            if parts.len() == 2 {
-                let port = parts[0].parse().ok();
-                if let Some(port) = port {
-                    return Some(PanelListen {
-                        host: parts[1].to_string(),
-                        port,
-                    });
-                }
-            }
-            None
+        Some(PanelBind::Address(addr)) => {
+            let socket: SocketAddr = addr
+                .parse()
+                .map_err(|_| ConfigError::invalid(format!("非法 listen.panel 地址: {addr}")))?;
+            let host = match socket.ip() {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            };
+            Some(PanelListen {
+                host,
+                port: socket.port(),
+            })
         }
-    });
+    };
+    if panel.as_ref().is_some_and(|listener| listener.port == 0) {
+        return Err(ConfigError::invalid(
+            "listen.panel 端口不能为 0；设为 false 可禁用 API 入站",
+        ));
+    }
 
     let auth = listen
         .auth
@@ -1555,6 +1565,54 @@ nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Home)));
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Cn)));
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Any)));
+    }
+
+    #[test]
+    fn fixed_process_listeners_reject_dynamic_port_zero() {
+        for yaml in [
+            r#"
+version: 1
+profile: desktop
+listen:
+  local: 0
+"#,
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 0
+"#,
+        ] {
+            let error = crate::loader::load_from_str(yaml).unwrap_err();
+            assert!(error.to_string().contains("端口不能为 0"));
+        }
+    }
+
+    #[test]
+    fn panel_address_is_validated_and_preserves_ipv6() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: not-a-socket
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("非法 listen.panel 地址"));
+
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: "[::1]:9090"
+"#,
+        );
+        assert_eq!(
+            plan.listen.panel.unwrap().socket_addr().unwrap(),
+            "[::1]:9090".parse().unwrap()
+        );
     }
 
     #[test]

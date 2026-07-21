@@ -20,6 +20,8 @@ pub struct NativeState {
     pub urltest: Arc<UrlTester>,
     /// 由 main.rs 在 capture 启动后注入；为空时 /v1/capture/state 仅回静态配置。
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
+    /// 统一组网监督器；`/v1/mesh/status` 只返回脱敏后的结构化快照。
+    pub mesh: Option<Arc<core_mesh::MeshSupervisor>>,
     /// 订阅管理器（始终注入，可能 idle）—— `/providers/proxies` 端点使用。
     pub feeds: Option<Arc<core_feeds::FeedManager>>,
     /// 端点级响应缓存（singleflight + TTL）。
@@ -45,6 +47,7 @@ impl NativeState {
             secret: None,
             urltest,
             capture: None,
+            mesh: None,
             feeds,
             caches: crate::compat_cache::Caches::new(),
             ws_hubs,
@@ -64,6 +67,7 @@ pub fn router(state: NativeState) -> Router {
         .route("/resolver/query", get(resolver_query))
         .route("/route/check", get(route_check))
         .route("/capture/state", get(capture_state))
+        .route("/mesh/status", get(mesh_status))
         .route("/smart/why", get(smart_why))
         .route("/smart/pin", post(smart_pin))
         .route("/smart/avoid", post(smart_avoid))
@@ -279,6 +283,23 @@ async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
         }
     }
     Json(body)
+}
+
+async fn mesh_status(State(s): State<NativeState>) -> impl IntoResponse {
+    match &s.mesh {
+        // Monitoring and fail-closed isolation belong to MeshSupervisor's
+        // background lifecycle. A GET must neither invoke an external daemon
+        // nor change a snapshot generation.
+        Some(mesh) => Json(mesh.snapshot().public_view()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "mesh supervisor unavailable",
+                "code": "mesh_supervisor_unavailable"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]

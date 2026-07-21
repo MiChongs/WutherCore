@@ -1,8 +1,9 @@
-//! core-mesh —— Tailscale / WireGuard / 局域网协同。
+//! core-mesh —— 跨后端组网能力、资源仲裁与生命周期监督。
 //!
-//! §9：默认排除 100.64.0.0/10、fd7a:115c:a1e0::/48；
-//! Tailnet 目标默认 direct，不进入 Smart。
-//! MVP：检测本机是否存在 tailscaled / userspace proxy，并产出诊断。
+//! 所有具体组网实现都通过 [`NetworkBackend`] 接入，并在修改系统路由、DNS、
+//! 防火墙、接口或监听端口前，由 [`MeshSupervisor`] 统一检查资源声明。这样既能
+//! 安全附着用户自行管理的系统服务，也能对 WutherCore 创建的子进程做事务启动、
+//! 失败回滚和逆序关闭。
 
 #![forbid(unsafe_code)]
 
@@ -10,6 +11,28 @@ use core_config::model::{Mesh, TailscaleMode};
 use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use tracing::info;
+
+pub mod backend;
+pub mod conflict;
+pub mod model;
+pub mod process;
+pub mod registry;
+pub mod supervisor;
+
+pub use backend::{
+    BackendDescriptor, BackendError, BackendResult, ExternalNetworkBackend, NetworkBackend,
+    OwnedNetworkBackend,
+};
+pub use conflict::{
+    PublicClaimIncompatibility, PublicResourceConflict, PublicResourceConflictKind,
+    PublicRouteManagedResource, PublicSingletonResource, ResourceConflict, detect_conflicts,
+};
+pub use model::*;
+pub use process::*;
+pub use registry::{BackendRegistry, RegistryError};
+pub use supervisor::{
+    BackendCallTimeouts, BackendFailure, MeshError, MeshSupervisor, SupervisorOptions,
+};
 
 pub static TAILNET_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
     ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
