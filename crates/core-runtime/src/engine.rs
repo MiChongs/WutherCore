@@ -479,6 +479,8 @@ impl Runtime {
         meta.dst_ip = ctx.ip;
         let tester = self.urltest.read().clone();
         let registry = self.outbounds.read();
+        // UDP 只允许具备 UDP 能力的节点。过滤后不得再回退到任意 TCP-only 成员，
+        // 否则会静默选中无 UDP relay 的协议，最终 Unsupported 或错误转发。
         let pick = if ctx.network == NetworkKind::Udp {
             g.pick_eligible(&meta, &self.smart, tester.as_ref(), |name| {
                 registry
@@ -486,7 +488,6 @@ impl Runtime {
                     .map(|ob| ob.capabilities().udp)
                     .unwrap_or(false)
             })
-            .or_else(|| g.pick(&meta, &self.smart, tester.as_ref()))
         } else {
             g.pick(&meta, &self.smart, tester.as_ref())
         };
@@ -495,6 +496,12 @@ impl Runtime {
                 return (name, ob);
             }
             warn!(target: "route", node = %name, "节点未注册，阻断流量避免回退 DIRECT");
+        } else if ctx.network == NetworkKind::Udp {
+            warn!(
+                target: "route",
+                group,
+                "分组内无支持 UDP 的节点，阻断流量避免回退 TCP-only 出站"
+            );
         } else if g.has_unresolved_feed_placeholders() {
             warn!(target: "route", group, "订阅节点尚未加载或为空，阻断流量避免回退 DIRECT");
         }
@@ -544,6 +551,8 @@ impl Runtime {
         let mut attempted = BTreeSet::new();
         let mut last_err: Option<std::io::Error> = None;
         for attempt in 1..=DIAL_MAX_RETRIES {
+            // 已失败节点通过 UrlTester 短期 dead + pick_eligible 的 alive 过滤排除；
+            // attempted 仍作本轮硬排除，防止 Manual 固定节点在 mark_temp_dead 前再次命中。
             let pick = self.pick_outbound_for_context(ctx.clone());
             info!(
                 target: "dial",
@@ -562,7 +571,7 @@ impl Runtime {
                     "blocked",
                 ));
             }
-            if !attempted.insert(pick.label.clone()) {
+            if attempted.contains(&pick.label) {
                 if let Some(err) = last_err {
                     debug!(
                         target: "dial",
@@ -571,11 +580,12 @@ impl Runtime {
                         %host, port,
                         outbound = %pick.label,
                         error = %err,
-                        "retry stopped because group selected the same outbound again",
+                        "retry stopped because group selected an already-failed outbound",
                     );
                     return Err(err);
                 }
             }
+            attempted.insert(pick.label.clone());
             let dial_ctx = DialContext {
                 host: host.to_string(),
                 port,
@@ -642,6 +652,10 @@ impl Runtime {
                     );
                     if pick.label != "DIRECT" && pick.label != "BLOCK" {
                         self.smart.record_failure(&pick.label, e.to_string());
+                        // 短期 mark_dead，让后续 pick 跳过本节点。
+                        if let Some(t) = self.urltest.read().clone() {
+                            t.mark_temp_dead(&pick.label);
+                        }
                     }
                     if let Some(name) = &group_for_event {
                         if let Some(g) = self.groups.read().get(name).cloned() {
@@ -1771,6 +1785,37 @@ find-process-mode: strict
         assert!(
             runtime.process_finder.is_some(),
             "find-process-mode: strict → finder 必须构建"
+        );
+    }
+
+    #[test]
+    fn udp_pick_does_not_fall_back_to_tcp_only_member() {
+        // VLESS 出站 capabilities.udp=false；组内只有 VLESS 时 UDP 必须 BLOCK，
+        // 不得回退到 TCP-only 成员。
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes:
+  - "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?security=tls&type=tcp#vless-only"
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        let tcp = runtime.pick_outbound("1.1.1.1", 443, NetworkKind::Tcp);
+        assert_eq!(tcp.label, "vless-only");
+        let udp = runtime.pick_outbound("1.1.1.1", 443, NetworkKind::Udp);
+        assert_eq!(
+            udp.label, "BLOCK",
+            "UDP must not fall back to TCP-only nodes"
         );
     }
 

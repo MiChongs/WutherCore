@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- UDP 选路在过滤无 UDP 能力节点后，不再回退到任意 TCP-only 成员；
+- dial 失败后短期 mark_dead，选点跳过已失败节点，避免 Manual/粘性死循环；
+- 运行时 `choose: chain` 返回空选择，避免静默单跳（配置层拒绝见独立 PR）。
+
 ### Added
 
 - 组网后端能力/附件模型、冻结 descriptor、强类型宿主资源声明与语义化系统资源冲突预检；
