@@ -16,11 +16,14 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
+use core_inbound::{
+    MixedListener, XhttpListenerHandle, ensure_best_effort_privilege, run_mixed,
+    start_xhttp_listeners,
+};
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::host_resources::listener_resource_claims;
 
@@ -634,6 +637,56 @@ nodes: []
 
         assert!(wait_for_mesh_fail_stop(&mut updates).await.is_none());
     }
+
+    #[tokio::test]
+    async fn configured_xhttp_is_prebound_by_main_startup_path() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let plan = core_config::loader::load_from_str(&format!(
+            r#"
+version: 1
+profile: server
+listen:
+  panel: false
+  xhttp:
+    enabled: true
+    address: 127.0.0.1
+    port: {listen_port}
+    cleartext: true
+    alpn: [h1, h2]
+    target: {{host: 127.0.0.1, port: {target_port}}}
+    tag: main-xhttp
+    settings:
+      host: localhost
+      path: /main-startup
+      mode: stream-one
+route:
+  preset: direct
+"#
+        ))
+        .unwrap();
+        let runtime = Arc::new(Runtime::build(plan.clone()).unwrap());
+
+        let mut handles = start_configured_xhttp_inbounds(&plan, Arc::clone(&runtime))
+            .await
+            .expect("main startup path must start configured XHTTP");
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].tag(), "main-xhttp");
+        assert_eq!(handles[0].local_addr().port(), listen_port);
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+                .await
+                .is_err(),
+            "main startup helper returned before pre-binding the XHTTP port"
+        );
+
+        handles[0].shutdown().await.unwrap();
+        runtime.shutdown().await;
+        drop(target);
+    }
 }
 
 fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
@@ -801,11 +854,14 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     // RulesetMatcher。
     let ruleset_index = core_ruleset::RulesetIndex::new();
 
-    let runtime = Arc::new(Runtime::build_with(
-        plan.clone(),
-        store,
-        Some(ruleset_index.clone()),
-    ));
+    let runtime = Arc::new(
+        Runtime::build_with(plan.clone(), store, Some(ruleset_index.clone()))
+            .context("运行时出站配置构建失败")?,
+    );
+    // XHTTP 的证书/ALPN 与 TCP/UDP socket 必须在宣告进程启动前全部准备完成。
+    // 任何一项失败都会关闭已启动的同类监听并直接返回 cmd_run。
+    let mut xhttp_listener_handles =
+        start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
 
     // 把运行期 LogBus 挂到 tracing 桥上 —— 让 /v1/logs 与 Clash 兼容 /logs WS
     // 流式输出。tracing 可能已被早期初始化占用，所以 observe 层使用可后挂载的
@@ -1053,6 +1109,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         warn!(target: "mesh", error = %error, "mesh supervisor stop failed");
     }
     feed_mgr_handle.stop();
+    for listener in &mut xhttp_listener_handles {
+        if let Err(error) = listener.shutdown().await {
+            warn!(
+                target: "inbound::xhttp",
+                tag = listener.tag(),
+                %error,
+                "XHTTP listener shutdown failed"
+            );
+        }
+    }
     runtime.shutdown().await;
     for h in handles {
         h.abort();
@@ -1073,6 +1139,15 @@ async fn wait_for_mesh_fail_stop(
             return None;
         }
     }
+}
+
+async fn start_configured_xhttp_inbounds(
+    plan: &core_config::runtime_plan::RuntimePlan,
+    runtime: Arc<Runtime>,
+) -> anyhow::Result<Vec<XhttpListenerHandle>> {
+    start_xhttp_listeners(&plan.listen.xhttp, runtime)
+        .await
+        .context("XHTTP 入站启动失败")
 }
 
 /// 把 [`core_ruleset::RulesetIndex`] 适配为 [`core_capture::IpSetProvider`]。
@@ -1186,6 +1261,13 @@ struct RuntimeFeedSink {
 #[async_trait]
 impl FeedSink for RuntimeFeedSink {
     async fn on_update(&self, update: FeedUpdate) {
-        self.runtime.apply_feed_nodes(&update.name, update.nodes);
+        if let Err(error) = self.runtime.apply_feed_nodes(&update.name, update.nodes) {
+            error!(
+                target: "feeds",
+                provider = %update.name,
+                %error,
+                "feed 节点配置无效，保留上一份可用快照"
+            );
+        }
     }
 }

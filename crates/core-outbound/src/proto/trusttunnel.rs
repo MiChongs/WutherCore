@@ -203,6 +203,12 @@ impl TrustTunnelOutbound {
             sni: self.sni.clone().or(Some(self.host.clone())),
             insecure: self.insecure,
             alpn: self.alpn.clone(),
+            fingerprint: String::new(),
+            enable_session_resumption: false,
+            pinned_peer_cert_sha256: Vec::new(),
+            verify_peer_cert_by_name: Vec::new(),
+            xray_settings: None,
+            resolved_ech_config_list: None,
         })
         .connect(&self.host, self.port)
         .await?;

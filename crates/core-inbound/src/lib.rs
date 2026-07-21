@@ -11,6 +11,11 @@ pub mod mixed;
 pub mod privilege;
 pub mod reality;
 pub mod vless;
+pub mod xhttp;
+mod xhttp_body_budget;
+mod xhttp_cors;
+pub mod xhttp_listener;
+mod xhttp_tls;
 
 pub use listener::{bind_with_fallback, select_bind_addr};
 pub use mixed::{MixedListener, run_mixed};
@@ -19,3 +24,5 @@ pub use privilege::{
 };
 pub use reality::{RealityListener, run_reality};
 pub use vless::{VlessConnectionContext, VlessInboundConfig, serve_vless_stream};
+pub use xhttp_listener::{XhttpListenerHandle, start_xhttp_listener, start_xhttp_listeners};
+pub use xhttp_tls::{XrayServerTlsAcceptor, XrayServerTlsCarrier, XrayServerTlsStream};

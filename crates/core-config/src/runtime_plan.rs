@@ -42,6 +42,7 @@ pub struct ListenPlan {
     #[serde(default)]
     pub reality: Vec<RealityListen>,
     pub panel: Option<PanelListen>,
+    pub xhttp: Vec<XhttpListenPlan>,
     pub share: Share,
     pub auth: Vec<UserPass>,
 }
@@ -73,6 +74,69 @@ impl PanelListen {
             .parse()
             .map_err(|_| ConfigError::invalid(format!("非法面板地址: {}:{}", self.host, self.port)))
     }
+}
+
+/// 已完成结构和语义校验的 XHTTP 服务端监听计划。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XhttpListenPlan {
+    pub enabled: bool,
+    pub address: String,
+    pub port: u16,
+    pub cleartext: bool,
+    pub allow_unauthenticated_non_loopback: bool,
+    pub tls: Option<XhttpListenTlsPlan>,
+    pub alpn: Vec<XhttpListenAlpn>,
+    pub target: Option<XhttpListenTargetPlan>,
+    pub tag: String,
+    pub accept_queue: usize,
+    pub max_active_relays: usize,
+    pub max_active_connections: usize,
+    pub max_concurrent_streams: u32,
+    pub max_active_http_streams: usize,
+    #[serde(with = "humantime_serde")]
+    pub http_idle_timeout: Duration,
+    /// `None` 使用 XrayCompatible；`Some([])` 禁用 CORS；非空值为 allowlist。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_origins: Option<Vec<String>>,
+    /// 与客户端/出站共享同一个完整强类型 XHTTP 配置。
+    pub settings: XhttpConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XhttpListenTargetPlan {
+    pub host: String,
+    pub port: u16,
+}
+
+impl XhttpListenPlan {
+    pub fn socket_addr(&self) -> ConfigResult<SocketAddr> {
+        let ip = self
+            .address
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| {
+                ConfigError::invalid(format!(
+                    "非法 XHTTP 监听地址: {}:{}",
+                    self.address, self.port
+                ))
+            })?;
+        Ok(SocketAddr::new(ip, self.port))
+    }
+
+    pub fn uses_http3(&self) -> bool {
+        self.alpn == [XhttpListenAlpn::H3]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XhttpListenTlsPlan {
+    /// 旧版单证书/私钥路径；新配置优先使用 settings.certificates。
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub settings: crate::model::XhttpDownloadTlsSettings,
+    pub require_client_certificate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +267,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
     let listen = cfg.listen.clone().unwrap_or(Listen {
         local: None,
         panel: None,
+        xhttp: None,
         share: None,
         auth: vec![],
         reality: vec![],
@@ -268,6 +333,8 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         ));
     }
 
+    let xhttp = compile_xhttp_listeners(listen.xhttp)?;
+
     let auth = listen
         .auth
         .iter()
@@ -285,6 +352,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         mixed,
         reality,
         panel,
+        xhttp,
         share,
         auth,
     })
@@ -535,6 +603,366 @@ fn validate_reality_resource_limits(
     Ok(())
 }
 
+fn compile_xhttp_cors_origins(
+    origins: Option<Vec<String>>,
+    path: &str,
+) -> ConfigResult<Option<Vec<String>>> {
+    let Some(origins) = origins else {
+        return Ok(None);
+    };
+    let mut normalized = Vec::with_capacity(origins.len());
+    for (index, origin) in origins.into_iter().enumerate() {
+        if origin.chars().any(char::is_control) {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cors-origins[{index}] 必须是不含控制字符的 ASCII origin"
+            )));
+        }
+        let origin = origin.trim().to_string();
+        if origin.is_empty() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cors-origins[{index}] 不能为空"
+            )));
+        }
+        if !origin.is_ascii() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cors-origins[{index}] 必须是不含控制字符的 ASCII origin"
+            )));
+        }
+        normalized.push(origin);
+    }
+
+    if normalized.iter().any(|origin| origin == "*") {
+        if normalized.len() == 1 {
+            return Ok(Some(normalized));
+        }
+        return Err(ConfigError::invalid(format!(
+            "{path}.cors-origins 中 `*` 必须是唯一项，不能与其它 origin 混用"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(normalized.len());
+    let mut canonical = Vec::with_capacity(normalized.len());
+    for (index, origin) in normalized.iter().enumerate() {
+        let parsed = url::Url::parse(origin).map_err(|_| {
+            ConfigError::invalid(format!(
+                "{path}.cors-origins[{index}] `{origin}` 不是有效的 HTTP(S) origin"
+            ))
+        })?;
+        let has_authority_only = origin
+            .split_once("://")
+            .is_some_and(|(_, authority)| !authority.is_empty() && !authority.contains('/'));
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !has_authority_only
+        {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cors-origins[{index}] `{origin}` 必须是明确的 HTTP(S) origin（scheme://host[:port]）"
+            )));
+        }
+        // Browser Origin serialization lower-cases scheme/host and removes a
+        // default port. Store exactly that form so matching is not accidentally
+        // case-sensitive and equivalent spellings cannot bypass duplicate
+        // detection.
+        let serialized = parsed.origin().ascii_serialization();
+        if !seen.insert(serialized.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cors-origins 包含等价的重复 origin `{origin}`（规范形式 `{serialized}`）"
+            )));
+        }
+        canonical.push(serialized);
+    }
+
+    Ok(Some(canonical))
+}
+
+fn compile_xhttp_listeners(
+    listeners: Option<XhttpListenSet>,
+) -> ConfigResult<Vec<XhttpListenPlan>> {
+    let listeners = listeners.map(XhttpListenSet::into_vec).unwrap_or_default();
+    let mut plans = Vec::with_capacity(listeners.len());
+    let mut tags = std::collections::HashSet::with_capacity(listeners.len());
+
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let path = format!("listen.xhttp[{index}]");
+        let address = listener.address.trim().to_string();
+        if address.is_empty() {
+            return Err(ConfigError::invalid(format!("{path}.address 不能为空")));
+        }
+        let normalized_address = address
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
+        let bind_ip = normalized_address
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| {
+                ConfigError::invalid(format!(
+                    "{path}.address 必须是可绑定的 IPv4/IPv6 地址，不能是 `{address}`"
+                ))
+            })?;
+        if listener.port == 0 {
+            return Err(ConfigError::invalid(format!("{path}.port 不能为 0")));
+        }
+        if listener.accept_queue == 0 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.accept-queue 必须大于 0"
+            )));
+        }
+        if listener.accept_queue > XHTTP_MAX_ACCEPT_QUEUE {
+            return Err(ConfigError::invalid(format!(
+                "{path}.accept-queue 不能大于 {XHTTP_MAX_ACCEPT_QUEUE}"
+            )));
+        }
+        if listener.max_active_relays == 0 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-active-relays 必须大于 0"
+            )));
+        }
+        if listener.max_active_connections == 0 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-active-connections 必须大于 0"
+            )));
+        }
+        if listener.max_active_connections > XHTTP_MAX_ACTIVE_CONNECTIONS {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-active-connections 不能大于 {XHTTP_MAX_ACTIVE_CONNECTIONS}"
+            )));
+        }
+        if listener.max_concurrent_streams == 0 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-concurrent-streams 必须大于 0"
+            )));
+        }
+        if listener.max_concurrent_streams > XHTTP_MAX_CONCURRENT_STREAMS {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-concurrent-streams 不能大于 {XHTTP_MAX_CONCURRENT_STREAMS}"
+            )));
+        }
+        if listener.max_active_http_streams == 0 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-active-http-streams 必须大于 0"
+            )));
+        }
+        if listener.max_active_http_streams > XHTTP_MAX_ACTIVE_HTTP_STREAMS {
+            return Err(ConfigError::invalid(format!(
+                "{path}.max-active-http-streams 不能大于 {XHTTP_MAX_ACTIVE_HTTP_STREAMS}"
+            )));
+        }
+        if listener.http_idle_timeout.is_zero() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.http-idle-timeout 必须大于 0 秒"
+            )));
+        }
+        let cors_origins = compile_xhttp_cors_origins(listener.cors_origins, &path)?;
+
+        if listener.cleartext && listener.tls.is_some() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.cleartext=true 与 tls 不能同时设置"
+            )));
+        }
+        if listener.enabled && !listener.cleartext && listener.tls.is_none() {
+            return Err(ConfigError::invalid(format!(
+                "{path} 已启用，必须设置 tls.cert/tls.key 或显式 cleartext=true"
+            )));
+        }
+        let tls = listener
+            .tls
+            .map(|tls| {
+                let cert_path = tls
+                    .cert_path
+                    .map(|value| {
+                        let value = value.trim().to_string();
+                        if value.is_empty() {
+                            Err(ConfigError::invalid(format!(
+                                "{path}.tls.cert 证书路径不能为空"
+                            )))
+                        } else {
+                            Ok(value)
+                        }
+                    })
+                    .transpose()?;
+                let key_path = tls
+                    .key_path
+                    .map(|value| {
+                        let value = value.trim().to_string();
+                        if value.is_empty() {
+                            Err(ConfigError::invalid(format!(
+                                "{path}.tls.key 私钥路径不能为空"
+                            )))
+                        } else {
+                            Ok(value)
+                        }
+                    })
+                    .transpose()?;
+                if cert_path.is_some() != key_path.is_some() {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.tls.cert 与 tls.key 必须同时设置"
+                    )));
+                }
+                tls.settings.validate().map_err(|error| {
+                    ConfigError::invalid(format!("{path}.tls 配置无效: {error}"))
+                })?;
+                let encipherment_count = tls
+                    .settings
+                    .certificates
+                    .iter()
+                    .filter(|certificate| {
+                        certificate.usage.unwrap_or(
+                            crate::model::XhttpTlsCertificateUsage::Encipherment,
+                        ) == crate::model::XhttpTlsCertificateUsage::Encipherment
+                    })
+                    .count();
+                let issuer_count = tls
+                    .settings
+                    .certificates
+                    .iter()
+                    .filter(|certificate| {
+                        certificate.usage
+                            == Some(crate::model::XhttpTlsCertificateUsage::Issue)
+                    })
+                    .count();
+                if cert_path.is_some() && encipherment_count != 0 {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.tls.cert/key 与 tls.certificates 的 encipherment 证书不能同时设置"
+                    )));
+                }
+                if issuer_count != 0 && (cert_path.is_some() || encipherment_count != 0) {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.tls usage=issue 动态 CA 不能与静态 encipherment/cert-key 身份混用"
+                    )));
+                }
+                if cert_path.is_none() && encipherment_count == 0 && issuer_count == 0 {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.tls 必须提供 cert/key、usage=encipherment 证书或 usage=issue 动态 CA"
+                    )));
+                }
+                let require_client_certificate =
+                    tls.require_client_certificate.unwrap_or(false);
+                if require_client_certificate
+                    && !tls.settings.certificates.iter().any(|certificate| {
+                        certificate.usage
+                            == Some(crate::model::XhttpTlsCertificateUsage::Verify)
+                    })
+                {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.tls.requireClientCertificate=true 时必须提供 usage=verify 的客户端 CA"
+                    )));
+                }
+                Ok(XhttpListenTlsPlan {
+                    cert_path,
+                    key_path,
+                    settings: tls.settings,
+                    require_client_certificate,
+                })
+            })
+            .transpose()?;
+
+        if listener.alpn.is_empty() {
+            return Err(ConfigError::invalid(format!("{path}.alpn 不能为空")));
+        }
+        let mut seen_alpn = std::collections::HashSet::with_capacity(listener.alpn.len());
+        for alpn in &listener.alpn {
+            if !seen_alpn.insert(*alpn) {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.alpn 包含重复值 `{}`",
+                    alpn.as_str()
+                )));
+            }
+        }
+        let has_h3 = listener.alpn.contains(&XhttpListenAlpn::H3);
+        if has_h3 && listener.alpn.len() != 1 {
+            return Err(ConfigError::invalid(format!(
+                "{path}.alpn=h3 必须独占该监听项，不能与 http/1.1 或 h2 混合"
+            )));
+        }
+        if has_h3 && (listener.cleartext || tls.is_none()) {
+            return Err(ConfigError::invalid(format!(
+                "{path}.alpn=h3 必须使用 TLS，不能启用 cleartext"
+            )));
+        }
+
+        listener
+            .settings
+            .validate()
+            .map_err(|error| ConfigError::invalid(format!("{path}.settings 配置无效: {error}")))?;
+
+        let target = listener
+            .target
+            .map(|target| {
+                let host = target
+                    .host
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string();
+                if host.is_empty() || host.chars().any(char::is_control) {
+                    return Err(ConfigError::invalid(format!(
+                        "{path}.target.host 不能为空或包含控制字符"
+                    )));
+                }
+                if target.port == 0 {
+                    return Err(ConfigError::invalid(format!("{path}.target.port 不能为 0")));
+                }
+                Ok(XhttpListenTargetPlan {
+                    host,
+                    port: target.port,
+                })
+            })
+            .transpose()?;
+        if listener.enabled {
+            if target.is_none() {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.target 是 enabled XHTTP Raw 适配器的必填固定目标"
+                )));
+            }
+            if !bind_ip.is_loopback() && !listener.allow_unauthenticated_non_loopback {
+                return Err(ConfigError::invalid(format!(
+                    "{path} 的 enabled raw 监听绑定非回环地址 `{normalized_address}`；必须显式设置 allow-unauthenticated-non-loopback=true"
+                )));
+            }
+        }
+
+        let tag = listener
+            .tag
+            .map(|tag| tag.trim().to_string())
+            .unwrap_or_else(|| format!("xhttp-{}", index + 1));
+        if tag.is_empty() {
+            return Err(ConfigError::invalid(format!("{path}.tag 不能为空")));
+        }
+        if !tags.insert(tag.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "{path}.tag `{tag}` 与其它 XHTTP 监听重复"
+            )));
+        }
+
+        plans.push(XhttpListenPlan {
+            enabled: listener.enabled,
+            address: normalized_address,
+            port: listener.port,
+            cleartext: listener.cleartext,
+            allow_unauthenticated_non_loopback: listener.allow_unauthenticated_non_loopback,
+            tls,
+            alpn: listener.alpn,
+            target,
+            tag,
+            accept_queue: listener.accept_queue,
+            max_active_relays: listener.max_active_relays,
+            max_active_connections: listener.max_active_connections,
+            max_concurrent_streams: listener.max_concurrent_streams,
+            max_active_http_streams: listener.max_active_http_streams,
+            http_idle_timeout: listener.http_idle_timeout,
+            cors_origins,
+            settings: listener.settings,
+        });
+    }
+
+    Ok(plans)
+}
+
 fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> BTreeMap<String, FeedDetail> {
     feeds
         .iter()
@@ -581,36 +1009,58 @@ fn compile_nodes(specs: &[NodeSpec]) -> ConfigResult<Vec<ParsedNode>> {
 }
 
 fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
-    if let Some(link) = &d.link {
+    let from_link = d.link.is_some();
+    let mut node = if let Some(link) = &d.link {
         let mut n = parse_uri(link)?;
         n.name = d.name.clone();
-        return Ok(n);
+        n
+    } else {
+        let proto = d
+            .protocol
+            .as_deref()
+            .map(NodeProtocol::from_scheme)
+            .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 protocol", d.name)))?;
+        let address = d
+            .address
+            .as_deref()
+            .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 address", d.name)))?;
+        let (host, port) = parse_node_address(&d.name, address)?;
+        ParsedNode::new(d.name.clone(), proto, host, port)
+    };
+
+    if from_link {
+        if let Some(protocol) = d.protocol.as_deref() {
+            let protocol = NodeProtocol::from_scheme(protocol);
+            if protocol != node.protocol {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 protocol={} 与 link 协议 {} 冲突",
+                    d.name,
+                    protocol.as_str(),
+                    node.protocol.as_str()
+                )));
+            }
+        }
+        if let Some(address) = d.address.as_deref() {
+            let (host, port) = parse_node_address(&d.name, address)?;
+            node.host = host;
+            node.port = port;
+        }
     }
-    let proto = d
-        .protocol
-        .as_deref()
-        .map(NodeProtocol::from_scheme)
-        .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 protocol", d.name)))?;
-    let address = d
-        .address
-        .as_deref()
-        .ok_or_else(|| ConfigError::bad_node(format!("node {} 缺少 address", d.name)))?;
-    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
-        ConfigError::bad_node(format!("node {} address 缺少端口: {}", d.name, address))
-    })?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| ConfigError::bad_node(format!("node {} 端口非法: {}", d.name, port)))?;
-    let mut node = ParsedNode::new(
-        d.name.clone(),
-        proto,
-        host.trim_matches(|c| c == '[' || c == ']'),
-        port,
-    );
+
     if let Some(login) = &d.login {
-        node.user = login.user.clone();
-        node.password = login.password.clone();
-        node.uuid = login.uuid.clone();
+        if let Some(user) = &login.user {
+            node.user = Some(user.clone());
+        }
+        if let Some(password) = &login.password {
+            node.password = Some(password.clone());
+        }
+        if let Some(uuid) = &login.uuid {
+            node.uuid = Some(uuid.clone());
+        }
+        if let Some(private_key) = &login.private_key {
+            node.params
+                .insert("private-key".into(), private_key.clone());
+        }
     }
     if let Some(secure) = &d.secure {
         let reality_enabled = secure.reality.unwrap_or(false) || secure.reality_settings.is_some();
@@ -620,14 +1070,79 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
                 d.name
             )));
         }
-        if secure.tls && reality_enabled {
+        let explicit_tls = secure.tls.unwrap_or(false);
+        if explicit_tls && reality_enabled {
             return Err(ConfigError::bad_node(format!(
                 "node {} 不能同时启用普通 TLS 与 REALITY",
                 d.name
             )));
         }
-        node.tls = secure.tls || reality_enabled;
-        node.sni = secure.sni.clone();
+        if reality_enabled && secure.tls_settings.is_some() {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 不能同时配置 tlsSettings 与 REALITY",
+                d.name
+            )));
+        }
+
+        node.tls = explicit_tls || reality_enabled;
+        let mut tls_settings = secure.tls_settings.clone().unwrap_or_default();
+        if !reality_enabled && let Some(sni) = &secure.sni {
+            if tls_settings
+                .server_name
+                .as_ref()
+                .is_some_and(|nested| nested != sni)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.sni 与 secure.tls-settings.serverName 冲突",
+                    d.name
+                )));
+            }
+            tls_settings.server_name = Some(sni.clone());
+            node.sni = Some(sni.clone());
+        } else if !reality_enabled && let Some(server_name) = tls_settings.server_name.clone() {
+            node.sni = Some(server_name);
+        }
+        if let (Some(fingerprint), Some(utls)) = (&secure.fingerprint, &secure.utls)
+            && !fingerprint.eq_ignore_ascii_case(utls)
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 的 secure.fingerprint 与 secure.utls 冲突",
+                d.name
+            )));
+        }
+        if !reality_enabled && let Some(fingerprint) = &secure.fingerprint {
+            if tls_settings
+                .fingerprint
+                .as_ref()
+                .is_some_and(|nested| !nested.eq_ignore_ascii_case(fingerprint))
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.fingerprint 与 secure.tls-settings.fingerprint 冲突",
+                    d.name
+                )));
+            }
+            tls_settings.fingerprint = Some(fingerprint.clone());
+            node.params
+                .insert("fingerprint".into(), fingerprint.clone());
+        }
+        if !reality_enabled && let Some(utls) = &secure.utls {
+            if tls_settings
+                .fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| !fingerprint.eq_ignore_ascii_case(utls))
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.utls 与 TLS fingerprint 冲突",
+                    d.name
+                )));
+            }
+            tls_settings.fingerprint = Some(utls.clone());
+            node.params.insert("utls".into(), utls.clone());
+        }
+        if let Some(ech) = secure.ech {
+            node.params.insert("ech".into(), ech.to_string());
+        }
+
         if reality_enabled {
             let mut reality = secure.reality_settings.clone().ok_or_else(|| {
                 ConfigError::bad_node(format!(
@@ -656,27 +1171,136 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
                 }
                 reality.fingerprint = fingerprint.clone();
             }
-            if let (Some(fingerprint), Some(utls)) = (&secure.fingerprint, &secure.utls)
-                && !fingerprint.eq_ignore_ascii_case(utls)
-            {
-                return Err(ConfigError::bad_node(format!(
-                    "node {} 的 secure.fingerprint 与 secure.utls 冲突",
-                    d.name
-                )));
-            }
             validate_reality_client_settings(&reality)
                 .map_err(|error| error.at(format!("nodes.{}.secure.realitySettings", d.name)))?;
             node.sni = Some(reality.server_name.clone());
+            node.params.insert("reality".into(), "true".into());
+            node.params.insert("security".into(), "reality".into());
+            node.reality_settings = Some(xhttp_reality_settings(&reality));
             node.reality = Some(reality);
+        } else {
+            if secure.reality == Some(false) {
+                node.params.insert("reality".into(), "false".into());
+                if node.params.get("security").map(String::as_str) == Some("reality") {
+                    node.params.remove("security");
+                }
+            }
+            if secure.tls_settings.is_some()
+                || secure.sni.is_some()
+                || secure.fingerprint.is_some()
+                || secure.utls.is_some()
+            {
+                tls_settings.validate().map_err(|error| {
+                    ConfigError::bad_node(format!("node {} TLS 配置非法: {error}", d.name))
+                })?;
+                node.tls_settings = Some(tls_settings);
+            }
         }
     }
     if let Some(transport) = &d.transport {
-        node.transport = transport.kind.clone();
+        if let Some(kind) = transport.kind.as_deref() {
+            if kind.trim().is_empty() {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} transport.kind 不能为空",
+                    d.name
+                )));
+            }
+            node.transport = kind.to_string();
+        }
+        if let Some(host) = &transport.host {
+            node.transport_host = Some(host.clone());
+            node.params.insert("host".into(), host.clone());
+        }
+        if let Some(path) = &transport.path {
+            node.transport_path = Some(path.clone());
+            node.params.insert("path".into(), path.clone());
+        }
+        if let Some(service) = &transport.service {
+            node.transport_service = Some(service.clone());
+            node.params.insert("serviceName".into(), service.clone());
+        }
+        if let Some(xhttp) = &transport.xhttp {
+            if let Some(kind) = transport.kind.as_deref() {
+                if !matches!(kind.to_ascii_lowercase().as_str(), "xhttp" | "splithttp") {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} 同时配置 transport.kind={} 与 xhttp",
+                        d.name, kind
+                    )));
+                }
+            }
+            if let (Some(common), Some(specific)) =
+                (transport.host.as_deref(), xhttp.host.as_deref())
+            {
+                if common != specific {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} transport.host 与 xhttp.host 冲突",
+                        d.name
+                    )));
+                }
+            }
+            if let (Some(common), Some(specific)) =
+                (transport.path.as_deref(), xhttp.path.as_deref())
+            {
+                if common != specific {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} transport.path 与 xhttp.path 冲突",
+                        d.name
+                    )));
+                }
+            }
+            xhttp.validate().map_err(|error| {
+                ConfigError::bad_node(format!("node {} XHTTP 配置非法: {error}", d.name))
+            })?;
+            node.xhttp = Some(xhttp.clone());
+            node.transport = "xhttp".into();
+        }
     }
     if let Some(network) = &d.network {
-        node.udp = network.udp;
+        if let Some(udp) = network.udp {
+            node.udp = udp;
+        }
+        if let Some(tfo) = network.tfo {
+            node.params.insert("tfo".into(), tfo.to_string());
+        }
+        if let Some(mptcp) = network.mptcp {
+            node.params.insert("mptcp".into(), mptcp.to_string());
+        }
+        if let Some(mark) = network.mark {
+            node.params.insert("mark".into(), mark.to_string());
+        }
+        if let Some(ip_family) = &network.ip_family {
+            node.params.insert("ip-family".into(), ip_family.clone());
+        }
     }
     Ok(node)
+}
+
+fn xhttp_reality_settings(settings: &RealityClientSettings) -> XhttpDownloadRealitySettings {
+    XhttpDownloadRealitySettings {
+        master_key_log: settings.master_key_log.clone(),
+        show: Some(settings.show),
+        server_name: Some(settings.server_name.clone()),
+        password: settings.password.clone(),
+        public_key: settings.public_key.clone(),
+        short_id: Some(settings.short_id.clone()),
+        fingerprint: Some(settings.fingerprint.clone()),
+        mldsa65_verify: settings.mldsa65_verify.clone(),
+        spider_x: Some(settings.spider_x.clone()),
+        ..XhttpDownloadRealitySettings::default()
+    }
+}
+
+fn parse_node_address(name: &str, address: &str) -> ConfigResult<(String, u16)> {
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| ConfigError::bad_node(format!("node {name} address 缺少端口: {address}")))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| ConfigError::bad_node(format!("node {name} 端口非法: {port}")))?;
+    Ok((
+        host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        port,
+    ))
 }
 
 fn compile_groups(
@@ -2052,6 +2676,587 @@ master_key_log: none
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn structured_xhttp_is_preserved_without_string_map_loss() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes:
+  - name: xhttp-full
+    protocol: vless
+    address: origin.example.com:443
+    login:
+      uuid: 11111111-1111-1111-1111-111111111111
+      private_key: secret-key
+    secure:
+      tls: true
+      sni: sni.example.com
+      fingerprint: chrome
+      tls-settings:
+        enable-session-resumption: true
+        pinned-peer-cert-sha256: "11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11:11"
+        verify-peer-cert-by-name: "edge.example.com, 127.0.0.1"
+        ech-config-list: "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA=="
+    transport:
+      kind: xhttp
+      host: cdn.example.com
+      path: /split
+      service: grpc-compat
+      xhttp:
+        host: cdn.example.com
+        path: /split
+        mode: packet-up
+        xPaddingBytes: 100-200
+        noSSEHeader: true
+        xmux:
+          maxConnections: 4-8
+    network:
+      udp: false
+      tfo: true
+      mptcp: true
+      mark: 123
+      ip_family: ipv4
+"#,
+        );
+        let node = &plan.nodes[0];
+        assert_eq!(node.transport, "xhttp");
+        assert_eq!(node.transport_host.as_deref(), Some("cdn.example.com"));
+        assert_eq!(node.transport_path.as_deref(), Some("/split"));
+        assert_eq!(node.transport_service.as_deref(), Some("grpc-compat"));
+        assert_eq!(
+            node.params.get("private-key").map(String::as_str),
+            Some("secret-key")
+        );
+        assert_eq!(
+            node.params.get("fingerprint").map(String::as_str),
+            Some("chrome")
+        );
+        assert_ne!(
+            node.params.get("security").map(String::as_str),
+            Some("reality")
+        );
+        let tls = node.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"));
+        assert_eq!(tls.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(tls.enable_session_resumption, Some(true));
+        assert_eq!(
+            tls.verify_peer_cert_by_name.as_deref(),
+            Some("edge.example.com, 127.0.0.1")
+        );
+        assert_eq!(
+            tls.ech_config_list.as_deref(),
+            Some(
+                "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA=="
+            )
+        );
+        assert_eq!(node.params.get("tfo").map(String::as_str), Some("true"));
+        assert!(!node.udp);
+        let xhttp = node.xhttp.as_ref().unwrap();
+        assert_eq!(xhttp.mode.as_deref(), Some("packet-up"));
+        assert_eq!(
+            xhttp.x_padding_bytes,
+            Some(crate::model::XhttpRange::new(100, 200))
+        );
+    }
+
+    #[test]
+    fn structured_fields_explicitly_override_link() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+nodes:
+  - name: overridden
+    link: "vless://11111111-1111-1111-1111-111111111111@old.example.com:443?security=tls&type=ws&host=old.example.com&path=%2Fold#old"
+    protocol: vless
+    address: new.example.com:8443
+    login:
+      uuid: 22222222-2222-2222-2222-222222222222
+    secure:
+      tls: false
+      sni: new-sni.example.com
+    transport:
+      kind: xhttp
+      host: new-cdn.example.com
+      path: /new
+      xhttp:
+        mode: packet-up
+        noGRPCHeader: true
+    network:
+      udp: false
+"#,
+        );
+        let node = &plan.nodes[0];
+        assert_eq!(node.name, "overridden");
+        assert_eq!(node.host, "new.example.com");
+        assert_eq!(node.port, 8443);
+        assert_eq!(
+            node.uuid.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert!(!node.tls);
+        assert_eq!(node.sni.as_deref(), Some("new-sni.example.com"));
+        assert_eq!(node.transport, "xhttp");
+        assert_eq!(
+            node.params.get("host").map(String::as_str),
+            Some("new-cdn.example.com")
+        );
+        assert_eq!(node.params.get("path").map(String::as_str), Some("/new"));
+        assert_eq!(
+            node.xhttp.as_ref().and_then(|config| config.no_grpc_header),
+            Some(true)
+        );
+        assert!(!node.udp);
+    }
+
+    #[test]
+    fn link_protocol_and_duplicate_xhttp_fields_report_conflicts() {
+        let mut protocol_conflict: UserConfig = serde_yaml::from_str(
+            r#"
+version: 1
+nodes:
+  - name: bad
+    link: "vless://11111111-1111-1111-1111-111111111111@example.com:443"
+    protocol: vmess
+"#,
+        )
+        .unwrap();
+        apply_defaults(&mut protocol_conflict);
+        assert!(
+            compile(protocol_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("与 link 协议")
+        );
+
+        let mut field_conflict: UserConfig = serde_yaml::from_str(
+            r#"
+version: 1
+nodes:
+  - name: bad-xhttp
+    protocol: vless
+    address: example.com:443
+    transport:
+      kind: xhttp
+      host: common.example
+      xhttp:
+        host: specific.example
+"#,
+        )
+        .unwrap();
+        apply_defaults(&mut field_conflict);
+        assert!(
+            compile(field_conflict)
+                .unwrap_err()
+                .to_string()
+                .contains("transport.host 与 xhttp.host 冲突")
+        );
+    }
+
+    #[test]
+    fn xhttp_listen_single_and_array_compile_to_strict_runtime_plans() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    - enabled: true
+      address: 127.0.0.1
+      port: 8080
+      cleartext: true
+      alpn: [h1, h2]
+      target: {host: 127.0.0.1, port: 9000}
+      tag: local-raw
+      accept-queue: 384
+      max-active-relays: 64
+      max-active-connections: 128
+      max-concurrent-streams: 32
+      max-active-http-streams: 96
+      http-idle-timeout: 45s
+      cors-origins:
+        - " https://console.example "
+        - http://127.0.0.1:3000
+      settings:
+        path: /raw
+        mode: packet-up
+        xPaddingBytes: 0
+    - enabled: true
+      address: "::"
+      port: 8443
+      allow-unauthenticated-non-loopback: true
+      tls:
+        cert: certs/server.pem
+        key: certs/server-key.pem
+      alpn: [h3]
+      target: {address: echo.internal, port: 9001}
+      settings:
+        path: /vless
+        mode: stream-one
+"#,
+        );
+        assert_eq!(plan.listen.xhttp.len(), 2);
+
+        let tcp = &plan.listen.xhttp[0];
+        assert!(tcp.enabled);
+        assert!(tcp.cleartext);
+        assert!(tcp.tls.is_none());
+        assert_eq!(tcp.alpn, [XhttpListenAlpn::Http1, XhttpListenAlpn::H2]);
+        assert_eq!(
+            tcp.target.as_ref(),
+            Some(&XhttpListenTargetPlan {
+                host: "127.0.0.1".into(),
+                port: 9000,
+            })
+        );
+        assert_eq!(tcp.tag, "local-raw");
+        assert_eq!(tcp.accept_queue, 384);
+        assert!(!tcp.allow_unauthenticated_non_loopback);
+        assert_eq!(tcp.max_active_relays, 64);
+        assert_eq!(tcp.max_active_connections, 128);
+        assert_eq!(tcp.max_concurrent_streams, 32);
+        assert_eq!(tcp.max_active_http_streams, 96);
+        assert_eq!(tcp.http_idle_timeout, Duration::from_secs(45));
+        assert_eq!(
+            tcp.cors_origins,
+            Some(vec![
+                "https://console.example".into(),
+                "http://127.0.0.1:3000".into()
+            ])
+        );
+        assert_eq!(tcp.settings.x_padding_bytes, Some(XhttpRange::new(0, 0)));
+        assert_eq!(
+            tcp.socket_addr().unwrap(),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
+        );
+
+        let h3 = &plan.listen.xhttp[1];
+        assert!(h3.uses_http3());
+        assert_eq!(h3.address, "::");
+        assert_eq!(h3.tag, "xhttp-2");
+        assert!(h3.allow_unauthenticated_non_loopback);
+        assert_eq!(h3.max_active_relays, 256);
+        assert_eq!(h3.max_active_connections, 1024);
+        assert_eq!(h3.max_concurrent_streams, 128);
+        assert_eq!(h3.max_active_http_streams, 1024);
+        assert_eq!(h3.http_idle_timeout, Duration::from_secs(90));
+        assert_eq!(h3.cors_origins, None);
+        assert_eq!(
+            h3.target.as_ref(),
+            Some(&XhttpListenTargetPlan {
+                host: "echo.internal".into(),
+                port: 9001,
+            })
+        );
+        assert_eq!(
+            h3.tls.as_ref().and_then(|tls| tls.cert_path.as_deref()),
+            Some("certs/server.pem")
+        );
+        assert_eq!(h3.socket_addr().unwrap(), "[::]:8443".parse().unwrap());
+    }
+
+    #[test]
+    fn xhttp_listen_security_h3_and_shared_settings_are_validated() {
+        fn compile_error(listener: &str) -> String {
+            let yaml = format!(
+                "version: 1\nprofile: server\nlisten:\n  xhttp:\n{}",
+                listener
+                    .lines()
+                    .map(|line| format!("    {line}\n"))
+                    .collect::<String>()
+            );
+            let mut cfg: UserConfig = serde_yaml::from_str(&yaml).unwrap();
+            apply_defaults(&mut cfg);
+            compile(cfg).unwrap_err().to_string()
+        }
+
+        let cases = [
+            (
+                "address: 127.0.0.1\nport: 8080",
+                "必须设置 tls.cert/tls.key 或显式 cleartext=true",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8080\ncleartext: true\ntls: {cert: cert.pem, key: key.pem}",
+                "不能同时设置",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8443\ntls: {cert: cert.pem, key: key.pem}\nalpn: [h2, h3]",
+                "必须独占",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8443\ncleartext: true\nalpn: [h3]",
+                "必须使用 TLS",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8443\ntls: {cert: '', key: key.pem}",
+                "证书路径不能为空",
+            ),
+            (
+                "address: 127.0.0.1\nport: 0\ncleartext: true",
+                "port 不能为 0",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8080\ncleartext: true\naccept-queue: 0",
+                "accept-queue 必须大于 0",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\naccept-queue: 1000001",
+                "accept-queue 不能大于 1000000",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-active-relays: 0",
+                "max-active-relays 必须大于 0",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-active-connections: 0",
+                "max-active-connections 必须大于 0",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-active-connections: 1000001",
+                "max-active-connections 不能大于 1000000",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-concurrent-streams: 0",
+                "max-concurrent-streams 必须大于 0",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-concurrent-streams: 1000001",
+                "max-concurrent-streams 不能大于 1000000",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-active-http-streams: 0",
+                "max-active-http-streams 必须大于 0",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nmax-active-http-streams: 1000001",
+                "max-active-http-streams 不能大于 1000000",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nsettings: {scMaxBufferedPosts: 1000001}",
+                "scMaxBufferedPosts 不能大于 1000000",
+            ),
+            (
+                "enabled: false\naddress: 127.0.0.1\nport: 8080\nhttp-idle-timeout: 0s",
+                "http-idle-timeout 必须大于 0 秒",
+            ),
+            (
+                "address: 127.0.0.1\nport: 8080\ncleartext: true\nsettings: {mode: unsupported}",
+                "mode 不支持",
+            ),
+        ];
+        for (yaml, expected) in cases {
+            let error = compile_error(yaml);
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_accept_queue_accepts_business_limit() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+listen:
+  xhttp:
+    enabled: false
+    address: 127.0.0.1
+    port: 8080
+    accept-queue: 1000000
+"#,
+        );
+        assert_eq!(plan.listen.xhttp[0].accept_queue, XHTTP_MAX_ACCEPT_QUEUE);
+    }
+
+    #[test]
+    fn disabled_xhttp_listener_may_omit_security_and_target() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    enabled: false
+    address: 0.0.0.0
+    port: 8080
+"#,
+        );
+        assert_eq!(plan.listen.xhttp.len(), 1);
+        assert!(!plan.listen.xhttp[0].enabled);
+        assert!(!plan.listen.xhttp[0].allow_unauthenticated_non_loopback);
+    }
+
+    #[test]
+    fn enabled_xhttp_raw_adapter_is_fail_closed_and_requires_typed_target() {
+        fn compile_error(listener: &str) -> String {
+            let yaml = format!(
+                "version: 1\nprofile: server\nlisten:\n  xhttp:\n{}",
+                listener
+                    .lines()
+                    .map(|line| format!("    {line}\n"))
+                    .collect::<String>()
+            );
+            let mut cfg: UserConfig = serde_yaml::from_str(&yaml).unwrap();
+            apply_defaults(&mut cfg);
+            compile(cfg).unwrap_err().to_string()
+        }
+
+        let missing = compile_error("address: 127.0.0.1\nport: 8080\ncleartext: true");
+        assert!(missing.contains("target 是 enabled XHTTP Raw 适配器的必填"));
+
+        let bad_target = compile_error(
+            "address: 127.0.0.1\nport: 8080\ncleartext: true\ntarget: {host: '', port: 0}",
+        );
+        assert!(bad_target.contains("target.host"));
+    }
+
+    #[test]
+    fn enabled_raw_non_loopback_requires_explicit_unauthenticated_opt_in() {
+        let missing_opt_in = r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    address: 0.0.0.0
+    port: 8080
+    cleartext: true
+    target: {host: 127.0.0.1, port: 9000}
+"#;
+        let mut cfg: UserConfig = serde_yaml::from_str(missing_opt_in).unwrap();
+        apply_defaults(&mut cfg);
+        let error = compile(cfg).unwrap_err().to_string();
+        assert!(error.contains("allow-unauthenticated-non-loopback=true"));
+
+        let opted_in = missing_opt_in.replace(
+            "    cleartext: true",
+            "    cleartext: true\n    allowUnauthenticatedNonLoopback: true",
+        );
+        let plan = compile_cfg(&opted_in);
+        let listener = &plan.listen.xhttp[0];
+        assert_eq!(listener.address, "0.0.0.0");
+        assert!(listener.allow_unauthenticated_non_loopback);
+
+        let loopback = missing_opt_in.replace("0.0.0.0", "\"[::1]\"");
+        let plan = compile_cfg(&loopback);
+        assert_eq!(
+            plan.listen.xhttp[0].socket_addr().unwrap(),
+            "[::1]:8080".parse().unwrap()
+        );
+        assert!(!plan.listen.xhttp[0].allow_unauthenticated_non_loopback);
+    }
+
+    #[test]
+    fn xhttp_cors_origins_are_normalized_and_strictly_validated() {
+        let omitted = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    enabled: false
+    address: 127.0.0.1
+    port: 8080
+"#,
+        );
+        assert_eq!(omitted.listen.xhttp[0].cors_origins, None);
+
+        let disabled = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    enabled: false
+    address: 127.0.0.1
+    port: 8080
+    cors-origins: []
+"#,
+        );
+        assert_eq!(disabled.listen.xhttp[0].cors_origins, Some(Vec::new()));
+
+        let wildcard = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    enabled: false
+    address: 127.0.0.1
+    port: 8080
+    cors-origins: [" * "]
+"#,
+        );
+        assert_eq!(
+            wildcard.listen.xhttp[0].cors_origins,
+            Some(vec!["*".into()])
+        );
+
+        let canonical = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    enabled: false
+    address: 127.0.0.1
+    port: 8080
+    cors-origins: [" HTTPS://Console.Example:443 "]
+"#,
+        );
+        assert_eq!(
+            canonical.listen.xhttp[0].cors_origins,
+            Some(vec!["https://console.example".into()])
+        );
+
+        fn compile_error(cors_yaml: &str) -> String {
+            let yaml = format!(
+                "version: 1\nprofile: server\nlisten:\n  xhttp:\n    enabled: false\n    address: 127.0.0.1\n    port: 8080\n    cors-origins: {cors_yaml}\n"
+            );
+            let mut cfg: UserConfig = serde_yaml::from_str(&yaml).unwrap();
+            apply_defaults(&mut cfg);
+            compile(cfg).unwrap_err().to_string()
+        }
+
+        let cases = [
+            ("['  ']", "不能为空"),
+            ("['https://one.example', '*']", "`*` 必须是唯一项"),
+            (
+                "['https://one.example', ' https://one.example ']",
+                "重复 origin",
+            ),
+            (
+                "['https://ONE.example:443', 'https://one.example']",
+                "重复 origin",
+            ),
+            ("['console.example']", "不是有效"),
+            (
+                "['https://one.example/path']",
+                "必须是明确的 HTTP(S) origin",
+            ),
+            (
+                "['https://例子.example']",
+                "必须是不含控制字符的 ASCII origin",
+            ),
+            (
+                r#"["https://one.example\u007f"]"#,
+                "必须是不含控制字符的 ASCII origin",
+            ),
+            (
+                r#"["\thttps://one.example"]"#,
+                "必须是不含控制字符的 ASCII origin",
+            ),
+        ];
+        for (cors, expected) in cases {
+            let error = compile_error(cors);
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error} for {cors}"
+            );
+        }
     }
 
     #[test]

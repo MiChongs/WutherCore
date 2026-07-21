@@ -31,11 +31,15 @@
 //! * `conn.rs` —— WaitReader（异步初始化的 reader）+ PipeWriter + XConn 组合
 //! * `client.rs` —— XhttpClient + dial 三种模式 + PacketUpWriter
 
+mod browser_headers;
 pub mod client;
 pub mod config;
 pub mod conn;
+mod download_policy;
+mod h3;
 pub mod request;
 pub mod upload_queue;
+pub mod xmux;
 pub mod xpadding;
 
 pub use client::XhttpClient;

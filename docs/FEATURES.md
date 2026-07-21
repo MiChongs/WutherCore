@@ -45,7 +45,7 @@
 
 ## 传输与解析
 
-代码中包含 TCP、TLS、WebSocket、HTTP、HTTP/2、gRPC 与 XHTTP 等传输配置路径。可用组合由具体协议、节点字段和服务端实现共同决定；不要假设任意协议都能与任意传输组合。
+代码中包含 TCP、TLS、WebSocket、HTTP、HTTP/2、gRPC 与 XHTTP 等传输配置路径。XHTTP 的客户端、服务端、TLS/ECH 和完整字段说明见 [XHTTP / SplitHTTP 配置](XHTTP.md)。可用组合由具体协议、节点字段和服务端实现共同决定；不要假设任意协议都能与任意传输组合。
 
 节点来源支持：
 

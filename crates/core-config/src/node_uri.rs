@@ -11,7 +11,9 @@ use url::Url;
 
 use crate::{
     error::{ConfigError, ConfigResult},
-    model::RealityClientSettings,
+    model::{
+        RealityClientSettings, XhttpConfig, XhttpDownloadRealitySettings, XhttpDownloadTlsSettings,
+    },
 };
 
 /// 出站类型枚举（与 `core-outbound::OutboundKind` 对齐）。
@@ -115,6 +117,17 @@ pub struct ParsedNode {
     #[serde(default)]
     pub reality: Option<RealityClientSettings>,
     pub transport: String,
+    /// 结构化传输覆盖；与 URI `params` 并存，注册时强类型字段优先。
+    pub transport_host: Option<String>,
+    pub transport_path: Option<String>,
+    pub transport_service: Option<String>,
+    pub xhttp: Option<XhttpConfig>,
+    /// Strongly typed primary TLS settings. Keeping this object intact avoids
+    /// losing certificate, ECH, pinning, and list semantics in the legacy
+    /// string parameter map.
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    /// Strongly typed primary REALITY settings.
+    pub reality_settings: Option<XhttpDownloadRealitySettings>,
     pub udp: bool,
     /// 原始 URI，便于调试与 explain。
     pub raw: String,
@@ -142,6 +155,12 @@ impl ParsedNode {
             sni: None,
             reality: None,
             transport: "tcp".into(),
+            transport_host: None,
+            transport_path: None,
+            transport_service: None,
+            xhttp: None,
+            tls_settings: None,
+            reality_settings: None,
             udp: true,
             raw: String::new(),
             params: Default::default(),

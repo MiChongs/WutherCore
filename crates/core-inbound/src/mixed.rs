@@ -2404,7 +2404,7 @@ route:
 "#,
         )
         .unwrap();
-        Arc::new(Runtime::build(plan))
+        Arc::new(Runtime::build(plan).unwrap())
     }
 
     struct TestMixedServer {

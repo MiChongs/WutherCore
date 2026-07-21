@@ -57,7 +57,7 @@ route:
     - "set:openai -> ai"
 "#,
     );
-    let runtime = Arc::new(Runtime::build_with(plan, None, Some(idx)));
+    let runtime = Arc::new(Runtime::build_with(plan, None, Some(idx)).unwrap());
     let handler = ListenerHandler::new(runtime);
     let metadata = InboundMetadata::tcp(
         "mixed",
@@ -93,7 +93,7 @@ route:
   final: main
 "#,
     );
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let handler = ListenerHandler::new(runtime);
     let source: SocketAddr = "127.0.0.1:41001".parse().unwrap();
     let _guard = core_outbound::register_tcp(source);
@@ -133,7 +133,7 @@ route:
   final: main
 "#,
     );
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let handler = ListenerHandler::new(runtime);
     let _guard = core_outbound::register_udp("0.0.0.0:42001".parse().unwrap());
     let metadata = InboundMetadata::udp(
@@ -172,7 +172,7 @@ route:
   final: main
 "#,
     );
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let handler = ListenerHandler::new(runtime);
     let source: SocketAddr = "127.0.0.1:41002".parse().unwrap();
     let _guard = core_outbound::register_tcp(source);

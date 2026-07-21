@@ -21,6 +21,10 @@ members = [
     "crates/wuther-core",
     "tests-e2e",
 ]
+exclude = [
+    "third_party/h3-c38a1af/h3",
+    "third_party/shaped-rustls-94f088e",
+]
 
 [workspace.package]
 version = "0.3.1-rc.5"
@@ -98,10 +102,14 @@ sha2              = "0.10"
 hmac              = "0.12"
 md-5              = "0.10"
 blake3            = "1"
-rustls            = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls      = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls            = { version = "=0.23.40", default-features = false, features = ["aws_lc_rs", "brotli", "ring", "std", "tls12"] }
+tokio-rustls      = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
 rustls-pki-types  = "1"
 webpki-roots      = "0.26"
+rustls-native-certs = "0.8.4"
+boring            = { version = "=4.19.0" }
+boring-sys        = { version = "=4.19.0" }
+tokio-boring      = { version = "=4.19.0" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 uuid              = { version = "1", features = ["v4"] }
 aes               = "0.8"
@@ -118,6 +126,8 @@ chacha20          = "0.10"
 # QUIC + UDP 协议（Hysteria / TUIC）
 quinn             = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
 quinn-proto       = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
+h3                = { git = "https://github.com/hyperium/h3", rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3" }
+h3-quinn          = { git = "https://github.com/hyperium/h3", rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3" }
 
 # SSH 客户端
 russh             = "0.46"
@@ -161,8 +171,15 @@ xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3
 
 [patch.crates-io]
 # REALITY 必须在同一个真实 ClientHello 上完成 session-id 封装并继续握手；
-# 上游 rustls 没有 finalizer hook，固定使用经过该能力审阅的 shaped-rustls 提交。
-rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "94f088e210fd2a56e413cce1c6d79c10852d500a" }
+# XHTTP 的 uTLS/ECH 也依赖精确扩展塑形。上游 rustls 没有这些 finalizer/
+# customizer hook，因此固定使用经过审阅的同 revision 本地源码。
+rustls = { path = "third_party/shaped-rustls-94f088e/rustls" }
+
+[patch."https://github.com/hyperium/h3"]
+# c38a1af 的 h3 会把合法的零长度 DATA 帧误报成消息 EOF。XHTTP/3
+# 服务端需要用这种无业务负载的帧探测对端 STOP_SENDING，因此固定使用带
+# 最小修复的同版本源码；h3-quinn 仍来自同一个上游提交并解析到此 h3。
+h3 = { path = "third_party/h3-c38a1af/h3" }
 
 # ============================================================================
 # 编译时间 / 二进制大小 / 运行性能的权衡

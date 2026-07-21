@@ -32,6 +32,10 @@ const DIAL_MAX_RETRIES: usize = 10;
 pub enum RuntimeError {
     #[error("配置错误: {0}")]
     Config(#[from] core_config::ConfigError),
+    #[error("出站配置错误: {0}")]
+    OutboundConfig(String),
+    #[error("解析器配置错误: {0}")]
+    ResolverConfig(String),
     #[error("出站不存在: {0}")]
     UnknownOutbound(String),
     #[error("IO 错误: {0}")]
@@ -104,13 +108,16 @@ impl Default for MutableConfig {
 
 impl Runtime {
     /// 从 [`RuntimePlan`] 构造 Runtime，但不启动任何监听。
-    pub fn build(plan: RuntimePlan) -> Self {
+    pub fn build(plan: RuntimePlan) -> Result<Self, RuntimeError> {
         Self::build_with(plan, None, None)
     }
 
     /// 同 [`Runtime::build`]，但带持久化 store —— Smart 评分、group 手选、
     /// pin/avoid 等数据会从 store 加载并由后台 writer 异步落盘。
-    pub fn build_with_store(plan: RuntimePlan, store: Option<Arc<Store>>) -> Self {
+    pub fn build_with_store(
+        plan: RuntimePlan,
+        store: Option<Arc<Store>>,
+    ) -> Result<Self, RuntimeError> {
         Self::build_with(plan, store, None)
     }
 
@@ -124,9 +131,9 @@ impl Runtime {
         plan: RuntimePlan,
         store: Option<Arc<Store>>,
         rulesets: Option<Arc<core_ruleset::RulesetIndex>>,
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
         let mut reg = OutboundRegistry::new();
-        register_nodes(&mut reg, &plan.nodes);
+        register_nodes(&mut reg, &plan.nodes).map_err(RuntimeError::OutboundConfig)?;
 
         let mut groups = BTreeMap::new();
         for (name, g) in &plan.groups {
@@ -140,7 +147,7 @@ impl Runtime {
             None => RouteEngine::new(plan.route.clone()),
         };
         let mut resolver = Resolver::try_new_with_rulesets(plan.resolver.clone(), rulesets.clone())
-            .unwrap_or_else(|e| panic!("resolver config invalid: {e}"));
+            .map_err(|error| RuntimeError::ResolverConfig(error.to_string()))?;
         if let Some(store) = store.clone() {
             resolver.attach_store(store);
         }
@@ -207,7 +214,7 @@ impl Runtime {
         } else {
             None
         };
-        Self {
+        Ok(Self {
             plan,
             outbounds: parking_lot::RwLock::new(reg),
             groups: parking_lot::RwLock::new(groups),
@@ -223,7 +230,7 @@ impl Runtime {
             mutable: parking_lot::RwLock::new(mutable),
             urltest: parking_lot::RwLock::new(None),
             process_finder,
-        }
+        })
     }
 
     /// Capture 数据面运行期间需要持有的进程级 outbound fwmark。
@@ -319,7 +326,24 @@ impl Runtime {
 
     /// 把订阅刷新得到的最新节点列表注入到 outbound registry，
     /// 同时把 group.members 中的 `feed:<name>` 占位符替换为真实节点名集合。
-    pub fn apply_feed_nodes(&self, feed_name: &str, nodes: Vec<core_config::node_uri::ParsedNode>) {
+    pub fn apply_feed_nodes(
+        &self,
+        feed_name: &str,
+        nodes: Vec<core_config::node_uri::ParsedNode>,
+    ) -> Result<(), RuntimeError> {
+        // 先在锁外完成整批构建。任一节点无效时整批拒绝，旧 provider 快照保持不变，
+        // 不会出现先删除旧节点、再因半途错误留下残缺 registry 的状态。
+        let built_outbounds = nodes
+            .iter()
+            .map(|node| {
+                core_outbound::registry::build_outbound(node).map_err(|error| {
+                    RuntimeError::OutboundConfig(format!(
+                        "feed `{feed_name}` node `{}`: {error}",
+                        node.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut new_names: Vec<String> = Vec::with_capacity(nodes.len());
         let static_nodes: BTreeSet<String> =
             self.plan.nodes.iter().map(|n| n.name.clone()).collect();
@@ -341,8 +365,7 @@ impl Runtime {
             info.retain(|name, v| {
                 v.provider.as_deref() != Some(feed_name) || static_nodes.contains(name)
             });
-            for n in &nodes {
-                let ob = core_outbound::registry::build_outbound(n);
+            for (n, ob) in nodes.iter().zip(built_outbounds) {
                 reg.insert(n.name.clone(), ob);
                 info.insert(
                     n.name.clone(),
@@ -408,6 +431,7 @@ impl Runtime {
             groups = updated_groups,
             "feed nodes applied to runtime"
         );
+        Ok(())
     }
 
     fn provider_nodes_by_name(&self) -> BTreeMap<String, Vec<String>> {
@@ -1451,7 +1475,7 @@ route:
   preset: direct
 "#,
         );
-        let runtime = Runtime::build_with_store(plan, Some(store));
+        let runtime = Runtime::build_with_store(plan, Some(store)).unwrap();
 
         let ips = runtime
             .resolver
@@ -1596,16 +1620,18 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
-        runtime.apply_feed_nodes(
-            "provider-a",
-            vec![core_config::node_uri::ParsedNode::new(
-                "provider-a/node-1",
-                core_config::node_uri::NodeProtocol::Direct,
-                "203.0.113.10",
-                10001,
-            )],
-        );
+        let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-a",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-a/node-1",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.10",
+                    10001,
+                )],
+            )
+            .unwrap();
 
         let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
         let chain = build_chain(&pick.decision, &pick.label);
@@ -1645,25 +1671,29 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
-        runtime.apply_feed_nodes(
-            "provider-a",
-            vec![core_config::node_uri::ParsedNode::new(
-                "provider-a/node-1",
-                core_config::node_uri::NodeProtocol::Direct,
-                "203.0.113.10",
-                10001,
-            )],
-        );
-        runtime.apply_feed_nodes(
-            "provider-b",
-            vec![core_config::node_uri::ParsedNode::new(
-                "provider-b/node-1",
-                core_config::node_uri::NodeProtocol::Direct,
-                "203.0.113.20",
-                10002,
-            )],
-        );
+        let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-a",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-a/node-1",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.10",
+                    10001,
+                )],
+            )
+            .unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-b",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-b/node-1",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.20",
+                    10002,
+                )],
+            )
+            .unwrap();
 
         let groups = runtime.groups.read();
         let members = groups.get("main").unwrap().members();
@@ -1693,25 +1723,29 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
-        runtime.apply_feed_nodes(
-            "provider-a",
-            vec![core_config::node_uri::ParsedNode::new(
-                "provider-a/old",
-                core_config::node_uri::NodeProtocol::Direct,
-                "203.0.113.10",
-                10001,
-            )],
-        );
-        runtime.apply_feed_nodes(
-            "provider-a",
-            vec![core_config::node_uri::ParsedNode::new(
-                "provider-a/new",
-                core_config::node_uri::NodeProtocol::Direct,
-                "203.0.113.20",
-                10002,
-            )],
-        );
+        let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-a",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-a/old",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.10",
+                    10001,
+                )],
+            )
+            .unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-a",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-a/new",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.20",
+                    10002,
+                )],
+            )
+            .unwrap();
 
         let names = runtime.outbound_names();
         let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
@@ -1719,6 +1753,62 @@ route:
         assert!(!names.contains(&"provider-a/old".to_string()));
         assert!(names.contains(&"provider-a/new".to_string()));
         assert_eq!(pick.label, "provider-a/new");
+    }
+
+    #[test]
+    fn invalid_xhttp_feed_update_is_rejected_atomically() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+feeds:
+  provider-a: "https://example.invalid/sub.yaml"
+groups:
+  main:
+    choose: manual
+    use: [provider-a]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan).unwrap();
+        runtime
+            .apply_feed_nodes(
+                "provider-a",
+                vec![core_config::node_uri::ParsedNode::new(
+                    "provider-a/old",
+                    core_config::node_uri::NodeProtocol::Direct,
+                    "203.0.113.10",
+                    10001,
+                )],
+            )
+            .unwrap();
+
+        let mut invalid = core_config::node_uri::ParsedNode::new(
+            "provider-a/bad",
+            core_config::node_uri::NodeProtocol::Vless,
+            "origin.example",
+            443,
+        );
+        invalid.transport = "xhttp".into();
+        invalid.params.insert("mode".into(), "not-a-mode".into());
+        let error = runtime
+            .apply_feed_nodes("provider-a", vec![invalid])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider-a/bad"), "error={error}");
+        assert!(error.contains("unsupported xhttp mode"), "error={error}");
+
+        let names = runtime.outbound_names();
+        assert!(names.contains(&"provider-a/old".to_string()));
+        assert!(!names.contains(&"provider-a/bad".to_string()));
+        assert_eq!(
+            runtime.groups.read().get("main").unwrap().members(),
+            vec!["provider-a/old".to_string()]
+        );
     }
 
     #[test]
@@ -1740,7 +1830,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
 
         let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
 
@@ -1758,7 +1848,7 @@ listen:
   panel: false
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
         assert!(
             runtime.process_finder.is_none(),
             "find-process-mode 默认 off → finder 不应构建"
@@ -1776,7 +1866,7 @@ listen:
 find-process-mode: always
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
         assert!(
             runtime.process_finder.is_some(),
             "find-process-mode: always → finder 必须构建"
@@ -1794,7 +1884,7 @@ listen:
 find-process-mode: strict
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
         assert!(
             runtime.process_finder.is_some(),
             "find-process-mode: strict → finder 必须构建"
@@ -1819,7 +1909,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
         // rule 模式应进 main 组。
         let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
         assert_eq!(rule_pick.label, "HK");
@@ -1847,7 +1937,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
         // direct preset 默认应 DIRECT。
         let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
         assert_eq!(rule_pick.label, "DIRECT");
@@ -1879,7 +1969,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
 
         let pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
 
@@ -1937,7 +2027,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
 
         let pick = runtime.pick_outbound("8.8.8.8", 53, NetworkKind::Udp);
 
@@ -1963,7 +2053,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
 
         let err = match runtime.dial_udp("8.8.8.8", 53).await {
             Ok(_) => panic!("UDP dial unexpectedly succeeded through tcp-only outbound"),
@@ -1995,7 +2085,7 @@ route:
   final: main
 "#,
         );
-        let runtime = Runtime::build(plan);
+        let runtime = Runtime::build(plan).unwrap();
 
         let pick = runtime.pick_outbound("Example.COM.", 443, NetworkKind::Tcp);
 
@@ -2037,7 +2127,7 @@ route:
     - "set:openai -> ai"
 "#,
         );
-        let runtime = Runtime::build_with(plan, None, Some(idx));
+        let runtime = Runtime::build_with(plan, None, Some(idx)).unwrap();
 
         let pick = runtime.pick_outbound("api.openai.com", 443, NetworkKind::Tcp);
 

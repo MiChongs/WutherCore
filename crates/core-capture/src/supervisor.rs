@@ -1126,9 +1126,10 @@ mod tests {
                 lifecycle_changed: Notify::new(),
                 resources: parking_lot::Mutex::new(None),
             });
-            let runtime = Arc::new(core_runtime::Runtime::build(
-                core_config::loader::load_from_str(
-                    r#"
+            let runtime = Arc::new(
+                core_runtime::Runtime::build(
+                    core_config::loader::load_from_str(
+                        r#"
 version: 1
 profile: desktop
 listen:
@@ -1136,9 +1137,11 @@ listen:
 route:
   preset: direct
 "#,
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
-            ));
+            );
 
             sup.start(runtime).await.unwrap();
 
@@ -1639,9 +1642,10 @@ route:
     }
 
     fn lifecycle_runtime() -> Arc<core_runtime::Runtime> {
-        Arc::new(core_runtime::Runtime::build(
-            core_config::loader::load_from_str(
-                r#"
+        Arc::new(
+            core_runtime::Runtime::build(
+                core_config::loader::load_from_str(
+                    r#"
 version: 1
 profile: desktop
 listen:
@@ -1649,9 +1653,11 @@ listen:
 route:
   preset: direct
 "#,
+                )
+                .unwrap(),
             )
             .unwrap(),
-        ))
+        )
     }
 
     fn lifecycle_runtime_with_fwmark() -> Arc<core_runtime::Runtime> {
@@ -1668,7 +1674,7 @@ route:
         .unwrap();
         plan.capture.on = true;
         plan.capture.method = CaptureMethod::Tproxy;
-        Arc::new(core_runtime::Runtime::build(plan))
+        Arc::new(core_runtime::Runtime::build(plan).unwrap())
     }
 
     fn dummy_engine() -> Arc<dyn CaptureEngine> {

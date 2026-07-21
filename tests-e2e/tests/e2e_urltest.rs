@@ -47,7 +47,7 @@ async fn spawn_204() -> u16 {
 async fn urltest_direct_succeeds() {
     let port = spawn_204().await;
     let plan = core_config::loader::load_from_str(CONFIG).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let tester = UrlTester::new(UrlTestConfig {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
@@ -68,7 +68,7 @@ async fn urltest_direct_succeeds() {
 async fn urltest_unknown_node_yields_error() {
     let port = spawn_204().await;
     let plan = core_config::loader::load_from_str(CONFIG).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let tester = UrlTester::new(UrlTestConfig {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
@@ -83,7 +83,7 @@ async fn urltest_unknown_node_yields_error() {
 async fn urltest_test_many_concurrent() {
     let port = spawn_204().await;
     let plan = core_config::loader::load_from_str(CONFIG).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let tester = UrlTester::new(UrlTestConfig {
         default_url: format!("http://127.0.0.1:{port}/generate_204"),
         default_timeout: Duration::from_secs(2),
