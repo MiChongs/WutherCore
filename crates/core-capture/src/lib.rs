@@ -67,7 +67,10 @@ pub use engine::{
     AutoRedirectMarks, CaptureEngine, CaptureError, CaptureEvent, CaptureFilters, CapturePlan,
     EngineKind,
 };
-pub use ipset::{IpSetProvider, NoopIpSetProvider, noop as noop_ipset_provider};
+pub use ipset::{
+    IpSetPrefixSemantics, IpSetPrefixSet, IpSetPrefixSnapshot, IpSetPrefixStatus, IpSetProvider,
+    IpSetSnapshotError, NoopIpSetProvider, noop as noop_ipset_provider,
+};
 pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
 pub use packet::{IpHeader, IpVersion, L4, ParsedPacket, TcpFlags, TcpSummary, UdpSummary};
 pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};

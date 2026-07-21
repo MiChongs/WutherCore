@@ -51,6 +51,7 @@ impl RulesetManager {
         if let Some(d) = &cache_dir {
             let _ = std::fs::create_dir_all(d);
         }
+        index.declare(sets.keys().cloned());
         Arc::new(Self {
             sets,
             cache_dir,
@@ -103,6 +104,7 @@ impl RulesetManager {
                         info!(target: "ruleset", name, source = "inline", size, "compiled");
                     }
                     Err(error) => {
+                        self.index.mark_unavailable(name.clone());
                         warn!(
                             target: "ruleset",
                             name,
@@ -117,6 +119,9 @@ impl RulesetManager {
         // 2) 远程 / 文件 set —— 每个独立后台 task
         for (name, spec) in self.sets.clone() {
             if spec.url.is_none() && spec.path.is_none() {
+                if spec.payload.is_empty() {
+                    self.index.mark_unavailable(name);
+                }
                 continue;
             }
             let source_hint = spec.url.as_deref().or(spec.path.as_deref());
@@ -183,7 +188,10 @@ impl RulesetManager {
                         sink.on_update(update);
                     }
                 }
-                Err(e) => warn!(target: "ruleset", name = %name, error = %e, "refresh failed"),
+                Err(e) => {
+                    self.index.mark_unavailable(name.clone());
+                    warn!(target: "ruleset", name = %name, error = %e, "refresh failed");
+                }
             }
             tokio::time::sleep(clamp_interval(spec.every)).await;
         }
@@ -240,8 +248,14 @@ impl RulesetManager {
                         target: "ruleset",
                         name,
                         error = %parse_error,
-                        "fetched ruleset is invalid; keeping cache and trying last valid copy"
+                        "fetched ruleset is invalid; keeping the last valid copy"
                     );
+                    if self.index.get(name).is_some() {
+                        return Err(format!(
+                            "fetched ruleset invalid: {parse_error}; keeping in-memory \
+                             last-known-good matcher"
+                        ));
+                    }
                     let (matcher, total) =
                         self.compile_cache(name, spec, Some(src))
                             .map_err(|cache_error| {
@@ -258,8 +272,14 @@ impl RulesetManager {
                     target: "ruleset",
                     name,
                     error = %fetch_error,
-                    "ruleset fetch failed; trying last valid cache"
+                    "ruleset fetch failed; keeping the last valid copy"
                 );
+                if self.index.get(name).is_some() {
+                    return Err(format!(
+                        "ruleset fetch failed: {fetch_error}; keeping in-memory last-known-good \
+                         matcher"
+                    ));
+                }
                 let (matcher, total) = self.compile_cache(name, spec, Some(src)).map_err(
                     |cache_error| {
                         format!(
@@ -511,6 +531,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_declares_pending_and_exposes_failed_initial_load() {
+        let mut sets = BTreeMap::new();
+        sets.insert(
+            "broken".to_string(),
+            RulesetSpec {
+                url: None,
+                path: None,
+                payload: vec!["IP-CIDR,not-a-prefix".into()],
+                r#type: crate::spec::RulesetType::Mixed,
+                format: None,
+                every: Duration::from_secs(3600),
+                via: "direct".into(),
+            },
+        );
+        let idx = RulesetIndex::new();
+        let mgr = RulesetManager::new(sets, None, idx.clone());
+        assert_eq!(
+            idx.ip_prefix_snapshot(&["broken"]).sets[0].status,
+            crate::matcher::RulesetIpPrefixStatus::Pending
+        );
+
+        mgr.clone().start();
+        assert_eq!(
+            idx.ip_prefix_snapshot(&["broken"]).sets[0].status,
+            crate::matcher::RulesetIpPrefixStatus::Unavailable
+        );
+        mgr.stop();
+    }
+
+    #[tokio::test]
     async fn startup_cache_is_available_before_network_refresh() {
         let dir = temp_test_dir("startup-cache");
         std::fs::write(
@@ -614,6 +664,53 @@ mod tests {
         let matcher = idx.get("safe_set").unwrap();
         assert!(matcher.matches("www.fresh.example", None, None, None));
         assert!(!matcher.matches("www.cached.example", None, None, None));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_never_replaces_newer_in_memory_last_good() {
+        let dir = temp_test_dir("cache-does-not-rollback-memory");
+        let source = dir.join("source.yaml");
+        let stale = b"payload:\n  - DOMAIN-SUFFIX,stale.example\n";
+        let fresh = b"payload:\n  - DOMAIN-SUFFIX,fresh.example\n";
+        std::fs::write(dir.join("safe_set"), stale).unwrap();
+        std::fs::write(&source, fresh).unwrap();
+
+        let spec = RulesetSpec {
+            url: None,
+            path: Some(source.display().to_string()),
+            payload: vec![],
+            r#type: crate::spec::RulesetType::Mixed,
+            format: Some("yaml".into()),
+            every: Duration::from_secs(3600),
+            via: "direct".into(),
+        };
+        let idx = RulesetIndex::new();
+        let mgr = RulesetManager::new(BTreeMap::new(), Some(dir.clone()), idx.clone());
+
+        let update = mgr.refresh_once("safe_set", &spec).await.unwrap();
+        assert!(!update.from_cache);
+        let matcher = idx.get("safe_set").unwrap();
+        assert!(matcher.matches("www.fresh.example", None, None, None));
+
+        // Model a stale cache left behind by a failed atomic cache replacement.
+        std::fs::write(dir.join("safe_set"), stale).unwrap();
+        std::fs::write(&source, b"payload: [").unwrap();
+
+        let error = mgr.refresh_once("safe_set", &spec).await.unwrap_err();
+        assert!(error.contains("keeping in-memory last-known-good matcher"));
+        let matcher = idx.get("safe_set").unwrap();
+        assert!(matcher.matches("www.fresh.example", None, None, None));
+        assert!(!matcher.matches("www.stale.example", None, None, None));
+        assert_eq!(std::fs::read(dir.join("safe_set")).unwrap(), stale);
+
+        std::fs::remove_file(&source).unwrap();
+        let error = mgr.refresh_once("safe_set", &spec).await.unwrap_err();
+        assert!(error.contains("keeping in-memory last-known-good matcher"));
+        let matcher = idx.get("safe_set").unwrap();
+        assert!(matcher.matches("www.fresh.example", None, None, None));
+        assert!(!matcher.matches("www.stale.example", None, None, None));
 
         let _ = std::fs::remove_dir_all(dir);
     }
