@@ -21,6 +21,7 @@
 
 pub mod android_caps;
 pub mod android_vpn_config;
+mod capture_dns;
 pub mod default_iface;
 pub mod dial_meta;
 pub mod doctor;
@@ -36,6 +37,7 @@ pub mod net_monitor_event;
 pub mod netstack_dispatch;
 pub mod packet;
 pub mod platform;
+mod resource_claims;
 pub mod route_table;
 pub mod stack;
 pub mod stack_system;
@@ -73,6 +75,7 @@ pub use ipset::{
 };
 pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
 pub use packet::{IpHeader, IpVersion, L4, ParsedPacket, TcpFlags, TcpSummary, UdpSummary};
+pub use resource_claims::host_resource_claims;
 pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};
 pub use stack::{
     AcceptedTcp, DEFAULT_LISTENER_POOL, SharedStack, SmolStream, SpliceManager, StackNotify,

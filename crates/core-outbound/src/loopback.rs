@@ -187,6 +187,13 @@ impl<S> TrackedTcpStream<S> {
             _guard: register_tcp(local),
         }
     }
+
+    pub fn with_guard(inner: S, guard: LoopbackTcpGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
 }
 
 impl TrackedTcpStream<tokio::net::TcpStream> {

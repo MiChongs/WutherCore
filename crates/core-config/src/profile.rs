@@ -14,6 +14,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         panel: None,
         share: None,
         auth: vec![],
+        reality: vec![],
     });
     if listen.local.is_none() {
         listen.local = match profile {

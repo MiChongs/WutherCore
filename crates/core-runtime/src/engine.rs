@@ -158,13 +158,9 @@ impl Runtime {
         core_outbound::set_global_dns_responder(Arc::new(DnsResponderAdapter {
             service: dns_service.clone(),
         }));
-        // 注入 outbound fwmark：对齐 mihomo `dialer.DefaultRoutingMark`。
-        // 默认值必须是 0（禁用），否则普通 Mixed/Direct 在无 CAP_NET_ADMIN 的
-        // Linux 环境会因 SO_MARK=EPERM 直接无法出站。只有显式配置
-        // auto_redirect_output_mark、TUN auto_route、或 TPROXY iptables 接管时，
-        // 才使用 mark 绕过 redirect/tproxy chain。
-        let out_mark = outbound_fwmark_for_plan(&plan);
-        core_outbound::set_outbound_fwmark(out_mark);
+        // Runtime 构造本身不能激活进程级 outbound fwmark：capture 可能稍后
+        // 启动失败，甚至根本没有 supervisor。非零 mark 由 CaptureSupervisor
+        // 在平台 ingress 启动前事务化持有，并在平台回滚成功后释放。
         core_resolver::upstream::marked::set_dns_socket_factory(Arc::new(OutboundDnsSocketFactory));
         // 订阅 / 规则集拉取的 HTTP client 由 core-fetch 自管理：内部直接走
         // hyper + tokio-rustls + bind_outbound_socket，net_monitor 同步的
@@ -226,6 +222,14 @@ impl Runtime {
             urltest: parking_lot::RwLock::new(None),
             process_finder,
         }
+    }
+
+    /// Capture 数据面运行期间需要持有的进程级 outbound fwmark。
+    ///
+    /// 此方法只计算配置结果，不修改全局 socket 状态；生命周期所有权由
+    /// `core-capture` 的 supervisor 管理。
+    pub fn capture_outbound_fwmark(&self) -> u32 {
+        outbound_fwmark_for_plan(&self.plan)
     }
 
     /// 由 main.rs 在 UrlTester::new 之后注入，让策略组的 URLTest/Fallback/LB
@@ -1175,28 +1179,16 @@ pub struct UdpDialResult {
     pub rule_payload: String,
 }
 
-/// "0x2024" / "8228" → u32。
-fn parse_hex_u32(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u32::from_str_radix(rest, 16).ok()
-    } else {
-        s.parse().ok()
-    }
-}
-
 fn outbound_fwmark_for_plan(plan: &RuntimePlan) -> u32 {
-    if let Some(mark) = plan
-        .capture
-        .tun
-        .auto_redirect_output_mark
-        .as_deref()
-        .and_then(parse_hex_u32)
-    {
-        return mark;
-    }
     if capture_uses_tun_auto_route(&plan.capture) {
-        core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+        core_config::model::normalize_auto_redirect_mark(
+            plan.capture.tun.auto_redirect_output_mark.as_deref(),
+            core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
+        )
+        // RuntimePlan normally came through validation. A manually-mutated plan
+        // must still use the same safe default as CapturePlan instead of
+        // silently disabling the loop-prevention mark.
+        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
     } else if plan.capture.on && capture_uses_tproxy(&plan.capture) {
         0x2d0
     } else {
@@ -1461,23 +1453,62 @@ route:
 
     #[test]
     fn runtime_uses_auto_redirect_default_output_mark_only_when_enabled() {
-        let plan = load_plan(
+        let mut plan = load_plan(
             r#"
 version: 1
 profile: desktop
 listen:
   panel: false
-capture:
-  on: true
-  method: virtual_nic
-  tun:
-    auto_redirect: true
 route:
   preset: direct
 "#,
         );
+        plan.capture.on = true;
+        plan.capture.method = core_config::model::CaptureMethod::VirtualNic;
+        plan.capture.tun.auto_route = true;
+        plan.capture.tun.auto_redirect = true;
 
         assert_eq!(outbound_fwmark_for_plan(&plan), 0x2024);
+    }
+
+    #[test]
+    fn runtime_normalizes_explicit_zero_auto_redirect_output_mark() {
+        let mut plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  preset: direct
+"#,
+        );
+        plan.capture.on = true;
+        plan.capture.method = core_config::model::CaptureMethod::VirtualNic;
+        plan.capture.tun.auto_route = true;
+        plan.capture.tun.auto_redirect = true;
+        plan.capture.tun.auto_redirect_output_mark = Some("0".into());
+
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0x2024);
+        plan.capture.on = false;
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0);
+    }
+
+    #[test]
+    fn runtime_ignores_dormant_explicit_output_mark() {
+        let mut plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+route:
+  preset: direct
+"#,
+        );
+        plan.capture.tun.auto_redirect_output_mark = Some("0x5151".into());
+
+        assert_eq!(outbound_fwmark_for_plan(&plan), 0);
     }
 
     #[test]

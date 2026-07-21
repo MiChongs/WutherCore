@@ -215,9 +215,12 @@ impl TuicOutbound {
     async fn connect_and_auth(&self) -> std::io::Result<Arc<TuicSession>> {
         let target_addr = resolve_first(&self.host, self.port).await?;
 
-        let mut tls_config = RustlsConfig::builder()
-            .with_root_certificates(root_store())
-            .with_no_client_auth();
+        let mut tls_config =
+            RustlsConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("rustls ring default protocols")
+                .with_root_certificates(root_store())
+                .with_no_client_auth();
         tls_config.alpn_protocols = self.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
         if self.insecure {
             tls_config
@@ -1580,10 +1583,14 @@ mod tests {
                 .decode(TEST_KEY_DER)
                 .unwrap(),
         );
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))
-            .unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("rustls ring default protocols")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))
+        .unwrap();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));

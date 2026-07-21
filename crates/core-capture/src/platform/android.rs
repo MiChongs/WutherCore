@@ -177,6 +177,12 @@ fn tier_label(tier: Option<AndroidTier>) -> &'static str {
 Capability 探测（通过 su -c 执行命令）
 ============================================================ */
 
+/// Detect the runtime transparent-capture tier.
+///
+/// This is an activation-time probe, not a read-only preflight: when TPROXY is
+/// not already visible it may load `nf_tproxy_ipv4`/`nf_tproxy_ipv6`. Host
+/// resource arbitration must use the capability-independent conservative union
+/// in `resource_claims` before constructing `AndroidCapture`.
 #[cfg(target_os = "android")]
 pub fn detect_capability() -> AndroidCapability {
     let mut c = AndroidCapability::default();
@@ -259,6 +265,9 @@ Per-Tier 安装/撤销（Android target 才真执行）
 
 const NFT_TABLE: &str = "wuthercore";
 const IPT_CHAIN: &str = "WUTHERCORE";
+pub(crate) const TRANSPARENT_FWMARK: u32 = 1;
+pub(crate) const TRANSPARENT_ROUTE_TABLE: u32 = 100;
+const TRANSPARENT_PORT: u16 = 7894;
 
 fn install_nft_full(plan: &CapturePlan) -> Result<(), CaptureError> {
     info!(target: "capture::android", "Tier=NftablesFull installing");
@@ -270,27 +279,43 @@ fn install_nft_full(plan: &CapturePlan) -> Result<(), CaptureError> {
     ))?;
     // 3. mark fwmark 1（与 ip rule 路由表配合）
     run_su_must(&format!(
-        "nft 'add rule inet {NFT_TABLE} prerouting meta l4proto tcp tproxy ip to 127.0.0.1:7894 meta mark set 1 accept'"
+        "nft 'add rule inet {NFT_TABLE} prerouting meta l4proto tcp tproxy ip to 127.0.0.1:{TRANSPARENT_PORT} meta mark set {TRANSPARENT_FWMARK} accept'"
     ))?;
     if plan.kind == EngineKind::Tproxy {
         run_su_must(&format!(
-            "nft 'add rule inet {NFT_TABLE} prerouting meta l4proto tcp tproxy ip6 to [::1]:7894 meta mark set 1 accept'"
+            "nft 'add rule inet {NFT_TABLE} prerouting meta l4proto tcp tproxy ip6 to [::1]:{TRANSPARENT_PORT} meta mark set {TRANSPARENT_FWMARK} accept'"
         ))?;
     }
     // 4. ip rule fwmark 1 lookup 100
-    run_su_must("ip rule add fwmark 1 lookup 100")?;
-    run_su_must("ip route add local default dev lo table 100")?;
-    run_su_must("ip -6 rule add fwmark 1 lookup 100")?;
-    run_su_must("ip -6 route add local default dev lo table 100")?;
+    run_su_must(&format!(
+        "ip rule add fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip route add local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip -6 rule add fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip -6 route add local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
     Ok(())
 }
 
 fn revert_nft_full() {
     let _ = run_su_must(&format!("nft delete table inet {NFT_TABLE}"));
-    let _ = run_su_must("ip rule del fwmark 1 lookup 100");
-    let _ = run_su_must("ip route del local default dev lo table 100");
-    let _ = run_su_must("ip -6 rule del fwmark 1 lookup 100");
-    let _ = run_su_must("ip -6 route del local default dev lo table 100");
+    let _ = run_su_must(&format!(
+        "ip rule del fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip route del local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip -6 rule del fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip -6 route del local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ));
 }
 
 fn install_iptables_v4v6_tproxy(_plan: &CapturePlan) -> Result<(), CaptureError> {
@@ -298,20 +323,28 @@ fn install_iptables_v4v6_tproxy(_plan: &CapturePlan) -> Result<(), CaptureError>
     // v4
     run_su_must(&format!("iptables -t mangle -N {IPT_CHAIN}"))?;
     run_su_must(&format!(
-        "iptables -t mangle -A {IPT_CHAIN} -p tcp -j TPROXY --on-port 7894 --tproxy-mark 1"
+        "iptables -t mangle -A {IPT_CHAIN} -p tcp -j TPROXY --on-port {TRANSPARENT_PORT} --tproxy-mark {TRANSPARENT_FWMARK}"
     ))?;
     run_su_must(&format!("iptables -t mangle -A PREROUTING -j {IPT_CHAIN}"))?;
     // v6
     run_su_must(&format!("ip6tables -t mangle -N {IPT_CHAIN}"))?;
     run_su_must(&format!(
-        "ip6tables -t mangle -A {IPT_CHAIN} -p tcp -j TPROXY --on-port 7894 --tproxy-mark 1"
+        "ip6tables -t mangle -A {IPT_CHAIN} -p tcp -j TPROXY --on-port {TRANSPARENT_PORT} --tproxy-mark {TRANSPARENT_FWMARK}"
     ))?;
     run_su_must(&format!("ip6tables -t mangle -A PREROUTING -j {IPT_CHAIN}"))?;
     // route table
-    run_su_must("ip rule add fwmark 1 lookup 100")?;
-    run_su_must("ip route add local default dev lo table 100")?;
-    run_su_must("ip -6 rule add fwmark 1 lookup 100")?;
-    run_su_must("ip -6 route add local default dev lo table 100")?;
+    run_su_must(&format!(
+        "ip rule add fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip route add local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip -6 rule add fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
+    run_su_must(&format!(
+        "ip -6 route add local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ))?;
     Ok(())
 }
 
@@ -319,12 +352,12 @@ fn install_iptables_v4v6_redirect(_plan: &CapturePlan) -> Result<(), CaptureErro
     info!(target: "capture::android", "Tier=IptablesV4V6Redirect installing");
     run_su_must(&format!("iptables -t nat -N {IPT_CHAIN}"))?;
     run_su_must(&format!(
-        "iptables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports 7894"
+        "iptables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports {TRANSPARENT_PORT}"
     ))?;
     run_su_must(&format!("iptables -t nat -A PREROUTING -j {IPT_CHAIN}"))?;
     run_su_must(&format!("ip6tables -t nat -N {IPT_CHAIN}"))?;
     run_su_must(&format!(
-        "ip6tables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports 7894"
+        "ip6tables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports {TRANSPARENT_PORT}"
     ))?;
     run_su_must(&format!("ip6tables -t nat -A PREROUTING -j {IPT_CHAIN}"))?;
     Ok(())
@@ -334,7 +367,7 @@ fn install_iptables_v4_only(_plan: &CapturePlan) -> Result<(), CaptureError> {
     info!(target: "capture::android", "Tier=IptablesV4Only installing (IPv6 traffic will go direct)");
     run_su_must(&format!("iptables -t nat -N {IPT_CHAIN}"))?;
     run_su_must(&format!(
-        "iptables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports 7894"
+        "iptables -t nat -A {IPT_CHAIN} -p tcp -j REDIRECT --to-ports {TRANSPARENT_PORT}"
     ))?;
     run_su_must(&format!("iptables -t nat -A PREROUTING -j {IPT_CHAIN}"))?;
     Ok(())
@@ -348,8 +381,16 @@ fn revert_iptables_all() {
             let _ = run_su_must(&format!("{ipt} -t {table} -X {IPT_CHAIN}"));
         }
     }
-    let _ = run_su_must("ip rule del fwmark 1 lookup 100");
-    let _ = run_su_must("ip route del local default dev lo table 100");
-    let _ = run_su_must("ip -6 rule del fwmark 1 lookup 100");
-    let _ = run_su_must("ip -6 route del local default dev lo table 100");
+    let _ = run_su_must(&format!(
+        "ip rule del fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip route del local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip -6 rule del fwmark {TRANSPARENT_FWMARK} lookup {TRANSPARENT_ROUTE_TABLE}"
+    ));
+    let _ = run_su_must(&format!(
+        "ip -6 route del local default dev lo table {TRANSPARENT_ROUTE_TABLE}"
+    ));
 }

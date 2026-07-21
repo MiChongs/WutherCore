@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ConfigError, ConfigResult},
     model::*,
-    node_uri::{NodeProtocol, ParsedNode, parse_uri},
+    node_uri::{NodeProtocol, ParsedNode, parse_uri, validate_reality_client_settings},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,8 @@ pub struct RuntimePlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenPlan {
     pub mixed: Option<MixedListen>,
+    #[serde(default)]
+    pub reality: Vec<RealityListen>,
     pub panel: Option<PanelListen>,
     pub share: Share,
     pub auth: Vec<UserPass>,
@@ -202,6 +204,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         panel: None,
         share: None,
         auth: vec![],
+        reality: vec![],
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -228,31 +231,41 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
             udp: d.udp,
         },
     });
+    if mixed.as_ref().is_some_and(|listener| listener.port == 0) {
+        return Err(ConfigError::invalid(
+            "listen.local 端口不能为 0；删除 local 配置可禁用 Mixed 入站",
+        ));
+    }
 
-    let panel = listen.panel.and_then(|p| match p {
-        PanelBind::Off(false) => None,
-        PanelBind::Off(true) => Some(PanelListen {
+    let panel = match listen.panel {
+        None | Some(PanelBind::Off(false)) => None,
+        Some(PanelBind::Off(true)) => Some(PanelListen {
             host: host_for(share).into(),
             port: 9090,
         }),
-        PanelBind::Port(port) => Some(PanelListen {
+        Some(PanelBind::Port(port)) => Some(PanelListen {
             host: host_for(share).into(),
             port,
         }),
-        PanelBind::Address(addr) => {
-            let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-            if parts.len() == 2 {
-                let port = parts[0].parse().ok();
-                if let Some(port) = port {
-                    return Some(PanelListen {
-                        host: parts[1].to_string(),
-                        port,
-                    });
-                }
-            }
-            None
+        Some(PanelBind::Address(addr)) => {
+            let socket: SocketAddr = addr
+                .parse()
+                .map_err(|_| ConfigError::invalid(format!("非法 listen.panel 地址: {addr}")))?;
+            let host = match socket.ip() {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            };
+            Some(PanelListen {
+                host,
+                port: socket.port(),
+            })
         }
-    });
+    };
+    if panel.as_ref().is_some_and(|listener| listener.port == 0) {
+        return Err(ConfigError::invalid(
+            "listen.panel 端口不能为 0；设为 false 可禁用 API 入站",
+        ));
+    }
 
     let auth = listen
         .auth
@@ -265,12 +278,260 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         })
         .collect();
 
+    let reality = compile_reality_listeners(&listen.reality)?;
+
     Ok(ListenPlan {
         mixed,
+        reality,
         panel,
         share,
         auth,
     })
+}
+
+fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
+    use base64::Engine as _;
+
+    let mut out = Vec::with_capacity(listeners.len());
+    let mut bound = std::collections::HashSet::new();
+    for (index, source) in listeners.iter().enumerate() {
+        let location = format!("listen.reality[{index}]");
+        if source.port == 0 {
+            return Err(ConfigError::invalid("REALITY 监听端口不能为 0").at(location));
+        }
+        if source.host.trim().is_empty() {
+            return Err(ConfigError::invalid("REALITY 监听地址不能为空").at(location));
+        }
+        if !bound.insert((source.host.clone(), source.port)) {
+            return Err(ConfigError::invalid("重复的 REALITY 监听地址").at(location));
+        }
+        if source.show {
+            return Err(ConfigError::invalid(
+                "REALITY show 会输出握手密钥材料，WutherCore 出于密钥安全不提供该选项",
+            )
+            .at(format!("{location}.show")));
+        }
+        if source
+            .master_key_log
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != "none")
+        {
+            return Err(ConfigError::invalid(
+                "REALITY masterKeyLog 会把会话密钥写入磁盘，WutherCore 出于密钥安全不提供该选项",
+            )
+            .at(format!("{location}.masterKeyLog")));
+        }
+        if source.xver > 2 {
+            return Err(ConfigError::invalid("REALITY xver 只能是 0、1 或 2")
+                .at(format!("{location}.xver")));
+        }
+        if !source.protocol.eq_ignore_ascii_case("vless") {
+            return Err(ConfigError::invalid(format!(
+                "当前 REALITY 入站只接受已完整实现的 VLESS 内层协议，收到 `{}`",
+                source.protocol
+            ))
+            .at(format!("{location}.protocol")));
+        }
+        if source.users.is_empty() {
+            return Err(
+                ConfigError::invalid("VLESS-over-REALITY 至少需要一个 users UUID")
+                    .at(format!("{location}.users")),
+            );
+        }
+        for (user_index, user) in source.users.iter().enumerate() {
+            uuid::Uuid::parse_str(user).map_err(|error| {
+                ConfigError::invalid(format!("非法 VLESS UUID：{error}"))
+                    .at(format!("{location}.users[{user_index}]"))
+            })?;
+        }
+        let target = match (&source.target, &source.dest) {
+            (Some(target), Some(dest)) if target != dest => {
+                return Err(
+                    ConfigError::invalid("REALITY target 与 dest 同时配置但值不一致").at(location),
+                );
+            }
+            (Some(target), _) | (_, Some(target)) => target.normalized(),
+            (None, None) => {
+                return Err(ConfigError::invalid("REALITY 缺少 target/dest")
+                    .at(format!("{location}.target")));
+            }
+        };
+        let target_type = source
+            .target_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if target.starts_with('@') || target.starts_with('/') {
+                    "unix".to_owned()
+                } else {
+                    "tcp".to_owned()
+                }
+            });
+        if !matches!(target_type.as_str(), "tcp" | "unix") {
+            return Err(ConfigError::invalid(format!(
+                "REALITY type 只接受 tcp 或 unix，收到 `{target_type}`"
+            ))
+            .at(format!("{location}.type")));
+        }
+        if target_type == "tcp" && target.rsplit_once(':').is_none() {
+            return Err(ConfigError::invalid("REALITY TCP target 必须包含端口")
+                .at(format!("{location}.target")));
+        }
+        if target_type == "unix" && cfg!(windows) {
+            return Err(
+                ConfigError::invalid("当前 Windows 平台不支持 REALITY unix target")
+                    .at(format!("{location}.type")),
+            );
+        }
+        if source.server_names.is_empty()
+            || source
+                .server_names
+                .iter()
+                .any(|name| name.trim().is_empty())
+        {
+            return Err(ConfigError::invalid("REALITY serverNames 不能为空")
+                .at(format!("{location}.serverNames")));
+        }
+        let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&source.private_key)
+            .map_err(|error| {
+                ConfigError::invalid(format!("REALITY privateKey 不是合法 base64url：{error}"))
+                    .at(format!("{location}.privateKey"))
+            })?;
+        if private_key.len() != 32 {
+            return Err(
+                ConfigError::invalid("REALITY privateKey 必须解码为 32 字节")
+                    .at(format!("{location}.privateKey")),
+            );
+        }
+        if source.short_ids.is_empty() {
+            return Err(ConfigError::invalid("REALITY shortIds 不能为空")
+                .at(format!("{location}.shortIds")));
+        }
+        for (short_index, short_id) in source.short_ids.iter().enumerate() {
+            validate_reality_short_id(short_id).map_err(|message| {
+                ConfigError::invalid(message).at(format!("{location}.shortIds[{short_index}]"))
+            })?;
+        }
+        let min = parse_reality_version(
+            source.min_client_ver.as_deref().unwrap_or("26.3.27"),
+            &format!("{location}.minClientVer"),
+        )?;
+        let max = source
+            .max_client_ver
+            .as_deref()
+            .map(|version| parse_reality_version(version, &format!("{location}.maxClientVer")))
+            .transpose()?;
+        if max.is_some_and(|max| min > max) {
+            return Err(
+                ConfigError::invalid("REALITY minClientVer 不能大于 maxClientVer").at(location),
+            );
+        }
+        if let Some(seed) = &source.mldsa65_seed {
+            if seed == &source.private_key {
+                return Err(
+                    ConfigError::invalid("REALITY mldsa65Seed 不能与 privateKey 相同")
+                        .at(format!("{location}.mldsa65Seed")),
+                );
+            }
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(seed)
+                .map_err(|error| {
+                    ConfigError::invalid(format!("REALITY mldsa65Seed 不是合法 base64url：{error}"))
+                        .at(format!("{location}.mldsa65Seed"))
+                })?;
+            if decoded.len() != 32 {
+                return Err(
+                    ConfigError::invalid("REALITY mldsa65Seed 必须解码为 32 字节")
+                        .at(format!("{location}.mldsa65Seed")),
+                );
+            }
+        }
+        validate_reality_fallback_limit(
+            source.limit_fallback_upload,
+            &format!("{location}.limitFallbackUpload"),
+        )?;
+        validate_reality_fallback_limit(
+            source.limit_fallback_download,
+            &format!("{location}.limitFallbackDownload"),
+        )?;
+        validate_reality_resource_limits(source.limits, &format!("{location}.limits"))?;
+
+        let mut normalized = source.clone();
+        normalized.target = Some(RealityTarget::Address(target));
+        normalized.dest = None;
+        normalized.target_type = Some(target_type);
+        normalized.min_client_ver = Some(format!("{}.{}.{}", min[0], min[1], min[2]));
+        normalized.max_client_ver =
+            max.map(|version| format!("{}.{}.{}", version[0], version[1], version[2]));
+        out.push(normalized);
+    }
+    Ok(out)
+}
+
+fn validate_reality_short_id(value: &str) -> Result<(), String> {
+    if value.len() > 16 || value.len() % 2 != 0 {
+        return Err("REALITY shortId 必须是 0 到 16 个偶数长度十六进制字符".into());
+    }
+    hex::decode(value)
+        .map(|_| ())
+        .map_err(|error| format!("REALITY shortId 不是合法十六进制：{error}"))
+}
+
+fn parse_reality_version(value: &str, location: &str) -> ConfigResult<[u8; 3]> {
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(ConfigError::invalid(format!(
+            "REALITY 客户端版本必须是 1 到 3 段十进制数字，收到 `{value}`"
+        ))
+        .at(location));
+    }
+    let mut version = [0u8; 3];
+    for (index, part) in parts.iter().enumerate() {
+        version[index] = part.parse().map_err(|_| {
+            ConfigError::invalid(format!("REALITY 客户端版本段必须小于 256：`{value}`"))
+                .at(location)
+        })?;
+    }
+    Ok(version)
+}
+
+fn validate_reality_fallback_limit(
+    limit: RealityFallbackLimit,
+    location: &str,
+) -> ConfigResult<()> {
+    if limit.bytes_per_sec == 0 && (limit.after_bytes != 0 || limit.burst_bytes_per_sec != 0) {
+        return Err(ConfigError::invalid(
+            "REALITY 回落 afterBytes/burstBytesPerSec 要求 bytesPerSec 非零",
+        )
+        .at(location));
+    }
+    Ok(())
+}
+
+fn validate_reality_resource_limits(
+    limits: RealityResourceLimits,
+    location: &str,
+) -> ConfigResult<()> {
+    if limits.handshake_timeout.is_zero()
+        || limits.target_handshake_timeout.is_zero()
+        || limits.idle_timeout.is_zero()
+        || limits.max_client_hello_records == 0
+        || limits.max_client_hello_record_payload == 0
+        || limits.max_client_hello_record_payload > 16_640
+        || limits.max_client_hello_bytes < 4
+        || limits.max_client_hello_bytes > u16::MAX as usize
+        || limits.max_client_hello_wire_bytes < 5
+        || limits.max_target_records < 3
+        || limits.max_target_handshake_bytes < 1024
+        || limits.application_buffer_bytes == 0
+        || limits.max_concurrent_handshakes == 0
+    {
+        return Err(ConfigError::invalid("非法 REALITY 资源上限").at(location));
+    }
+    Ok(())
 }
 
 fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> BTreeMap<String, FeedDetail> {
@@ -351,8 +612,62 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
         node.uuid = login.uuid.clone();
     }
     if let Some(secure) = &d.secure {
-        node.tls = secure.tls;
+        let reality_enabled = secure.reality.unwrap_or(false) || secure.reality_settings.is_some();
+        if secure.reality == Some(false) && secure.reality_settings.is_some() {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 同时禁用 reality 并提供 realitySettings",
+                d.name
+            )));
+        }
+        if secure.tls && reality_enabled {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 不能同时启用普通 TLS 与 REALITY",
+                d.name
+            )));
+        }
+        node.tls = secure.tls || reality_enabled;
         node.sni = secure.sni.clone();
+        if reality_enabled {
+            let mut reality = secure.reality_settings.clone().ok_or_else(|| {
+                ConfigError::bad_node(format!(
+                    "node {} 启用了 reality 但缺少 realitySettings",
+                    d.name
+                ))
+            })?;
+            if let Some(sni) = &secure.sni {
+                if !reality.server_name.is_empty() && &reality.server_name != sni {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} 的 secure.sni 与 realitySettings.serverName 冲突",
+                        d.name
+                    )));
+                }
+                reality.server_name = sni.clone();
+            }
+            if let Some(fingerprint) = secure.fingerprint.as_ref().or(secure.utls.as_ref()) {
+                if !reality.fingerprint.is_empty()
+                    && !reality.fingerprint.eq_ignore_ascii_case(fingerprint)
+                    && !reality.fingerprint.eq_ignore_ascii_case("chrome")
+                {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} 的 secure fingerprint/utls 与 realitySettings.fingerprint 冲突",
+                        d.name
+                    )));
+                }
+                reality.fingerprint = fingerprint.clone();
+            }
+            if let (Some(fingerprint), Some(utls)) = (&secure.fingerprint, &secure.utls)
+                && !fingerprint.eq_ignore_ascii_case(utls)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.fingerprint 与 secure.utls 冲突",
+                    d.name
+                )));
+            }
+            validate_reality_client_settings(&reality)
+                .map_err(|error| error.at(format!("nodes.{}.secure.realitySettings", d.name)))?;
+            node.sni = Some(reality.server_name.clone());
+            node.reality = Some(reality);
+        }
     }
     if let Some(transport) = &d.transport {
         node.transport = transport.kind.clone();
@@ -956,10 +1271,136 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
 }
 
 fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
+    validate_capture_platform_for_os(c, std::env::consts::OS)
+}
+
+fn validate_capture_platform_for_os(c: &Capture, os: &str) -> ConfigResult<()> {
     if !c.on {
         return Ok(());
     }
-    let os = std::env::consts::OS;
+    validate_capture_literals(c)?;
+
+    if c.tun.auto_redirect {
+        if !c.tun.auto_route {
+            return Err(
+                ConfigError::invalid("capture.tun.auto_redirect 依赖 auto_route")
+                    .hint("启用 capture.tun.auto_route，或关闭 auto_redirect"),
+            );
+        }
+        if c.method != CaptureMethod::VirtualNic {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 只属于 TUN 数据面，要求 capture.method=virtual_nic",
+            )
+            .hint("独立 TPROXY/REDIRECT 是不同入口；不要用 auto_redirect 替代"));
+        }
+        if os != "linux" {
+            return Err(
+                ConfigError::new(crate::error::ConfigErrorKind::UnsupportedPlatform(format!(
+                    "capture.tun.auto_redirect 当前仅支持 root-managed Linux；当前平台为 {os}"
+                )))
+                .hint("关闭 auto_redirect；Android root/VpnService 数据面将在独立能力中实现"),
+            );
+        }
+        if c.traffic != CaptureTraffic::System {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 当前只支持 traffic=system 的本机 TCP/UDP 数据面",
+            )
+            .hint("LAN/Apps 需要独立的全协议 policy-routing 过滤能力，不能仅靠 NAT return"));
+        }
+        if c.tun.strict_route {
+            return Err(ConfigError::invalid(
+                "capture.tun.auto_redirect 当前不支持 strict_route",
+            )
+            .hint("当前不为 ICMP/非 TCP-UDP 协议安装导流 rule，它们按已有主路由策略处理；启用 strict_route 会产生虚假的防泄漏承诺"));
+        }
+        if !c.tun.route_address_set.is_empty() || !c.tun.route_exclude_address_set.is_empty() {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不能安全同步 route_address_set/route_exclude_address_set 的动态 IP 快照",
+            )
+            .hint("关闭 auto_redirect 可继续由 TUN 路由层使用动态规则集；内核 nft set 同步完成前禁止静默忽略"));
+        }
+        if c.tun.auto_redirect_nfqueue.is_some() {
+            return Err(ConfigError::invalid(
+                "auto_redirect_nfqueue 需要配套 NFQUEUE 用户态消费者，当前数据面未启用该能力",
+            )
+            .hint("删除 auto_redirect_nfqueue；TCP REDIRECT 与 UDP TUN 数据面不依赖 NFQUEUE"));
+        }
+        if c.tun.auto_redirect_input_mark.is_some()
+            || c.tun.auto_redirect_reset_mark.is_some()
+            || c.tun.auto_redirect_iproute2_fallback_rule_index.is_some()
+        {
+            return Err(ConfigError::invalid(
+                "显式 auto_redirect input/reset/fallback 配置属于 NFQUEUE/mark 数据面，当前 TCP REDIRECT 后端不会消费",
+            )
+            .hint("删除这些保留字段；auto_redirect_output_mark 已完整用于 outbound 绕行"));
+        }
+        if c.tun.exclude_mptcp {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不支持 exclude_mptcp 的全协议旁路语义",
+            ));
+        }
+        if !c.exclude.process.is_empty() {
+            return Err(ConfigError::invalid(
+                "auto_redirect 暂不支持按进程名做内核级全协议旁路",
+            ));
+        }
+        let has_interface_filters =
+            !c.tun.include_interface.is_empty() || !c.tun.exclude_interface.is_empty();
+        let has_mac_filters =
+            !c.tun.include_mac_address.is_empty() || !c.tun.exclude_mac_address.is_empty();
+        if has_interface_filters || has_mac_filters {
+            return Err(ConfigError::invalid(
+                "traffic=system auto_redirect 暂不支持 interface/MAC 过滤",
+            )
+            .hint("NAT 链 return 不能撤销 auto_route，禁止把 TCP 快路径过滤误当成全协议旁路"));
+        }
+        let has_identity_filters = !c.tun.include_uid.is_empty()
+            || !c.tun.include_uid_range.is_empty()
+            || !c.tun.exclude_uid.is_empty()
+            || !c.tun.exclude_uid_range.is_empty()
+            || !c.tun.include_gid.is_empty()
+            || !c.tun.include_gid_range.is_empty()
+            || !c.tun.exclude_gid.is_empty()
+            || !c.tun.exclude_gid_range.is_empty()
+            || !c.tun.include_android_user.is_empty()
+            || !c.tun.include_package.is_empty()
+            || !c.tun.exclude_package.is_empty();
+        if has_identity_filters {
+            return Err(ConfigError::invalid(
+                "auto_redirect 身份过滤尚未具备双栈、可回滚的 policy-routing 事务",
+            )
+            .hint("删除 UID/GID/Android user/package 过滤；该能力会以独立提交补全"));
+        }
+        let rule_index = if c.tun.iproute2_rule_index == 0 {
+            9000
+        } else {
+            c.tun.iproute2_rule_index
+        };
+        if rule_index < 4 {
+            return Err(ConfigError::invalid(
+                "auto_redirect iproute2_rule_index 必须至少为 4，才能保留 TUN 子网和 bypass 优先级",
+            ));
+        }
+        if rule_index > MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX {
+            return Err(ConfigError::invalid(format!(
+                "auto_redirect iproute2_rule_index={rule_index} 必须小于 Linux main rule 优先级 32766"
+            ))
+            .hint("使用 4..=32765 的空闲优先级，例如默认值 9000"));
+        }
+        let table_index = if c.tun.iproute2_table_index == 0 {
+            2022
+        } else {
+            c.tun.iproute2_table_index
+        };
+        if matches!(table_index, 253..=255) {
+            return Err(ConfigError::invalid(format!(
+                "auto_redirect iproute2_table_index={table_index} 是 Linux 保留路由表，不能作为 TUN 私有表"
+            ))
+            .hint("使用独立的自定义表号，例如默认值 2022"));
+        }
+        validate_auto_redirect_marks(&c.tun)?;
+    }
+
     let ok = match c.method {
         CaptureMethod::Auto | CaptureMethod::VirtualNic => true,
         CaptureMethod::Tproxy | CaptureMethod::Redirect => os == "linux" || os == "android",
@@ -976,15 +1417,586 @@ fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_capture_literals(c: &Capture) -> ConfigResult<()> {
+    fn cidrs(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            value.parse::<ipnet::IpNet>().map_err(|_| {
+                ConfigError::invalid(format!("{field}[{index}] 不是合法的 CIDR: {value}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn addresses(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            if value.parse::<ipnet::Ipv4Net>().is_err() && value.parse::<ipnet::Ipv6Net>().is_err()
+            {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 不是合法的 IPv4/IPv6 CIDR: {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ips(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            value.parse::<std::net::IpAddr>().map_err(|_| {
+                ConfigError::invalid(format!("{field}[{index}] 不是合法的 IP 地址: {value}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn ranges(field: &str, values: &[String]) -> ConfigResult<()> {
+        for (index, value) in values.iter().enumerate() {
+            let valid = value
+                .split_once(':')
+                .and_then(|(start, end)| {
+                    Some((start.parse::<u32>().ok()?, end.parse::<u32>().ok()?))
+                })
+                .is_some_and(|(start, end)| start <= end);
+            if !valid {
+                return Err(ConfigError::invalid(format!(
+                    "{field}[{index}] 必须是 start:end 闭区间且 start <= end: {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    cidrs("capture.exclude.cidr", &c.exclude.cidr)?;
+    addresses("capture.tun.address", &c.tun.address)?;
+    cidrs("capture.tun.route_address", &c.tun.route_address)?;
+    cidrs(
+        "capture.tun.route_exclude_address",
+        &c.tun.route_exclude_address,
+    )?;
+    ips("capture.tun.loopback_address", &c.tun.loopback_address)?;
+    ranges("capture.tun.include_uid_range", &c.tun.include_uid_range)?;
+    ranges("capture.tun.exclude_uid_range", &c.tun.exclude_uid_range)?;
+    ranges("capture.tun.include_gid_range", &c.tun.include_gid_range)?;
+    ranges("capture.tun.exclude_gid_range", &c.tun.exclude_gid_range)?;
+    Ok(())
+}
+
+fn validate_auto_redirect_marks(tun: &TunInboundOptions) -> ConfigResult<()> {
+    fn parse(name: &str, value: Option<&str>, default: u32) -> ConfigResult<u32> {
+        normalize_auto_redirect_mark(value, default)
+            .ok_or_else(|| ConfigError::invalid(format!("{name} 不是合法的 u32/十六进制 mark")))
+    }
+
+    let _input = parse(
+        "auto_redirect_input_mark",
+        tun.auto_redirect_input_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_INPUT_MARK,
+    )?;
+    let _output = parse(
+        "auto_redirect_output_mark",
+        tun.auto_redirect_output_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
+    )?;
+    let _reset = parse(
+        "auto_redirect_reset_mark",
+        tun.auto_redirect_reset_mark.as_deref(),
+        DEFAULT_AUTO_REDIRECT_RESET_MARK,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::apply_defaults;
 
+    fn base64url_bytes(byte: u8, len: usize) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![byte; len])
+    }
+
+    fn valid_reality_listener() -> RealityListen {
+        serde_yaml::from_str(&format!(
+            r#"
+port: 2443
+protocol: vless
+users: [11111111-1111-1111-1111-111111111111]
+target: camouflage.example:443
+serverNames: [camouflage.example]
+privateKey: {}
+shortIds: [0123456789abcdef]
+"#,
+            base64url_bytes(7, 32)
+        ))
+        .unwrap()
+    }
+
     fn compile_cfg(yaml: &str) -> RuntimePlan {
         let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
         apply_defaults(&mut cfg);
         compile(cfg).unwrap()
+    }
+
+    fn auto_redirect_capture() -> Capture {
+        let mut capture = Capture {
+            on: true,
+            method: CaptureMethod::VirtualNic,
+            ..Capture::default()
+        };
+        capture.tun.auto_route = true;
+        capture.tun.auto_redirect = true;
+        capture
+    }
+
+    #[test]
+    fn omitted_tun_and_empty_tun_have_identical_serde_defaults() {
+        let omitted: Capture = serde_yaml::from_str("{}").unwrap();
+        let empty: Capture = serde_yaml::from_str("tun: {}").unwrap();
+
+        assert_eq!(omitted.tun.inet6, empty.tun.inet6);
+        assert_eq!(omitted.tun.auto_route, empty.tun.auto_route);
+        assert_eq!(
+            omitted.tun.iproute2_table_index,
+            empty.tun.iproute2_table_index
+        );
+        assert_eq!(
+            omitted.tun.iproute2_rule_index,
+            empty.tun.iproute2_rule_index
+        );
+        assert_eq!(omitted.tun.udp_timeout, empty.tun.udp_timeout);
+        assert!(omitted.tun.inet6);
+        assert!(omitted.tun.auto_route);
+        assert_eq!(omitted.tun.iproute2_table_index, 2022);
+        assert_eq!(omitted.tun.iproute2_rule_index, 9000);
+        assert_eq!(omitted.tun.udp_timeout, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn auto_redirect_requires_auto_route() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.auto_route = false;
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("依赖 auto_route"));
+    }
+
+    #[test]
+    fn auto_redirect_requires_virtual_nic_data_plane() {
+        let mut capture = auto_redirect_capture();
+        capture.method = CaptureMethod::Tproxy;
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("method=virtual_nic"));
+    }
+
+    #[test]
+    fn auto_redirect_platform_contract_is_explicit() {
+        let capture = auto_redirect_capture();
+
+        validate_capture_platform_for_os(&capture, "linux").unwrap();
+        let android = validate_capture_platform_for_os(&capture, "android").unwrap_err();
+        let error = validate_capture_platform_for_os(&capture, "windows").unwrap_err();
+
+        assert!(android.to_string().contains("root-managed Linux"));
+        assert!(error.to_string().contains("root-managed Linux"));
+    }
+
+    #[test]
+    fn disabled_capture_ignores_dormant_auto_redirect_fields() {
+        let mut capture = auto_redirect_capture();
+        capture.on = false;
+        capture.method = CaptureMethod::Redirect;
+        capture.tun.auto_route = false;
+        capture.tun.auto_redirect_nfqueue = Some(100);
+        capture.tun.auto_redirect_input_mark = Some("not-a-mark".into());
+
+        validate_capture_platform_for_os(&capture, "windows").unwrap();
+    }
+
+    #[test]
+    fn auto_redirect_rejects_dynamic_route_sets_until_kernel_snapshots_exist() {
+        for exclude in [false, true] {
+            let mut capture = auto_redirect_capture();
+            if exclude {
+                capture.tun.route_exclude_address_set = vec!["geoip-private".into()];
+            } else {
+                capture.tun.route_address_set = vec!["geoip-proxy".into()];
+            }
+
+            let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+            assert!(error.to_string().contains("动态 IP 快照"));
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rejects_unowned_nfqueue_configuration() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.auto_redirect_nfqueue = Some(100);
+
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+
+        assert!(error.to_string().contains("NFQUEUE 用户态消费者"));
+    }
+
+    #[test]
+    fn auto_redirect_rejects_unimplemented_cross_protocol_contracts() {
+        let mut lan = auto_redirect_capture();
+        lan.traffic = CaptureTraffic::Lan;
+        assert!(
+            validate_capture_platform_for_os(&lan, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("traffic=system")
+        );
+
+        let mut strict = auto_redirect_capture();
+        strict.tun.strict_route = true;
+        assert!(
+            validate_capture_platform_for_os(&strict, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("strict_route")
+        );
+
+        let mut interface = auto_redirect_capture();
+        interface.tun.exclude_interface = vec!["eth0".into()];
+        assert!(
+            validate_capture_platform_for_os(&interface, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("interface/MAC")
+        );
+
+        let mut identity = auto_redirect_capture();
+        identity.tun.exclude_uid = vec![1000];
+        assert!(
+            validate_capture_platform_for_os(&identity, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("身份过滤")
+        );
+    }
+
+    #[test]
+    fn auto_redirect_rejects_reserved_mark_data_plane_fields() {
+        for field in ["input", "reset", "fallback"] {
+            let mut capture = auto_redirect_capture();
+            match field {
+                "input" => capture.tun.auto_redirect_input_mark = Some("0x2023".into()),
+                "reset" => capture.tun.auto_redirect_reset_mark = Some("0x2025".into()),
+                "fallback" => {
+                    capture.tun.auto_redirect_iproute2_fallback_rule_index = Some(32768);
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                validate_capture_platform_for_os(&capture, "linux")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("保留字段")
+            );
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rejects_linux_reserved_route_tables() {
+        for table in 253..=255 {
+            let mut capture = auto_redirect_capture();
+            capture.tun.iproute2_table_index = table;
+            let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+            assert!(error.to_string().contains("Linux 保留路由表"));
+        }
+    }
+
+    #[test]
+    fn auto_redirect_rule_priority_must_precede_linux_main_rule() {
+        let mut capture = auto_redirect_capture();
+        capture.tun.iproute2_rule_index = MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX;
+        validate_capture_platform_for_os(&capture, "linux").unwrap();
+
+        capture.tun.iproute2_rule_index = MAX_IPROUTE2_AUTO_REDIRECT_RULE_INDEX + 1;
+        let error = validate_capture_platform_for_os(&capture, "linux").unwrap_err();
+        assert!(error.to_string().contains("main rule 优先级 32766"));
+    }
+
+    #[test]
+    fn active_capture_literals_fail_closed() {
+        let mut invalid_cidr = auto_redirect_capture();
+        invalid_cidr.tun.route_address = vec!["not-a-cidr".into()];
+        assert!(
+            validate_capture_platform_for_os(&invalid_cidr, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("route_address[0]")
+        );
+
+        let mut reversed_range = auto_redirect_capture();
+        reversed_range.tun.include_uid_range = vec!["2000:1000".into()];
+        assert!(
+            validate_capture_platform_for_os(&reversed_range, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("start <= end")
+        );
+    }
+
+    #[test]
+    fn auto_redirect_marks_are_parsed_and_zero_uses_defaults() {
+        let mut invalid = auto_redirect_capture();
+        invalid.tun.auto_redirect_output_mark = Some("0xnot-hex".into());
+        assert!(
+            validate_capture_platform_for_os(&invalid, "linux")
+                .unwrap_err()
+                .to_string()
+                .contains("不是合法")
+        );
+
+        let mut zero = auto_redirect_capture();
+        zero.tun.auto_redirect_output_mark = Some("0".into());
+        validate_capture_platform_for_os(&zero, "linux").unwrap();
+        assert_eq!(
+            normalize_auto_redirect_mark(
+                zero.tun.auto_redirect_output_mark.as_deref(),
+                DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+            ),
+            Some(DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+        );
+
+        let mut valid = auto_redirect_capture();
+        valid.tun.auto_redirect_output_mark = Some("50".into());
+        validate_capture_platform_for_os(&valid, "linux").unwrap();
+    }
+
+    #[test]
+    fn reality_server_all_xray_fields_survive_normalization() {
+        let source: RealityListen = serde_yaml::from_str(&format!(
+            r#"
+host: 127.0.0.1
+port: 2443
+protocol: vless
+users: [11111111-1111-1111-1111-111111111111]
+dest: camouflage.example:443
+type: tcp
+show: false
+masterKeyLog: none
+xver: 2
+serverNames: [camouflage.example, www.example.com]
+privateKey: {}
+minClientVer: "26.3"
+maxClientVer: "26.9.1"
+maxTimeDiff: 45000
+shortIds: [0123456789abcdef, ""]
+mldsa65Seed: {}
+limitFallbackUpload:
+  afterBytes: 100
+  bytesPerSec: 1000
+  burstBytesPerSec: 2000
+limitFallbackDownload:
+  afterBytes: 200
+  bytesPerSec: 3000
+  burstBytesPerSec: 4000
+limits:
+  handshakeTimeout: 11s
+  targetHandshakeTimeout: 6s
+  idleTimeout: 7s
+  maxClientHelloRecords: 8
+  maxClientHelloRecordPayload: 16000
+  maxClientHelloBytes: 60000
+  maxClientHelloWireBytes: 70000
+  maxTargetRecords: 4
+  maxTargetHandshakeBytes: 8192
+  applicationBufferBytes: 65536
+  maxConcurrentHandshakes: 12
+"#,
+            base64url_bytes(7, 32),
+            base64url_bytes(8, 32),
+        ))
+        .unwrap();
+
+        let normalized = compile_reality_listeners(&[source]).unwrap().remove(0);
+        assert_eq!(normalized.host, "127.0.0.1");
+        assert_eq!(normalized.port, 2443);
+        assert_eq!(normalized.protocol, "vless");
+        assert_eq!(normalized.users.len(), 1);
+        assert_eq!(
+            normalized.target,
+            Some(RealityTarget::Address("camouflage.example:443".into()))
+        );
+        assert_eq!(normalized.dest, None);
+        assert_eq!(normalized.target_type.as_deref(), Some("tcp"));
+        assert!(!normalized.show);
+        assert_eq!(normalized.master_key_log.as_deref(), Some("none"));
+        assert_eq!(normalized.xver, 2);
+        assert_eq!(normalized.server_names.len(), 2);
+        assert_eq!(normalized.min_client_ver.as_deref(), Some("26.3.0"));
+        assert_eq!(normalized.max_client_ver.as_deref(), Some("26.9.1"));
+        assert_eq!(normalized.max_time_diff_ms, 45_000);
+        assert_eq!(normalized.short_ids, ["0123456789abcdef", ""]);
+        assert!(normalized.mldsa65_seed.is_some());
+        assert_eq!(normalized.limit_fallback_upload.after_bytes, 100);
+        assert_eq!(normalized.limit_fallback_upload.bytes_per_sec, 1_000);
+        assert_eq!(normalized.limit_fallback_upload.burst_bytes_per_sec, 2_000);
+        assert_eq!(normalized.limit_fallback_download.after_bytes, 200);
+        assert_eq!(normalized.limits.handshake_timeout, Duration::from_secs(11));
+        assert_eq!(
+            normalized.limits.target_handshake_timeout,
+            Duration::from_secs(6)
+        );
+        assert_eq!(normalized.limits.idle_timeout, Duration::from_secs(7));
+        assert_eq!(normalized.limits.max_client_hello_records, 8);
+        assert_eq!(normalized.limits.max_client_hello_record_payload, 16_000);
+        assert_eq!(normalized.limits.max_client_hello_bytes, 60_000);
+        assert_eq!(normalized.limits.max_client_hello_wire_bytes, 70_000);
+        assert_eq!(normalized.limits.max_target_records, 4);
+        assert_eq!(normalized.limits.max_target_handshake_bytes, 8_192);
+        assert_eq!(normalized.limits.application_buffer_bytes, 65_536);
+        assert_eq!(normalized.limits.max_concurrent_handshakes, 12);
+    }
+
+    #[test]
+    fn reality_server_snake_aliases_work_and_unknown_fields_fail() {
+        let source: RealityListen = serde_yaml::from_str(&format!(
+            r#"
+port: 2443
+users: [11111111-1111-1111-1111-111111111111]
+target: camouflage.example:443
+target_type: tcp
+server_names: [camouflage.example]
+private_key: {}
+min_client_ver: "26.3.27"
+max_time_diff: 1000
+short_ids: ["00"]
+limit_fallback_upload: {{bytes_per_sec: 1}}
+limits: {{max_client_hello_records: 4}}
+"#,
+            base64url_bytes(7, 32)
+        ))
+        .unwrap();
+        let normalized = compile_reality_listeners(&[source]).unwrap().remove(0);
+        assert_eq!(normalized.target_type.as_deref(), Some("tcp"));
+        assert_eq!(normalized.max_time_diff_ms, 1_000);
+        assert_eq!(normalized.limit_fallback_upload.bytes_per_sec, 1);
+        assert_eq!(normalized.limits.max_client_hello_records, 4);
+
+        let unknown = format!(
+            "port: 2443\nusers: []\ntarget: a:1\nserverNames: [a]\nprivateKey: {}\nshortIds: ['']\nserverNmaes: [typo]\n",
+            base64url_bytes(7, 32)
+        );
+        assert!(serde_yaml::from_str::<RealityListen>(&unknown).is_err());
+    }
+
+    #[test]
+    fn reality_server_rejects_conflicts_dangerous_options_and_bad_bounds() {
+        let valid = valid_reality_listener();
+
+        let mut conflict = valid.clone();
+        conflict.dest = Some(RealityTarget::Address("other.example:443".into()));
+        assert!(compile_reality_listeners(&[conflict]).is_err());
+
+        let mut show = valid.clone();
+        show.show = true;
+        assert!(compile_reality_listeners(&[show]).is_err());
+
+        let mut key_log = valid.clone();
+        key_log.master_key_log = Some("reality.keys".into());
+        assert!(compile_reality_listeners(&[key_log]).is_err());
+
+        let mut xver = valid.clone();
+        xver.xver = 3;
+        assert!(compile_reality_listeners(&[xver]).is_err());
+
+        let mut versions = valid.clone();
+        versions.min_client_ver = Some("27.0.0".into());
+        versions.max_client_ver = Some("26.9.9".into());
+        assert!(compile_reality_listeners(&[versions]).is_err());
+
+        let mut fallback = valid.clone();
+        fallback.limit_fallback_upload.after_bytes = 1;
+        assert!(compile_reality_listeners(&[fallback]).is_err());
+
+        let mut limits = valid.clone();
+        limits.limits.max_client_hello_bytes = u16::MAX as usize + 1;
+        assert!(compile_reality_listeners(&[limits]).is_err());
+
+        let mut equal_seed = valid;
+        equal_seed.mldsa65_seed = Some(equal_seed.private_key.clone());
+        assert!(compile_reality_listeners(&[equal_seed]).is_err());
+    }
+
+    #[test]
+    fn reality_client_rejects_key_alias_and_security_conflicts() {
+        let key = base64url_bytes(7, 32);
+        let mut settings = RealityClientSettings {
+            server_name: "camouflage.example".into(),
+            password: Some(key.clone()),
+            short_id: "0123456789abcdef".into(),
+            spider_x: "/news?p=8&c=2".into(),
+            ..RealityClientSettings::default()
+        };
+        validate_reality_client_settings(&settings).unwrap();
+
+        settings.public_key = Some(base64url_bytes(8, 32));
+        assert!(validate_reality_client_settings(&settings).is_err());
+        settings.public_key = None;
+        settings.show = true;
+        assert!(validate_reality_client_settings(&settings).is_err());
+        settings.show = false;
+        settings.master_key_log = Some("reality.keys".into());
+        assert!(validate_reality_client_settings(&settings).is_err());
+
+        let mut reality = settings;
+        reality.master_key_log = None;
+        let detail = NodeDetail {
+            name: "reality-client".into(),
+            protocol: Some("vless".into()),
+            address: Some("127.0.0.1:443".into()),
+            secure: Some(NodeSecure {
+                fingerprint: Some("chrome".into()),
+                utls: Some("firefox".into()),
+                reality: Some(true),
+                reality_settings: Some(reality),
+                ..NodeSecure::default()
+            }),
+            ..NodeDetail::default()
+        };
+        assert!(detail_to_parsed(&detail).is_err());
+    }
+
+    #[test]
+    fn reality_client_camel_and_snake_fields_deserialize_without_loss() {
+        let key = base64url_bytes(7, 32);
+        let verify = base64url_bytes(9, 1952);
+        let settings: RealityClientSettings = serde_yaml::from_str(&format!(
+            r#"
+fp: chrome
+server_name: camouflage.example
+pbk: {key}
+short-id: 0123456789abcdef
+mldsa65_verify: {verify}
+spiderX: /cover?p=4
+show: false
+master_key_log: none
+"#
+        ))
+        .unwrap();
+        validate_reality_client_settings(&settings).unwrap();
+        assert_eq!(settings.fingerprint, "chrome");
+        assert_eq!(settings.server_name, "camouflage.example");
+        assert_eq!(settings.password.as_deref(), Some(key.as_str()));
+        assert_eq!(settings.short_id, "0123456789abcdef");
+        assert_eq!(settings.mldsa65_verify.as_deref(), Some(verify.as_str()));
+        assert_eq!(settings.spider_x, "/cover?p=4");
+        assert_eq!(settings.master_key_log.as_deref(), Some("none"));
+
+        assert!(
+            serde_yaml::from_str::<RealityClientSettings>(&format!(
+                "serverName: a\npassword: {key}\nshortId: ''\nspiderX: /\npublicKye: typo\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1000,6 +2012,54 @@ nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Home)));
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Cn)));
         assert!(kinds.iter().any(|m| matches!(m, RouteMatcher::Any)));
+    }
+
+    #[test]
+    fn fixed_process_listeners_reject_dynamic_port_zero() {
+        for yaml in [
+            r#"
+version: 1
+profile: desktop
+listen:
+  local: 0
+"#,
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 0
+"#,
+        ] {
+            let error = crate::loader::load_from_str(yaml).unwrap_err();
+            assert!(error.to_string().contains("端口不能为 0"));
+        }
+    }
+
+    #[test]
+    fn panel_address_is_validated_and_preserves_ipv6() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: not-a-socket
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("非法 listen.panel 地址"));
+
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: "[::1]:9090"
+"#,
+        );
+        assert_eq!(
+            plan.listen.panel.unwrap().socket_addr().unwrap(),
+            "[::1]:9090".parse().unwrap()
+        );
     }
 
     #[test]

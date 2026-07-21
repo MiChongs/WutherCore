@@ -71,15 +71,16 @@ pub struct MixedListener {
     pub udp: bool,
 }
 
+async fn bind_mixed_listener(listen: SocketAddr) -> io::Result<TcpListener> {
+    TcpListener::bind(listen).await
+}
+
 pub async fn run_mixed(listener: MixedListener, runtime: Arc<Runtime>) -> io::Result<()> {
-    let report = crate::privilege::PrivilegeReport::detect();
-    let l = crate::listener::bind_with_fallback(listener.listen, &report, None).await?;
+    // Host-resource arbitration reserves this exact address. Falling back to a
+    // different port would make the reservation and the live socket diverge.
+    let l = bind_mixed_listener(listener.listen).await?;
     let bound = l.local_addr()?;
-    if bound != listener.listen {
-        info!(want = %listener.listen, got = %bound, "mixed inbound bound to fallback");
-    } else {
-        info!(addr = %bound, "mixed inbound listening");
-    }
+    info!(addr = %bound, "mixed inbound listening");
     serve_mixed(l, listener, runtime).await
 }
 
@@ -2378,6 +2379,18 @@ mod tests {
     fn network_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn mixed_bind_is_exact_and_fails_when_requested_port_is_occupied() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+
+        let error = bind_mixed_listener(address)
+            .await
+            .expect_err("must not fall back to an undeclared port");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
 
     fn test_runtime() -> Arc<Runtime> {

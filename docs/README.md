@@ -8,6 +8,7 @@
 | --- | --- |
 | [功能矩阵](FEATURES.md) | 当前有哪些能力，哪些行为依赖平台或服务端 |
 | [配置指南](CONFIGURATION.md) | 如何选择 Profile、组织配置、校验与迁移 |
+| [Linux TUN auto_redirect](LINUX-TUN-AUTO-REDIRECT.md) | 本机 TCP REDIRECT + UDP TUN 的前置条件、安全边界和回滚 |
 | [管理 API](API.md) | 如何鉴权、查询状态和控制运行时 |
 | [排错手册](TROUBLESHOOTING.md) | TUN、DNS、订阅、权限和连接失败如何定位 |
 | [示例配置](../examples/) | Desktop、Router、Android、Feed 与手动节点模板 |
@@ -17,6 +18,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [架构说明](ARCHITECTURE.md) | workspace 边界、连接数据流与主要扩展点 |
+| [组网后端基础设施](mesh-backend-foundation.md) | 后端能力、系统资源仲裁、进程所有权与事务生命周期 |
 | [内核设计文档](../RP内核设计文档.md) | 完整设计背景和实现细节 |
 | [构建性能](BUILD-PERF.md) | Cargo profile、缓存与编译性能 |
 | [构建脚本](../scripts/README.md) | 多平台构建方式和产物 |

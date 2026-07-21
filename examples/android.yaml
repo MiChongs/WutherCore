@@ -214,7 +214,7 @@ capture:
     auto_route: true
     iproute2_table_index: 2024
     iproute2_rule_index:  9100
-    auto_redirect: false        # 默认关；root 设备 + nft/iptables 才打开（见 6.B）
+    auto_redirect: false        # Android 当前明确不支持；仅 Linux root-managed TUN 可按专门文档启用
     strict_route: false         # 严格防泄漏会切断 LAN，移动端关
     route_address: []           # 空 = 全部走 TUN
 
@@ -301,31 +301,14 @@ capture:
           - "*.local"
 
 # -----------------------------------------------------------------------------
-# 6.B 【可选】root + KernelSU 高性能模板
-#     条件：手机已 root + 装了 magisk-iptables 或 nftables 模块。
-#     取消注释 + 把上方 6 节的 capture 整段删掉。
+# 6.B Android auto_redirect 说明
 # -----------------------------------------------------------------------------
-# capture:
-#   on: true
-#   method: tproxy            # 真透明代理；纯 nftables/iptables，零用户态栈
-#   traffic: system
-#   resolver: hijack
-#   stack: native
-#   exclude:
-#     cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
-#   tun:
-#     interface_name: "rpktun0"
-#     auto_route: true
-#     auto_redirect: true
-#     auto_redirect_input_mark:  "0x2023"
-#     auto_redirect_output_mark: "0x2024"
-#     auto_redirect_reset_mark:  "0x2025"
-#     iproute2_table_index: 2024
-#     iproute2_rule_index:  9100
-#     include_uid_range: ["10000:99999"]    # 仅普通 app
-#     exclude_uid: [1000, 0]                # 排除 system + root
-#     loopback_address: ["127.0.0.1", "::1"]
-#     route_exclude_address_set: ["geoip-cn", "geoip-private"]
+# 当前安全实现只接受 Linux root-managed TUN + virtual_nic + traffic=system。
+# Android/VpnService、method=tproxy、identity 过滤、input/reset mark 和动态 route
+# set 组合会在配置阶段明确拒绝，不能把这些字段当作已经生效。
+#
+# Android 请继续使用上方 6 节的 VpnService/TUN 配置；Linux root-managed 主机参见：
+# docs/LINUX-TUN-AUTO-REDIRECT.md
 
 # ---------------------------------------------------------------------------
 # 7. route —— 分流规则
