@@ -6,13 +6,24 @@ on:
     paths:
       - 'crates/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'Cross.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
       - '.github/workflows/build.yml'
+
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
 jobs:
   build:
     name: Build (${{ matrix.platform.name }})
@@ -43,41 +54,57 @@ jobs:
             name: windows-amd64
             is_android: false
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: ${{ matrix.platform.target }}
-          components: rust-src
+
       - name: Setup Android NDK
         if: matrix.platform.is_android == true
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@v1.6.0
         with:
           ndk-version: r29
           add-to-path: true
+          local-cache: true
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: release
+          key: ${{ matrix.platform.target }}
+          workspaces: |
+            . -> target
+          cache-bin: false
+          cache-on-failure: true
+
       - name: Install cargo-ndk
         if: matrix.platform.is_android == true
-        run: |
-          cargo install cargo-ndk --locked
+        uses: taiki-e/install-action@v2.84.0
+        with:
+          tool: cargo-ndk@4.1.2
+
       - name: Install Cross
         if: matrix.platform.is_android != true
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross.git --rev v0.2.5 --locked
-      - uses: Swatinem/rust-cache@v2
+        uses: taiki-e/install-action@v2.84.0
         with:
-          key: ${{ matrix.platform.target }}
-          save-if: ${{ github.event_name == 'push' }}
+          tool: cross@0.2.5
+
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
-          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release
+          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release --locked
+
       - name: Run Cross Build (Non-Android)
         if: matrix.platform.is_android != true
         run: |
-          cross build --release --target ${{ matrix.platform.target }}
+          cross build --release --locked --target ${{ matrix.platform.target }}
+
       - name: Package Artifacts
         run: |
           mkdir -p ./dist
@@ -100,8 +127,10 @@ jobs:
           cd ..
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: wuther-core-${{ matrix.platform.name }}
-          path: ./dist/*
+          path: ./dist/wuther-core-${{ matrix.platform.name }}.zip
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 1

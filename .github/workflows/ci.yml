@@ -11,11 +11,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
 
 jobs:
   required-ci:
@@ -25,7 +28,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check repository presentation
         run: python scripts/check-repository.py
@@ -43,14 +48,20 @@ jobs:
           components: rustfmt
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.1
         with:
-          save-if: ${{ github.event_name == 'push' }}
+          shared-key: required-ci
+          workspaces: |
+            . -> target
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
       - name: Check CLI brand
         run: |
@@ -58,7 +69,7 @@ jobs:
           grep -q '^Usage: wuther-core' /tmp/wuthercore-help.txt
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build Rust documentation
         env:
