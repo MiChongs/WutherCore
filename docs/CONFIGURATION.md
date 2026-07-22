@@ -146,10 +146,13 @@ ui:
 
 面板暴露到局域网前：
 
-- 配置 `ui.secret`；
+- 配置 `ui.secret`（**硬门禁**：`listen.share: home|all` 或非 loopback `listen.panel` 且 `ui.secret` 为空时，`check`/`run` 直接失败）；
+- `profile: router` 默认 `share: home`，因此也必须显式填写 `ui.secret`；
 - 将 `ui.cors` 限制为实际 Dashboard 来源；
 - 不要在 URL、日志或截图中公开密钥；
 - 用防火墙限制管理端口。
+
+策略组 `choose: chain`（多跳 relay）尚未实现，配置编译期会拒绝，不会静默退化为单跳。
 
 端点和鉴权方式见 [管理 API](API.md)。
 

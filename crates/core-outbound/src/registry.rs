@@ -4,6 +4,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use base64::Engine as _;
 use core_config::node_uri::{NodeProtocol, ParsedNode};
 use uuid::Uuid;
 
@@ -35,7 +36,7 @@ use crate::{
     },
     socks5::Socks5Outbound,
     stub::StubOutbound,
-    transport::{GrpcOptions, H2Options, HttpOptions, WsOptions, XhttpOptions},
+    transport::{GrpcOptions, H2Options, HttpOptions, RealityOptions, WsOptions, XhttpOptions},
 };
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
@@ -322,7 +323,7 @@ fn build_vless(node: &ParsedNode) -> SharedOutbound {
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::nil);
     let mut ob = VlessOutbound::new(&node.name, &node.host, node.port, uuid);
-    ob.tls = node.tls;
+    ob.tls = node.tls && node.reality.is_none();
     ob.sni = node
         .sni
         .clone()
@@ -335,6 +336,38 @@ fn build_vless(node: &ParsedNode) -> SharedOutbound {
         .unwrap_or(false);
     if let Some(alpn) = node.params.get("alpn") {
         ob.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
+    }
+    if let Some(reality) = &node.reality {
+        let encoded_public_key = reality
+            .password
+            .as_ref()
+            .or(reality.public_key.as_ref())
+            .expect("core-config validated REALITY password/publicKey");
+        let decoded_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_public_key)
+            .expect("core-config validated REALITY public key base64url");
+        let public_key: [u8; 32] = decoded_public_key
+            .try_into()
+            .expect("core-config validated REALITY public key length");
+        let short_id = hex::decode(&reality.short_id)
+            .expect("core-config validated REALITY shortId hexadecimal");
+        let mldsa65_verify = reality.mldsa65_verify.as_ref().map(|encoded| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .expect("core-config validated REALITY mldsa65Verify")
+        });
+        ob.sni = Some(reality.server_name.clone());
+        ob.reality = Some(RealityOptions {
+            config: core_reality::RealityClientConfig {
+                server_name: reality.server_name.clone(),
+                fingerprint: reality.fingerprint.clone(),
+                public_key,
+                short_id,
+                spider_x: reality.spider_x.clone(),
+                mldsa65_verify,
+                ..core_reality::RealityClientConfig::default()
+            },
+        });
     }
     let network_str = resolve_network_string(node);
     ob.network = VlessNetwork::parse(&network_str);

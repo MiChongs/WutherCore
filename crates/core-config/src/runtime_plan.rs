@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ConfigError, ConfigResult},
     model::*,
-    node_uri::{NodeProtocol, ParsedNode, parse_uri},
+    node_uri::{NodeProtocol, ParsedNode, parse_uri, validate_reality_client_settings},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +39,8 @@ pub struct RuntimePlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenPlan {
     pub mixed: Option<MixedListen>,
+    #[serde(default)]
+    pub reality: Vec<RealityListen>,
     pub panel: Option<PanelListen>,
     pub share: Share,
     pub auth: Vec<UserPass>,
@@ -175,6 +177,7 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     validate_capture_platform(&capture)?;
     let smart = cfg.smart.unwrap_or_default();
     let ui = cfg.ui.unwrap_or_default();
+    validate_ui_secret_for_bind(&listen, &ui)?;
     let mesh = cfg.mesh.unwrap_or_default();
     let find_process_mode = cfg.find_process_mode;
     Ok(RuntimePlan {
@@ -202,6 +205,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         panel: None,
         share: None,
         auth: vec![],
+        reality: vec![],
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -275,12 +279,260 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         })
         .collect();
 
+    let reality = compile_reality_listeners(&listen.reality)?;
+
     Ok(ListenPlan {
         mixed,
+        reality,
         panel,
         share,
         auth,
     })
+}
+
+fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
+    use base64::Engine as _;
+
+    let mut out = Vec::with_capacity(listeners.len());
+    let mut bound = std::collections::HashSet::new();
+    for (index, source) in listeners.iter().enumerate() {
+        let location = format!("listen.reality[{index}]");
+        if source.port == 0 {
+            return Err(ConfigError::invalid("REALITY 监听端口不能为 0").at(location));
+        }
+        if source.host.trim().is_empty() {
+            return Err(ConfigError::invalid("REALITY 监听地址不能为空").at(location));
+        }
+        if !bound.insert((source.host.clone(), source.port)) {
+            return Err(ConfigError::invalid("重复的 REALITY 监听地址").at(location));
+        }
+        if source.show {
+            return Err(ConfigError::invalid(
+                "REALITY show 会输出握手密钥材料，WutherCore 出于密钥安全不提供该选项",
+            )
+            .at(format!("{location}.show")));
+        }
+        if source
+            .master_key_log
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != "none")
+        {
+            return Err(ConfigError::invalid(
+                "REALITY masterKeyLog 会把会话密钥写入磁盘，WutherCore 出于密钥安全不提供该选项",
+            )
+            .at(format!("{location}.masterKeyLog")));
+        }
+        if source.xver > 2 {
+            return Err(ConfigError::invalid("REALITY xver 只能是 0、1 或 2")
+                .at(format!("{location}.xver")));
+        }
+        if !source.protocol.eq_ignore_ascii_case("vless") {
+            return Err(ConfigError::invalid(format!(
+                "当前 REALITY 入站只接受已完整实现的 VLESS 内层协议，收到 `{}`",
+                source.protocol
+            ))
+            .at(format!("{location}.protocol")));
+        }
+        if source.users.is_empty() {
+            return Err(
+                ConfigError::invalid("VLESS-over-REALITY 至少需要一个 users UUID")
+                    .at(format!("{location}.users")),
+            );
+        }
+        for (user_index, user) in source.users.iter().enumerate() {
+            uuid::Uuid::parse_str(user).map_err(|error| {
+                ConfigError::invalid(format!("非法 VLESS UUID：{error}"))
+                    .at(format!("{location}.users[{user_index}]"))
+            })?;
+        }
+        let target = match (&source.target, &source.dest) {
+            (Some(target), Some(dest)) if target != dest => {
+                return Err(
+                    ConfigError::invalid("REALITY target 与 dest 同时配置但值不一致").at(location),
+                );
+            }
+            (Some(target), _) | (_, Some(target)) => target.normalized(),
+            (None, None) => {
+                return Err(ConfigError::invalid("REALITY 缺少 target/dest")
+                    .at(format!("{location}.target")));
+            }
+        };
+        let target_type = source
+            .target_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if target.starts_with('@') || target.starts_with('/') {
+                    "unix".to_owned()
+                } else {
+                    "tcp".to_owned()
+                }
+            });
+        if !matches!(target_type.as_str(), "tcp" | "unix") {
+            return Err(ConfigError::invalid(format!(
+                "REALITY type 只接受 tcp 或 unix，收到 `{target_type}`"
+            ))
+            .at(format!("{location}.type")));
+        }
+        if target_type == "tcp" && target.rsplit_once(':').is_none() {
+            return Err(ConfigError::invalid("REALITY TCP target 必须包含端口")
+                .at(format!("{location}.target")));
+        }
+        if target_type == "unix" && cfg!(windows) {
+            return Err(
+                ConfigError::invalid("当前 Windows 平台不支持 REALITY unix target")
+                    .at(format!("{location}.type")),
+            );
+        }
+        if source.server_names.is_empty()
+            || source
+                .server_names
+                .iter()
+                .any(|name| name.trim().is_empty())
+        {
+            return Err(ConfigError::invalid("REALITY serverNames 不能为空")
+                .at(format!("{location}.serverNames")));
+        }
+        let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&source.private_key)
+            .map_err(|error| {
+                ConfigError::invalid(format!("REALITY privateKey 不是合法 base64url：{error}"))
+                    .at(format!("{location}.privateKey"))
+            })?;
+        if private_key.len() != 32 {
+            return Err(
+                ConfigError::invalid("REALITY privateKey 必须解码为 32 字节")
+                    .at(format!("{location}.privateKey")),
+            );
+        }
+        if source.short_ids.is_empty() {
+            return Err(ConfigError::invalid("REALITY shortIds 不能为空")
+                .at(format!("{location}.shortIds")));
+        }
+        for (short_index, short_id) in source.short_ids.iter().enumerate() {
+            validate_reality_short_id(short_id).map_err(|message| {
+                ConfigError::invalid(message).at(format!("{location}.shortIds[{short_index}]"))
+            })?;
+        }
+        let min = parse_reality_version(
+            source.min_client_ver.as_deref().unwrap_or("26.3.27"),
+            &format!("{location}.minClientVer"),
+        )?;
+        let max = source
+            .max_client_ver
+            .as_deref()
+            .map(|version| parse_reality_version(version, &format!("{location}.maxClientVer")))
+            .transpose()?;
+        if max.is_some_and(|max| min > max) {
+            return Err(
+                ConfigError::invalid("REALITY minClientVer 不能大于 maxClientVer").at(location),
+            );
+        }
+        if let Some(seed) = &source.mldsa65_seed {
+            if seed == &source.private_key {
+                return Err(
+                    ConfigError::invalid("REALITY mldsa65Seed 不能与 privateKey 相同")
+                        .at(format!("{location}.mldsa65Seed")),
+                );
+            }
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(seed)
+                .map_err(|error| {
+                    ConfigError::invalid(format!("REALITY mldsa65Seed 不是合法 base64url：{error}"))
+                        .at(format!("{location}.mldsa65Seed"))
+                })?;
+            if decoded.len() != 32 {
+                return Err(
+                    ConfigError::invalid("REALITY mldsa65Seed 必须解码为 32 字节")
+                        .at(format!("{location}.mldsa65Seed")),
+                );
+            }
+        }
+        validate_reality_fallback_limit(
+            source.limit_fallback_upload,
+            &format!("{location}.limitFallbackUpload"),
+        )?;
+        validate_reality_fallback_limit(
+            source.limit_fallback_download,
+            &format!("{location}.limitFallbackDownload"),
+        )?;
+        validate_reality_resource_limits(source.limits, &format!("{location}.limits"))?;
+
+        let mut normalized = source.clone();
+        normalized.target = Some(RealityTarget::Address(target));
+        normalized.dest = None;
+        normalized.target_type = Some(target_type);
+        normalized.min_client_ver = Some(format!("{}.{}.{}", min[0], min[1], min[2]));
+        normalized.max_client_ver =
+            max.map(|version| format!("{}.{}.{}", version[0], version[1], version[2]));
+        out.push(normalized);
+    }
+    Ok(out)
+}
+
+fn validate_reality_short_id(value: &str) -> Result<(), String> {
+    if value.len() > 16 || value.len() % 2 != 0 {
+        return Err("REALITY shortId 必须是 0 到 16 个偶数长度十六进制字符".into());
+    }
+    hex::decode(value)
+        .map(|_| ())
+        .map_err(|error| format!("REALITY shortId 不是合法十六进制：{error}"))
+}
+
+fn parse_reality_version(value: &str, location: &str) -> ConfigResult<[u8; 3]> {
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(ConfigError::invalid(format!(
+            "REALITY 客户端版本必须是 1 到 3 段十进制数字，收到 `{value}`"
+        ))
+        .at(location));
+    }
+    let mut version = [0u8; 3];
+    for (index, part) in parts.iter().enumerate() {
+        version[index] = part.parse().map_err(|_| {
+            ConfigError::invalid(format!("REALITY 客户端版本段必须小于 256：`{value}`"))
+                .at(location)
+        })?;
+    }
+    Ok(version)
+}
+
+fn validate_reality_fallback_limit(
+    limit: RealityFallbackLimit,
+    location: &str,
+) -> ConfigResult<()> {
+    if limit.bytes_per_sec == 0 && (limit.after_bytes != 0 || limit.burst_bytes_per_sec != 0) {
+        return Err(ConfigError::invalid(
+            "REALITY 回落 afterBytes/burstBytesPerSec 要求 bytesPerSec 非零",
+        )
+        .at(location));
+    }
+    Ok(())
+}
+
+fn validate_reality_resource_limits(
+    limits: RealityResourceLimits,
+    location: &str,
+) -> ConfigResult<()> {
+    if limits.handshake_timeout.is_zero()
+        || limits.target_handshake_timeout.is_zero()
+        || limits.idle_timeout.is_zero()
+        || limits.max_client_hello_records == 0
+        || limits.max_client_hello_record_payload == 0
+        || limits.max_client_hello_record_payload > 16_640
+        || limits.max_client_hello_bytes < 4
+        || limits.max_client_hello_bytes > u16::MAX as usize
+        || limits.max_client_hello_wire_bytes < 5
+        || limits.max_target_records < 3
+        || limits.max_target_handshake_bytes < 1024
+        || limits.application_buffer_bytes == 0
+        || limits.max_concurrent_handshakes == 0
+    {
+        return Err(ConfigError::invalid("非法 REALITY 资源上限").at(location));
+    }
+    Ok(())
 }
 
 fn compile_feeds(feeds: &BTreeMap<String, FeedSpec>) -> BTreeMap<String, FeedDetail> {
@@ -361,8 +613,62 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
         node.uuid = login.uuid.clone();
     }
     if let Some(secure) = &d.secure {
-        node.tls = secure.tls;
+        let reality_enabled = secure.reality.unwrap_or(false) || secure.reality_settings.is_some();
+        if secure.reality == Some(false) && secure.reality_settings.is_some() {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 同时禁用 reality 并提供 realitySettings",
+                d.name
+            )));
+        }
+        if secure.tls && reality_enabled {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 不能同时启用普通 TLS 与 REALITY",
+                d.name
+            )));
+        }
+        node.tls = secure.tls || reality_enabled;
         node.sni = secure.sni.clone();
+        if reality_enabled {
+            let mut reality = secure.reality_settings.clone().ok_or_else(|| {
+                ConfigError::bad_node(format!(
+                    "node {} 启用了 reality 但缺少 realitySettings",
+                    d.name
+                ))
+            })?;
+            if let Some(sni) = &secure.sni {
+                if !reality.server_name.is_empty() && &reality.server_name != sni {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} 的 secure.sni 与 realitySettings.serverName 冲突",
+                        d.name
+                    )));
+                }
+                reality.server_name = sni.clone();
+            }
+            if let Some(fingerprint) = secure.fingerprint.as_ref().or(secure.utls.as_ref()) {
+                if !reality.fingerprint.is_empty()
+                    && !reality.fingerprint.eq_ignore_ascii_case(fingerprint)
+                    && !reality.fingerprint.eq_ignore_ascii_case("chrome")
+                {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {} 的 secure fingerprint/utls 与 realitySettings.fingerprint 冲突",
+                        d.name
+                    )));
+                }
+                reality.fingerprint = fingerprint.clone();
+            }
+            if let (Some(fingerprint), Some(utls)) = (&secure.fingerprint, &secure.utls)
+                && !fingerprint.eq_ignore_ascii_case(utls)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {} 的 secure.fingerprint 与 secure.utls 冲突",
+                    d.name
+                )));
+            }
+            validate_reality_client_settings(&reality)
+                .map_err(|error| error.at(format!("nodes.{}.secure.realitySettings", d.name)))?;
+            node.sni = Some(reality.server_name.clone());
+            node.reality = Some(reality);
+        }
     }
     if let Some(transport) = &d.transport {
         node.transport = transport.kind.clone();
@@ -381,6 +687,16 @@ fn compile_groups(
     let valid_feeds: std::collections::HashSet<&str> =
         cfg.feeds.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
+        if g.choose == ChooseStrategy::Chain {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.choose = chain 尚未实现多跳 relay"
+            ))
+            .at(format!("groups.{name}.choose"))
+            .hint(
+                "请改用 manual / smart / fast / stable / spread；\
+                     多跳链路实现前不会静默退化为单跳",
+            ));
+        }
         let mut members = Vec::new();
         for src in &g.r#use {
             if src == "nodes" {
@@ -965,6 +1281,50 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
     Some(format!("{} -> {}", lhs_parts.join(","), policy))
 }
 
+/// 非本机 API 面板暴露时必须配置 `ui.secret`，避免空 secret 的全开控制面。
+fn validate_ui_secret_for_bind(listen: &ListenPlan, ui: &Ui) -> ConfigResult<()> {
+    if !ui.on {
+        return Ok(());
+    }
+    let Some(panel) = listen.panel.as_ref() else {
+        return Ok(());
+    };
+    if is_loopback_bind_host(&panel.host) {
+        return Ok(());
+    }
+    let secret_ok = ui
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if secret_ok {
+        return Ok(());
+    }
+    Err(ConfigError::invalid(
+        "管理 API 绑定了非本机地址，但 ui.secret 为空；拒绝启动以避免未鉴权控制面",
+    )
+    .at("ui.secret")
+    .hint(
+        "为 ui.secret 设置足够长的随机串，或把 listen.panel / listen.share 限制在 127.0.0.1 / ::1；\
+             share: home|all 会把面板绑到 0.0.0.0",
+    ))
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
     validate_capture_platform_for_os(c, std::env::consts::OS)
 }
@@ -1203,6 +1563,27 @@ fn validate_auto_redirect_marks(tun: &TunInboundOptions) -> ConfigResult<()> {
 mod tests {
     use super::*;
     use crate::profile::apply_defaults;
+
+    fn base64url_bytes(byte: u8, len: usize) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![byte; len])
+    }
+
+    fn valid_reality_listener() -> RealityListen {
+        serde_yaml::from_str(&format!(
+            r#"
+port: 2443
+protocol: vless
+users: [11111111-1111-1111-1111-111111111111]
+target: camouflage.example:443
+serverNames: [camouflage.example]
+privateKey: {}
+shortIds: [0123456789abcdef]
+"#,
+            base64url_bytes(7, 32)
+        ))
+        .unwrap()
+    }
 
     fn compile_cfg(yaml: &str) -> RuntimePlan {
         let mut cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1445,6 +1826,235 @@ mod tests {
     }
 
     #[test]
+    fn reality_server_all_xray_fields_survive_normalization() {
+        let source: RealityListen = serde_yaml::from_str(&format!(
+            r#"
+host: 127.0.0.1
+port: 2443
+protocol: vless
+users: [11111111-1111-1111-1111-111111111111]
+dest: camouflage.example:443
+type: tcp
+show: false
+masterKeyLog: none
+xver: 2
+serverNames: [camouflage.example, www.example.com]
+privateKey: {}
+minClientVer: "26.3"
+maxClientVer: "26.9.1"
+maxTimeDiff: 45000
+shortIds: [0123456789abcdef, ""]
+mldsa65Seed: {}
+limitFallbackUpload:
+  afterBytes: 100
+  bytesPerSec: 1000
+  burstBytesPerSec: 2000
+limitFallbackDownload:
+  afterBytes: 200
+  bytesPerSec: 3000
+  burstBytesPerSec: 4000
+limits:
+  handshakeTimeout: 11s
+  targetHandshakeTimeout: 6s
+  idleTimeout: 7s
+  maxClientHelloRecords: 8
+  maxClientHelloRecordPayload: 16000
+  maxClientHelloBytes: 60000
+  maxClientHelloWireBytes: 70000
+  maxTargetRecords: 4
+  maxTargetHandshakeBytes: 8192
+  applicationBufferBytes: 65536
+  maxConcurrentHandshakes: 12
+"#,
+            base64url_bytes(7, 32),
+            base64url_bytes(8, 32),
+        ))
+        .unwrap();
+
+        let normalized = compile_reality_listeners(&[source]).unwrap().remove(0);
+        assert_eq!(normalized.host, "127.0.0.1");
+        assert_eq!(normalized.port, 2443);
+        assert_eq!(normalized.protocol, "vless");
+        assert_eq!(normalized.users.len(), 1);
+        assert_eq!(
+            normalized.target,
+            Some(RealityTarget::Address("camouflage.example:443".into()))
+        );
+        assert_eq!(normalized.dest, None);
+        assert_eq!(normalized.target_type.as_deref(), Some("tcp"));
+        assert!(!normalized.show);
+        assert_eq!(normalized.master_key_log.as_deref(), Some("none"));
+        assert_eq!(normalized.xver, 2);
+        assert_eq!(normalized.server_names.len(), 2);
+        assert_eq!(normalized.min_client_ver.as_deref(), Some("26.3.0"));
+        assert_eq!(normalized.max_client_ver.as_deref(), Some("26.9.1"));
+        assert_eq!(normalized.max_time_diff_ms, 45_000);
+        assert_eq!(normalized.short_ids, ["0123456789abcdef", ""]);
+        assert!(normalized.mldsa65_seed.is_some());
+        assert_eq!(normalized.limit_fallback_upload.after_bytes, 100);
+        assert_eq!(normalized.limit_fallback_upload.bytes_per_sec, 1_000);
+        assert_eq!(normalized.limit_fallback_upload.burst_bytes_per_sec, 2_000);
+        assert_eq!(normalized.limit_fallback_download.after_bytes, 200);
+        assert_eq!(normalized.limits.handshake_timeout, Duration::from_secs(11));
+        assert_eq!(
+            normalized.limits.target_handshake_timeout,
+            Duration::from_secs(6)
+        );
+        assert_eq!(normalized.limits.idle_timeout, Duration::from_secs(7));
+        assert_eq!(normalized.limits.max_client_hello_records, 8);
+        assert_eq!(normalized.limits.max_client_hello_record_payload, 16_000);
+        assert_eq!(normalized.limits.max_client_hello_bytes, 60_000);
+        assert_eq!(normalized.limits.max_client_hello_wire_bytes, 70_000);
+        assert_eq!(normalized.limits.max_target_records, 4);
+        assert_eq!(normalized.limits.max_target_handshake_bytes, 8_192);
+        assert_eq!(normalized.limits.application_buffer_bytes, 65_536);
+        assert_eq!(normalized.limits.max_concurrent_handshakes, 12);
+    }
+
+    #[test]
+    fn reality_server_snake_aliases_work_and_unknown_fields_fail() {
+        let source: RealityListen = serde_yaml::from_str(&format!(
+            r#"
+port: 2443
+users: [11111111-1111-1111-1111-111111111111]
+target: camouflage.example:443
+target_type: tcp
+server_names: [camouflage.example]
+private_key: {}
+min_client_ver: "26.3.27"
+max_time_diff: 1000
+short_ids: ["00"]
+limit_fallback_upload: {{bytes_per_sec: 1}}
+limits: {{max_client_hello_records: 4}}
+"#,
+            base64url_bytes(7, 32)
+        ))
+        .unwrap();
+        let normalized = compile_reality_listeners(&[source]).unwrap().remove(0);
+        assert_eq!(normalized.target_type.as_deref(), Some("tcp"));
+        assert_eq!(normalized.max_time_diff_ms, 1_000);
+        assert_eq!(normalized.limit_fallback_upload.bytes_per_sec, 1);
+        assert_eq!(normalized.limits.max_client_hello_records, 4);
+
+        let unknown = format!(
+            "port: 2443\nusers: []\ntarget: a:1\nserverNames: [a]\nprivateKey: {}\nshortIds: ['']\nserverNmaes: [typo]\n",
+            base64url_bytes(7, 32)
+        );
+        assert!(serde_yaml::from_str::<RealityListen>(&unknown).is_err());
+    }
+
+    #[test]
+    fn reality_server_rejects_conflicts_dangerous_options_and_bad_bounds() {
+        let valid = valid_reality_listener();
+
+        let mut conflict = valid.clone();
+        conflict.dest = Some(RealityTarget::Address("other.example:443".into()));
+        assert!(compile_reality_listeners(&[conflict]).is_err());
+
+        let mut show = valid.clone();
+        show.show = true;
+        assert!(compile_reality_listeners(&[show]).is_err());
+
+        let mut key_log = valid.clone();
+        key_log.master_key_log = Some("reality.keys".into());
+        assert!(compile_reality_listeners(&[key_log]).is_err());
+
+        let mut xver = valid.clone();
+        xver.xver = 3;
+        assert!(compile_reality_listeners(&[xver]).is_err());
+
+        let mut versions = valid.clone();
+        versions.min_client_ver = Some("27.0.0".into());
+        versions.max_client_ver = Some("26.9.9".into());
+        assert!(compile_reality_listeners(&[versions]).is_err());
+
+        let mut fallback = valid.clone();
+        fallback.limit_fallback_upload.after_bytes = 1;
+        assert!(compile_reality_listeners(&[fallback]).is_err());
+
+        let mut limits = valid.clone();
+        limits.limits.max_client_hello_bytes = u16::MAX as usize + 1;
+        assert!(compile_reality_listeners(&[limits]).is_err());
+
+        let mut equal_seed = valid;
+        equal_seed.mldsa65_seed = Some(equal_seed.private_key.clone());
+        assert!(compile_reality_listeners(&[equal_seed]).is_err());
+    }
+
+    #[test]
+    fn reality_client_rejects_key_alias_and_security_conflicts() {
+        let key = base64url_bytes(7, 32);
+        let mut settings = RealityClientSettings {
+            server_name: "camouflage.example".into(),
+            password: Some(key.clone()),
+            short_id: "0123456789abcdef".into(),
+            spider_x: "/news?p=8&c=2".into(),
+            ..RealityClientSettings::default()
+        };
+        validate_reality_client_settings(&settings).unwrap();
+
+        settings.public_key = Some(base64url_bytes(8, 32));
+        assert!(validate_reality_client_settings(&settings).is_err());
+        settings.public_key = None;
+        settings.show = true;
+        assert!(validate_reality_client_settings(&settings).is_err());
+        settings.show = false;
+        settings.master_key_log = Some("reality.keys".into());
+        assert!(validate_reality_client_settings(&settings).is_err());
+
+        let mut reality = settings;
+        reality.master_key_log = None;
+        let detail = NodeDetail {
+            name: "reality-client".into(),
+            protocol: Some("vless".into()),
+            address: Some("127.0.0.1:443".into()),
+            secure: Some(NodeSecure {
+                fingerprint: Some("chrome".into()),
+                utls: Some("firefox".into()),
+                reality: Some(true),
+                reality_settings: Some(reality),
+                ..NodeSecure::default()
+            }),
+            ..NodeDetail::default()
+        };
+        assert!(detail_to_parsed(&detail).is_err());
+    }
+
+    #[test]
+    fn reality_client_camel_and_snake_fields_deserialize_without_loss() {
+        let key = base64url_bytes(7, 32);
+        let verify = base64url_bytes(9, 1952);
+        let settings: RealityClientSettings = serde_yaml::from_str(&format!(
+            r#"
+fp: chrome
+server_name: camouflage.example
+pbk: {key}
+short-id: 0123456789abcdef
+mldsa65_verify: {verify}
+spiderX: /cover?p=4
+show: false
+master_key_log: none
+"#
+        ))
+        .unwrap();
+        validate_reality_client_settings(&settings).unwrap();
+        assert_eq!(settings.fingerprint, "chrome");
+        assert_eq!(settings.server_name, "camouflage.example");
+        assert_eq!(settings.password.as_deref(), Some(key.as_str()));
+        assert_eq!(settings.short_id, "0123456789abcdef");
+        assert_eq!(settings.mldsa65_verify.as_deref(), Some(verify.as_str()));
+        assert_eq!(settings.spider_x, "/cover?p=4");
+        assert_eq!(settings.master_key_log.as_deref(), Some("none"));
+
+        assert!(
+            serde_yaml::from_str::<RealityClientSettings>(&format!(
+                "serverName: a\npassword: {key}\nshortId: ''\nspiderX: /\npublicKye: typo\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn cn_smart_preset_expanded() {
         let plan = compile_cfg(
             r#"
@@ -1504,6 +2114,87 @@ listen:
         assert_eq!(
             plan.listen.panel.unwrap().socket_addr().unwrap(),
             "[::1]:9090".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn non_loopback_panel_requires_ui_secret() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 9090
+  share: home
+ui:
+  on: true
+"#,
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("ui.secret") || msg.contains("未鉴权"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_loopback_panel_with_secret_is_allowed() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 9090
+  share: home
+ui:
+  on: true
+  secret: "test-secret-please-change"
+"#,
+        );
+        assert_eq!(plan.listen.panel.as_ref().unwrap().host, "0.0.0.0");
+        assert_eq!(plan.ui.secret.as_deref(), Some("test-secret-please-change"));
+    }
+
+    #[test]
+    fn loopback_panel_allows_empty_secret() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: "127.0.0.1:9090"
+  share: false
+ui:
+  on: true
+"#,
+        );
+        assert!(plan.ui.secret.is_none() || plan.ui.secret.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn choose_chain_is_rejected_at_compile() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#A"]
+groups:
+  relay:
+    choose: chain
+    use: [nodes]
+    path: [A]
+route:
+  preset: direct
+"#,
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("chain") && msg.contains("尚未实现"),
+            "unexpected error: {msg}"
         );
     }
 

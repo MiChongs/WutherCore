@@ -222,4 +222,4 @@ python scripts/check-repository.py
 
 ## License
 
-WutherCore 使用 [MIT License](LICENSE) 开源。
+除 `third_party/xray-transport` 之外使用 [MIT License](LICENSE) 开源，`third_party/xray-transport` 使用 [MPL License](third_party/xray-transport/LICENSE-MPL-2.0)

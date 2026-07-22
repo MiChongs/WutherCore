@@ -9,7 +9,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::error::{ConfigError, ConfigResult};
+use crate::{
+    error::{ConfigError, ConfigResult},
+    model::RealityClientSettings,
+};
 
 /// 出站类型枚举（与 `core-outbound::OutboundKind` 对齐）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +110,10 @@ pub struct ParsedNode {
     pub method: Option<String>,
     pub tls: bool,
     pub sni: Option<String>,
+    /// 完整 REALITY 客户端配置；不得降级为字符串 params，否则二进制密钥、
+    /// 默认值和冲突信息都会丢失。
+    #[serde(default)]
+    pub reality: Option<RealityClientSettings>,
     pub transport: String,
     pub udp: bool,
     /// 原始 URI，便于调试与 explain。
@@ -133,6 +140,7 @@ impl ParsedNode {
             method: None,
             tls: false,
             sni: None,
+            reality: None,
             transport: "tcp".into(),
             udp: true,
             raw: String::new(),
@@ -235,6 +243,12 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
         .get("sni")
         .cloned()
         .or_else(|| params.get("peer").cloned());
+    if params
+        .get("security")
+        .is_some_and(|security| security.eq_ignore_ascii_case("reality"))
+    {
+        node.reality = Some(reality_settings_from_params(&params, &node.host)?);
+    }
     node.transport = params.get("type").cloned().unwrap_or_else(|| "tcp".into());
     let user = url.username();
     if !user.is_empty() {
@@ -263,6 +277,135 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     }
     node.params = params;
     Ok(node)
+}
+
+fn reality_settings_from_params(
+    params: &std::collections::BTreeMap<String, String>,
+    fallback_server_name: &str,
+) -> ConfigResult<RealityClientSettings> {
+    let get_unique = |names: &[&str]| -> ConfigResult<Option<String>> {
+        let mut found: Option<(&str, &String)> = None;
+        for name in names {
+            if let Some(value) = params.get(*name) {
+                if let Some((previous_name, previous)) = found {
+                    if previous != value {
+                        return Err(ConfigError::bad_node(format!(
+                            "REALITY 参数 `{previous_name}` 与 `{name}` 冲突"
+                        )));
+                    }
+                } else {
+                    found = Some((name, value));
+                }
+            }
+        }
+        Ok(found.map(|(_, value)| value.clone()))
+    };
+
+    let password = get_unique(&["password", "pbk"])?;
+    let public_key = get_unique(&["publicKey", "public_key"])?;
+    if password.is_some() && public_key.is_some() && password != public_key {
+        return Err(ConfigError::bad_node(
+            "REALITY password/pbk 与 publicKey 值冲突",
+        ));
+    }
+    let settings = RealityClientSettings {
+        fingerprint: get_unique(&["fingerprint", "fp"])?.unwrap_or_else(|| "chrome".into()),
+        server_name: get_unique(&["serverName", "server_name", "sni"])?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| fallback_server_name.to_owned()),
+        password,
+        public_key,
+        short_id: get_unique(&["shortId", "short_id", "sid"])?.unwrap_or_default(),
+        mldsa65_verify: get_unique(&["mldsa65Verify", "mldsa65_verify", "pqv"])?,
+        spider_x: get_unique(&["spiderX", "spider_x", "spx"])?.unwrap_or_else(|| "/".into()),
+        show: params
+            .get("show")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        master_key_log: get_unique(&["masterKeyLog", "master_key_log"])?,
+    };
+    validate_reality_client_settings(&settings)?;
+    Ok(settings)
+}
+
+pub(crate) fn validate_reality_client_settings(
+    settings: &RealityClientSettings,
+) -> ConfigResult<()> {
+    use base64::Engine as _;
+
+    if settings.show {
+        return Err(ConfigError::bad_node(
+            "REALITY show 会输出握手密钥材料，WutherCore 出于密钥安全不提供该选项",
+        ));
+    }
+    if settings
+        .master_key_log
+        .as_deref()
+        .is_some_and(|value| !value.is_empty() && value != "none")
+    {
+        return Err(ConfigError::bad_node(
+            "REALITY masterKeyLog 会把会话密钥写入磁盘，WutherCore 出于密钥安全不提供该选项",
+        ));
+    }
+    if settings.server_name.trim().is_empty() {
+        return Err(ConfigError::bad_node("REALITY serverName 不能为空"));
+    }
+    let fingerprint = xray_utls::normalize_reality_supported_fingerprint(&settings.fingerprint)
+        .ok_or_else(|| {
+            ConfigError::bad_node(format!(
+                "未知或不具备 TLS 1.3 X25519 key-share 的 REALITY fingerprint：`{}`",
+                settings.fingerprint
+            ))
+        })?;
+    if fingerprint == "unsafe" || fingerprint == "hellogolang" {
+        return Err(ConfigError::bad_node(format!(
+            "REALITY 不接受 fingerprint `{fingerprint}`"
+        )));
+    }
+    let key = match (&settings.password, &settings.public_key) {
+        (Some(password), Some(public_key)) if password != public_key => {
+            return Err(ConfigError::bad_node(
+                "REALITY password 与 publicKey 同时配置但值不一致",
+            ));
+        }
+        (Some(password), _) => password,
+        (_, Some(public_key)) => public_key,
+        (None, None) => return Err(ConfigError::bad_node("REALITY password/publicKey 不能为空")),
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .map_err(|error| {
+            ConfigError::bad_node(format!("REALITY password 不是合法 base64url：{error}"))
+        })?;
+    if decoded.len() != 32 {
+        return Err(ConfigError::bad_node(
+            "REALITY password/publicKey 必须解码为 32 字节",
+        ));
+    }
+    if settings.short_id.len() > 16 || settings.short_id.len() % 2 != 0 {
+        return Err(ConfigError::bad_node(
+            "REALITY shortId 必须是 0 到 16 个偶数长度十六进制字符",
+        ));
+    }
+    hex::decode(&settings.short_id)
+        .map_err(|error| ConfigError::bad_node(format!("REALITY shortId 非法：{error}")))?;
+    if let Some(verify) = &settings.mldsa65_verify {
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(verify)
+            .map_err(|error| {
+                ConfigError::bad_node(format!("REALITY mldsa65Verify 不是合法 base64url：{error}"))
+            })?;
+        if decoded.len() != 1952 {
+            return Err(ConfigError::bad_node(
+                "REALITY mldsa65Verify 必须解码为 1952 字节",
+            ));
+        }
+    }
+    if !settings.spider_x.starts_with('/') {
+        return Err(ConfigError::bad_node("REALITY spiderX 必须以 `/` 开头"));
+    }
+    url::Url::parse(&format!("https://reality.invalid{}", settings.spider_x))
+        .map_err(|error| ConfigError::bad_node(format!("REALITY spiderX 非法：{error}")))?;
+    Ok(())
 }
 
 fn parse_http_socks(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
@@ -444,6 +587,41 @@ mod tests {
         assert_eq!(n.port, 443);
         assert!(n.tls);
         assert_eq!(n.transport, "ws");
+    }
+
+    #[test]
+    fn parse_vless_reality_preserves_typed_security_fields() {
+        let node = parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443?security=reality&sni=cover.example&fp=chrome&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&sid=0123456789abcdef&spx=%2Fnews%3Fp%3D10-20#REALITY",
+        )
+        .unwrap();
+        let reality = node.reality.expect("typed REALITY settings");
+        assert_eq!(reality.server_name, "cover.example");
+        assert_eq!(reality.fingerprint, "chrome");
+        assert_eq!(reality.short_id, "0123456789abcdef");
+        assert_eq!(reality.spider_x, "/news?p=10-20");
+        assert!(reality.password.is_some());
+        assert!(node.tls);
+    }
+
+    #[test]
+    fn parse_vless_reality_rejects_alias_conflicts() {
+        let error = parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443?security=reality&sni=cover.example&fp=chrome&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&publicKey=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=00",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("冲突"), "{error}");
+    }
+
+    #[test]
+    fn parse_vless_reality_rejects_key_share_incapable_fingerprint() {
+        let error = parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443?security=reality&sni=cover.example&fp=android&pbk=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc&sid=00",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fingerprint"), "{error}");
     }
 
     #[test]

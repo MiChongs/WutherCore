@@ -103,9 +103,12 @@ impl Hysteria2Outbound {
         let target_addr = resolve_first(&self.host, self.port).await?;
 
         // 2) 准备 rustls 客户端配置
-        let mut tls_config = RustlsConfig::builder()
-            .with_root_certificates(root_store())
-            .with_no_client_auth();
+        let mut tls_config =
+            RustlsConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("rustls ring default protocols")
+                .with_root_certificates(root_store())
+                .with_no_client_auth();
         tls_config.alpn_protocols = self.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
         if self.insecure {
             tls_config

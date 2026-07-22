@@ -207,6 +207,269 @@ pub struct Listen {
     pub share: Option<Share>,
     #[serde(default)]
     pub auth: Vec<String>,
+    /// REALITY 是一层入站流安全协议；每个条目独立监听并在认证后交给
+    /// `protocol` 指定的内层代理协议。
+    #[serde(default, alias = "reality-inbounds", alias = "reality_inbounds")]
+    pub reality: Vec<RealityListen>,
+}
+
+/// Xray REALITY 服务端监听配置。
+///
+/// 字段名同时接受 Xray 的 camelCase 与本项目常用的 snake/kebab 写法；
+/// 未知字段一律拒绝，避免把密钥或限速字段拼错后静默降级。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityListen {
+    #[serde(default = "default_reality_listen_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_reality_inner_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(default)]
+    pub target: Option<RealityTarget>,
+    #[serde(default)]
+    pub dest: Option<RealityTarget>,
+    #[serde(default, rename = "type", alias = "target_type", alias = "target-type")]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub show: bool,
+    #[serde(
+        default,
+        rename = "masterKeyLog",
+        alias = "master_key_log",
+        alias = "master-key-log"
+    )]
+    pub master_key_log: Option<String>,
+    #[serde(default)]
+    pub xver: u8,
+    #[serde(
+        default,
+        rename = "serverNames",
+        alias = "server_names",
+        alias = "server-names"
+    )]
+    pub server_names: Vec<String>,
+    #[serde(
+        default,
+        rename = "privateKey",
+        alias = "private_key",
+        alias = "private-key"
+    )]
+    pub private_key: String,
+    #[serde(
+        default,
+        rename = "minClientVer",
+        alias = "min_client_ver",
+        alias = "min-client-ver"
+    )]
+    pub min_client_ver: Option<String>,
+    #[serde(
+        default,
+        rename = "maxClientVer",
+        alias = "max_client_ver",
+        alias = "max-client-ver"
+    )]
+    pub max_client_ver: Option<String>,
+    /// 与 Xray 一致，单位为毫秒；0 表示不限制时钟差。
+    #[serde(
+        default,
+        rename = "maxTimeDiff",
+        alias = "max_time_diff",
+        alias = "max-time-diff"
+    )]
+    pub max_time_diff_ms: u64,
+    #[serde(default, rename = "shortIds", alias = "short_ids", alias = "short-ids")]
+    pub short_ids: Vec<String>,
+    #[serde(
+        default,
+        rename = "mldsa65Seed",
+        alias = "mldsa65_seed",
+        alias = "mldsa65-seed"
+    )]
+    pub mldsa65_seed: Option<String>,
+    #[serde(
+        default,
+        rename = "limitFallbackUpload",
+        alias = "limit_fallback_upload",
+        alias = "limit-fallback-upload"
+    )]
+    pub limit_fallback_upload: RealityFallbackLimit,
+    #[serde(
+        default,
+        rename = "limitFallbackDownload",
+        alias = "limit_fallback_download",
+        alias = "limit-fallback-download"
+    )]
+    pub limit_fallback_download: RealityFallbackLimit,
+    #[serde(default)]
+    pub limits: RealityResourceLimits,
+}
+
+impl std::fmt::Debug for RealityListen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RealityListen")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("user_count", &self.users.len())
+            .field("target", &self.target)
+            .field("dest", &self.dest)
+            .field("target_type", &self.target_type)
+            .field("show", &self.show)
+            .field(
+                "master_key_log",
+                &self.master_key_log.as_ref().map(|_| "<redacted>"),
+            )
+            .field("xver", &self.xver)
+            .field("server_names", &self.server_names)
+            .field("private_key", &"<redacted>")
+            .field("min_client_ver", &self.min_client_ver)
+            .field("max_client_ver", &self.max_client_ver)
+            .field("max_time_diff_ms", &self.max_time_diff_ms)
+            .field("short_id_count", &self.short_ids.len())
+            .field("has_mldsa65_seed", &self.mldsa65_seed.is_some())
+            .field("limit_fallback_upload", &self.limit_fallback_upload)
+            .field("limit_fallback_download", &self.limit_fallback_download)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RealityTarget {
+    Port(u16),
+    Address(String),
+}
+
+impl RealityTarget {
+    pub fn normalized(&self) -> String {
+        match self {
+            Self::Port(port) => format!("localhost:{port}"),
+            Self::Address(address) => address.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealityFallbackLimit {
+    #[serde(
+        default,
+        rename = "afterBytes",
+        alias = "after_bytes",
+        alias = "after-bytes"
+    )]
+    pub after_bytes: u64,
+    #[serde(
+        default,
+        rename = "bytesPerSec",
+        alias = "bytes_per_sec",
+        alias = "bytes-per-sec"
+    )]
+    pub bytes_per_sec: u64,
+    #[serde(
+        default,
+        rename = "burstBytesPerSec",
+        alias = "burst_bytes_per_sec",
+        alias = "burst-bytes-per-sec"
+    )]
+    pub burst_bytes_per_sec: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealityResourceLimits {
+    #[serde(
+        default = "default_reality_handshake_timeout",
+        with = "humantime_serde",
+        alias = "handshake-timeout",
+        alias = "handshakeTimeout"
+    )]
+    pub handshake_timeout: Duration,
+    #[serde(
+        default = "default_reality_target_handshake_timeout",
+        with = "humantime_serde",
+        alias = "target-handshake-timeout",
+        alias = "targetHandshakeTimeout"
+    )]
+    pub target_handshake_timeout: Duration,
+    #[serde(
+        default = "default_reality_idle_timeout",
+        with = "humantime_serde",
+        alias = "idle-timeout",
+        alias = "idleTimeout"
+    )]
+    pub idle_timeout: Duration,
+    #[serde(
+        default = "default_reality_max_client_hello_records",
+        alias = "max-client-hello-records",
+        alias = "maxClientHelloRecords"
+    )]
+    pub max_client_hello_records: usize,
+    #[serde(
+        default = "default_reality_max_client_hello_record_payload",
+        alias = "max-client-hello-record-payload",
+        alias = "maxClientHelloRecordPayload"
+    )]
+    pub max_client_hello_record_payload: usize,
+    #[serde(
+        default = "default_reality_max_client_hello_bytes",
+        alias = "max-client-hello-bytes",
+        alias = "maxClientHelloBytes"
+    )]
+    pub max_client_hello_bytes: usize,
+    #[serde(
+        default = "default_reality_max_client_hello_wire_bytes",
+        alias = "max-client-hello-wire-bytes",
+        alias = "maxClientHelloWireBytes"
+    )]
+    pub max_client_hello_wire_bytes: usize,
+    #[serde(
+        default = "default_reality_max_target_records",
+        alias = "max-target-records",
+        alias = "maxTargetRecords"
+    )]
+    pub max_target_records: usize,
+    #[serde(
+        default = "default_reality_max_target_handshake_bytes",
+        alias = "max-target-handshake-bytes",
+        alias = "maxTargetHandshakeBytes"
+    )]
+    pub max_target_handshake_bytes: usize,
+    #[serde(
+        default = "default_reality_application_buffer_bytes",
+        alias = "application-buffer-bytes",
+        alias = "applicationBufferBytes"
+    )]
+    pub application_buffer_bytes: usize,
+    #[serde(
+        default = "default_reality_max_concurrent_handshakes",
+        alias = "max-concurrent-handshakes",
+        alias = "maxConcurrentHandshakes"
+    )]
+    pub max_concurrent_handshakes: usize,
+}
+
+impl Default for RealityResourceLimits {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: default_reality_handshake_timeout(),
+            target_handshake_timeout: default_reality_target_handshake_timeout(),
+            idle_timeout: default_reality_idle_timeout(),
+            max_client_hello_records: default_reality_max_client_hello_records(),
+            max_client_hello_record_payload: default_reality_max_client_hello_record_payload(),
+            max_client_hello_bytes: default_reality_max_client_hello_bytes(),
+            max_client_hello_wire_bytes: default_reality_max_client_hello_wire_bytes(),
+            max_target_records: default_reality_max_target_records(),
+            max_target_handshake_bytes: default_reality_max_target_handshake_bytes(),
+            application_buffer_bytes: default_reality_application_buffer_bytes(),
+            max_concurrent_handshakes: default_reality_max_concurrent_handshakes(),
+        }
+    }
 }
 
 /// listen.local 支持端口写法 / 完整对象。
@@ -324,6 +587,7 @@ pub struct NodeDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeLogin {
     #[serde(default)]
     pub user: Option<String>,
@@ -336,6 +600,7 @@ pub struct NodeLogin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSecure {
     #[serde(default)]
     pub tls: bool,
@@ -347,11 +612,117 @@ pub struct NodeSecure {
     pub utls: Option<String>,
     #[serde(default)]
     pub reality: Option<bool>,
+    #[serde(
+        default,
+        rename = "realitySettings",
+        alias = "reality_settings",
+        alias = "reality-settings"
+    )]
+    pub reality_settings: Option<RealityClientSettings>,
     #[serde(default)]
     pub ech: Option<bool>,
 }
 
+/// Xray REALITY 客户端字段。`password` 是 Xray 新名称，`publicKey` 为兼容旧名称；
+/// 编译阶段会做冲突检测与统一解码。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityClientSettings {
+    #[serde(default = "default_reality_fingerprint", alias = "fp")]
+    pub fingerprint: String,
+    #[serde(
+        default,
+        rename = "serverName",
+        alias = "server_name",
+        alias = "server-name",
+        alias = "sni"
+    )]
+    pub server_name: String,
+    #[serde(default, alias = "pbk")]
+    pub password: Option<String>,
+    #[serde(
+        default,
+        rename = "publicKey",
+        alias = "public_key",
+        alias = "public-key"
+    )]
+    pub public_key: Option<String>,
+    #[serde(
+        default,
+        rename = "shortId",
+        alias = "short_id",
+        alias = "short-id",
+        alias = "sid"
+    )]
+    pub short_id: String,
+    #[serde(
+        default,
+        rename = "mldsa65Verify",
+        alias = "mldsa65_verify",
+        alias = "mldsa65-verify",
+        alias = "pqv"
+    )]
+    pub mldsa65_verify: Option<String>,
+    #[serde(
+        default = "default_reality_spider_x",
+        rename = "spiderX",
+        alias = "spider_x",
+        alias = "spider-x",
+        alias = "spx"
+    )]
+    pub spider_x: String,
+    #[serde(default)]
+    pub show: bool,
+    #[serde(
+        default,
+        rename = "masterKeyLog",
+        alias = "master_key_log",
+        alias = "master-key-log"
+    )]
+    pub master_key_log: Option<String>,
+}
+
+impl Default for RealityClientSettings {
+    fn default() -> Self {
+        Self {
+            fingerprint: default_reality_fingerprint(),
+            server_name: String::new(),
+            password: None,
+            public_key: None,
+            short_id: String::new(),
+            mldsa65_verify: None,
+            spider_x: default_reality_spider_x(),
+            show: false,
+            master_key_log: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for RealityClientSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RealityClientSettings")
+            .field("fingerprint", &self.fingerprint)
+            .field("server_name", &self.server_name)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "public_key",
+                &self.public_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("short_id", &"<redacted>")
+            .field("has_mldsa65_verify", &self.mldsa65_verify.is_some())
+            .field("spider_x", &self.spider_x)
+            .field("show", &self.show)
+            .field(
+                "master_key_log",
+                &self.master_key_log.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeTransport {
     #[serde(default = "default_transport")]
     pub kind: String,
@@ -364,6 +735,7 @@ pub struct NodeTransport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeNetwork {
     #[serde(default = "default_true")]
     pub udp: bool,
@@ -1369,6 +1741,51 @@ pub struct TailscaleUserspaceProxy {
 
 fn default_localhost() -> String {
     "127.0.0.1".into()
+}
+fn default_reality_listen_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_reality_inner_protocol() -> String {
+    "vless".into()
+}
+fn default_reality_fingerprint() -> String {
+    "chrome".into()
+}
+fn default_reality_spider_x() -> String {
+    "/".into()
+}
+fn default_reality_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_reality_target_handshake_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_reality_idle_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+fn default_reality_max_client_hello_records() -> usize {
+    16
+}
+fn default_reality_max_client_hello_record_payload() -> usize {
+    16_640
+}
+fn default_reality_max_client_hello_bytes() -> usize {
+    u16::MAX as usize
+}
+fn default_reality_max_client_hello_wire_bytes() -> usize {
+    96 * 1024
+}
+fn default_reality_max_target_records() -> usize {
+    12
+}
+fn default_reality_max_target_handshake_bytes() -> usize {
+    96 * 1024
+}
+fn default_reality_application_buffer_bytes() -> usize {
+    256 * 1024
+}
+fn default_reality_max_concurrent_handshakes() -> usize {
+    1024
 }
 fn default_true() -> bool {
     true
