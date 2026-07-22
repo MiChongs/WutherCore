@@ -48,7 +48,7 @@ dependencies = [
  "aead",
  "aes",
  "cipher 0.4.4",
- "ctr",
+ "ctr 0.9.2",
  "ghash",
  "subtle",
  "zeroize",
@@ -1049,7 +1049,7 @@ dependencies = [
  "core-config",
  "core-reality",
  "crc32fast",
- "ctr",
+ "ctr 0.10.1",
  "curve25519-dalek",
  "fnv",
  "futures",
@@ -1349,6 +1349,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher 0.4.4",
+]
+
+[[package]]
+name = "ctr"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -3551,7 +3560,7 @@ dependencies = [
  "byteorder",
  "cbc",
  "chacha20 0.9.1",
- "ctr",
+ "ctr 0.9.2",
  "curve25519-dalek",
  "des",
  "digest 0.10.7",
@@ -3605,7 +3614,7 @@ dependencies = [
  "block-padding",
  "byteorder",
  "cbc",
- "ctr",
+ "ctr 0.9.2",
  "data-encoding",
  "der 0.7.10",
  "digest 0.10.7",
@@ -4172,7 +4181,7 @@ dependencies = [
  "cbc",
  "chacha20 0.9.1",
  "cipher 0.4.4",
- "ctr",
+ "ctr 0.9.2",
  "poly1305",
  "ssh-encoding",
  "subtle",
