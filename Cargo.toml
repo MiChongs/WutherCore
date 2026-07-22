@@ -120,7 +120,7 @@ quinn             = { version = "0.11", default-features = false, features = ["r
 quinn-proto       = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
 
 # SSH 客户端
-russh             = "0.46"
+russh             = "0.61"
 russh-keys        = "0.46"
 
 # WireGuard 用户态
