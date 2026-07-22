@@ -73,9 +73,6 @@ jobs:
           - target: s390x-unknown-linux-gnu
             name: linux-s390x
             is_android: false
-          - target: x86_64-pc-windows-gnu
-            name: windows-amd64-gnu
-            is_android: false
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
@@ -106,6 +103,11 @@ jobs:
             . -> target
           cache-bin: false
           cache-on-failure: true
+          # cross executes host-side proc macros inside target-specific containers.
+          # Reusing target/ outside those containers can introduce an incompatible
+          # glibc ABI, so Cross jobs cache registries only. Android builds run on
+          # the host and can safely reuse their target directories.
+          cache-targets: ${{ matrix.platform.is_android }}
 
       - name: Install cargo-ndk
         if: matrix.platform.is_android == true

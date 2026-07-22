@@ -72,7 +72,6 @@ git push origin v0.4.0
 | Linux GNU | AMD64、ARM64、i686、s390x |
 | Linux musl | AMD64、ARM64 |
 | Android | ARM64、ARMv7 |
-| Windows GNU | AMD64 |
 | Windows MSVC | AMD64、ARM64 |
 | macOS | Intel、Apple Silicon |
 
