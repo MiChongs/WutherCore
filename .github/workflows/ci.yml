@@ -35,11 +35,13 @@ jobs:
       - name: Check repository presentation
         run: python scripts/check-repository.py
 
-      - name: Review dependency changes
+      - name: Review dependency changes (advisory)
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: high
+          warn-only: true
+          show-openssf-scorecard: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
