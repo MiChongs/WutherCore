@@ -59,9 +59,11 @@ git push origin v0.4.0
 2. 确认正式版提交属于 `main`；
 3. 在标签对应源码上运行完整 `Required CI`；
 4. 构建并冒烟验证所有原生平台产物；
-5. 生成版本化 ZIP、`SHA256SUMS` 和 GitHub Artifact Attestation；
-6. 使用 `.github/release.yml` 自动分类 Release Notes；
-7. 发布 GitHub Release，并按照标签设置 Pre-release 或 Latest。
+5. 将每个平台 ZIP 作为非嵌套 artifact 上传，再按 `wuther-core-$VERSION-*` 前缀收集全部 12 个产物；
+6. 生成 `SHA256SUMS`，再汇总为零压缩的 `release-assets` artifact；
+7. 下载并解包汇总产物，生成 GitHub Artifact Attestation；
+8. 使用 `.github/release.yml` 自动分类 Release Notes；
+9. 直接上传文件到 GitHub Release，并按照标签设置 Pre-release 或 Latest。
 
 正式发布不会覆盖已经发布的同名 Release。若首次发布在上传阶段中断，重新运行可以续传仍处于 Draft 状态的 Release；已发布的资产保持不可变。
 

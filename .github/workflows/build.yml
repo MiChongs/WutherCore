@@ -95,19 +95,19 @@ jobs:
           local-cache: true
 
       - name: Cache Cargo
+        # Cross runs builds inside target-specific containers. Do not restore or
+        # save host-side Cargo/target caches for those jobs.
+        if: matrix.platform.is_android == true
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          shared-key: release
+          prefix-key: v1-wuther-core
+          shared-key: build-android
           key: ${{ matrix.platform.target }}
           workspaces: |
             . -> target
           cache-bin: false
           cache-on-failure: true
-          # cross executes host-side proc macros inside target-specific containers.
-          # Reusing target/ outside those containers can introduce an incompatible
-          # glibc ABI, so Cross jobs cache registries only. Android builds run on
-          # the host and can safely reuse their target directories.
-          cache-targets: ${{ matrix.platform.is_android }}
+          cache-targets: true
 
       - name: Install cargo-ndk
         if: matrix.platform.is_android == true
@@ -166,8 +166,8 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: wuther-core-${{ matrix.platform.name }}
           path: ./dist/*.zip
           if-no-files-found: error
-          compression-level: 0
+          archive: false
+          overwrite: true
           retention-days: ${{ inputs.retention-days || 1 }}
