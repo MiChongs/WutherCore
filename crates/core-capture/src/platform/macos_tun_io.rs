@@ -60,6 +60,7 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<MacUtunIo>, TunIoError> {
 
 impl MacUtunIo {
     /// 用 NEPacketTunnelProvider 注入的 fd 构造 —— fd 已经绑好 utun，无需 ioctl。
+    #[allow(unsafe_code)]
     pub fn from_injected_fd(fd: i32, name: String, mtu: u32) -> Result<Self, TunIoError> {
         // SAFETY: fd 由 Swift 侧 dup 给本进程，所有权交本进程；不会被宿主再 close。
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
