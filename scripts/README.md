@@ -1,5 +1,7 @@
 # WutherCore 多平台构建
 
+仓库的 GitHub Release 使用 [Release 工作流](../.github/workflows/release.yml) 自动构建并发布；本页脚本用于本地构建、调试工具链或复现单个平台问题。正式版与预发布的标签规则见 [发版指南](../docs/RELEASING.md)。
+
 ## 一键构建（Windows 主机）
 
 ```cmd
@@ -82,6 +84,8 @@ dist/
 - `wuther-core[.exe]` —— 内核可执行文件
 - `README.md`、`RP内核设计文档.md`
 - `examples/` —— 桌面、路由器、Android、订阅和手动节点模板
+
+GitHub Release 还会统一生成 `SHA256SUMS`，并为所有归档写入 GitHub Artifact Attestation。
 
 ## 平台支持矩阵
 

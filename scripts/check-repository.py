@@ -30,6 +30,7 @@ REQUIRED_FILES = (
     "docs/ARCHITECTURE.md",
     "docs/API.md",
     "docs/TROUBLESHOOTING.md",
+    "docs/RELEASING.md",
     "docs/assets/wuthercore-hero.jpg",
 )
 

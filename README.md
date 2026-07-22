@@ -10,12 +10,14 @@
 
 <p align="center">
   <a href="https://github.com/MiChongs/WutherCore/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/MiChongs/WutherCore/ci.yml?branch=main&label=Required%20CI&logo=github" alt="Required CI"></a>
+  <a href="https://github.com/MiChongs/WutherCore/releases"><img src="https://img.shields.io/github/v/release/MiChongs/WutherCore?include_prereleases&sort=semver&logo=github" alt="GitHub Release"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85%2B-CE422B?logo=rust&logoColor=white" alt="Rust 1.85+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3DA639" alt="MIT License"></a>
 </p>
 
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
+  <a href="#下载与版本通道">下载</a> ·
   <a href="docs/FEATURES.md">功能矩阵</a> ·
   <a href="docs/CONFIGURATION.md">配置指南</a> ·
   <a href="docs/ARCHITECTURE.md">架构</a> ·
@@ -70,6 +72,24 @@ WutherCore 读取 YAML 配置，负责订阅更新、节点选择、规则分流
 | Direct、Block、HTTP、SOCKS5、DNS Hijack | Shadowsocks、Shadowsocks 2022、SSR、Snell | Trojan、VLESS、VMess、AnyTLS | Hysteria、Hysteria 2、TUIC、WireGuard、SSH、Mieru、Sudoku、TrustTunnel |
 
 不同协议的 UDP、复用和传输层组合并不完全相同。功能矩阵只表示代码路径已经实现，不代替与具体服务端版本的兼容性测试。
+
+## 下载与版本通道
+
+预编译产物在 [GitHub Releases](https://github.com/MiChongs/WutherCore/releases) 提供，覆盖 Linux、Android、Windows 和 macOS 的主要架构。
+
+| 通道 | 版本格式 | 用途 |
+| --- | --- | --- |
+| Release | `vX.Y.Z` | 已完成正式发版检查，标记为 Latest |
+| Pre-release | `vX.Y.Z-alpha.N`、`beta.N`、`rc.N` | 提前验证新版本，不替代 Latest |
+
+每个版本都附带 `SHA256SUMS` 和 GitHub 构建证明。下载后可以校验：
+
+```bash
+sha256sum -c SHA256SUMS
+gh attestation verify <archive.zip> --repo MiChongs/WutherCore
+```
+
+标签规则、完整平台矩阵和维护者操作步骤见 [发版指南](docs/RELEASING.md)。
 
 ## 快速开始
 
@@ -205,6 +225,7 @@ wuther-core store reset                          清空学习数据
 | [内核设计文档](RP内核设计文档.md) | 更详细的设计背景和实现说明 |
 | [构建性能](docs/BUILD-PERF.md) | Cargo 构建与编译性能配置 |
 | [构建脚本](scripts/README.md) | 多平台构建脚本和产物 |
+| [发版指南](docs/RELEASING.md) | 正式版、预发布、标签、校验和构建证明 |
 
 ## 开发与协作
 

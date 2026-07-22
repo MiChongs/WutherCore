@@ -1,5 +1,22 @@
-name: Build and Release (Cross Matrix)
+name: Build Matrix
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; defaults to the triggering ref.
+        required: false
+        type: string
+        default: ""
+      version:
+        description: Optional version included in archive filenames.
+        required: false
+        type: string
+        default: ""
+      retention-days:
+        description: Artifact retention period.
+        required: false
+        type: number
+        default: 1
   workflow_dispatch:
   push:
     branches: ["main"]
@@ -38,6 +55,12 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
             is_android: false
+          - target: x86_64-unknown-linux-musl
+            name: linux-amd64-musl
+            is_android: false
+          - target: aarch64-unknown-linux-musl
+            name: linux-arm64-musl
+            is_android: false
           - target: aarch64-linux-android
             name: android-arm64
             is_android: true
@@ -51,12 +74,13 @@ jobs:
             name: linux-s390x
             is_android: false
           - target: x86_64-pc-windows-gnu
-            name: windows-amd64
+            name: windows-amd64-gnu
             is_android: false
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.1
         with:
+          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Setup Rust toolchain
@@ -98,21 +122,24 @@ jobs:
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
-          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release --locked
+          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release --locked -p wuther-core
 
       - name: Run Cross Build (Non-Android)
         if: matrix.platform.is_android != true
         run: |
-          cross build --release --locked --target ${{ matrix.platform.target }}
+          cross build --release --locked --target ${{ matrix.platform.target }} -p wuther-core
 
       - name: Package Artifacts
+        env:
+          PLATFORM_NAME: ${{ matrix.platform.name }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          mkdir -p ./dist
-          mkdir -p ./pkg_dir
+          set -euo pipefail
+          mkdir -p ./dist ./pkg_dir/licenses
           FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core"
 
           if [ -f "target/${{ matrix.platform.target }}/release/wuther-core.exe" ]; then
-            FILE_PATH="target/${{ matrix.platform.target}}/release/wuther-core.exe"
+            FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core.exe"
           fi
 
           if [ -f "$FILE_PATH" ]; then
@@ -122,15 +149,23 @@ jobs:
             exit 1
           fi
 
+          cp README.md LICENSE ./pkg_dir/
+          cp third_party/xray-transport/LICENSE-MPL-2.0 ./pkg_dir/licenses/xray-transport-MPL-2.0.txt
+          cp -R examples ./pkg_dir/
+
+          ARCHIVE_NAME="wuther-core-${PLATFORM_NAME}.zip"
+          if [ -n "$RELEASE_VERSION" ]; then
+            ARCHIVE_NAME="wuther-core-${RELEASE_VERSION}-${PLATFORM_NAME}.zip"
+          fi
+
           cd ./pkg_dir
-          zip -r ../dist/wuther-core-${{ matrix.platform.name }}.zip ./*
-          cd ..
+          zip -X -r "../dist/${ARCHIVE_NAME}" .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: wuther-core-${{ matrix.platform.name }}
-          path: ./dist/wuther-core-${{ matrix.platform.name }}.zip
+          path: ./dist/*.zip
           if-no-files-found: error
           compression-level: 0
-          retention-days: 1
+          retention-days: ${{ inputs.retention-days || 1 }}

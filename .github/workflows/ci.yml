@@ -1,6 +1,13 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to validate; defaults to the triggering ref.
+        required: false
+        type: string
+        default: ""
   pull_request:
     branches: ["main"]
   push:
@@ -11,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -30,6 +37,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
         with:
+          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Check repository presentation
