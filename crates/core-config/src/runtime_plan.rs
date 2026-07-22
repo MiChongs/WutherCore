@@ -177,6 +177,7 @@ pub fn compile(mut cfg: UserConfig) -> ConfigResult<RuntimePlan> {
     validate_capture_platform(&capture)?;
     let smart = cfg.smart.unwrap_or_default();
     let ui = cfg.ui.unwrap_or_default();
+    validate_ui_secret_for_bind(&listen, &ui)?;
     let mesh = cfg.mesh.unwrap_or_default();
     let find_process_mode = cfg.find_process_mode;
     Ok(RuntimePlan {
@@ -686,6 +687,16 @@ fn compile_groups(
     let valid_feeds: std::collections::HashSet<&str> =
         cfg.feeds.keys().map(|s| s.as_str()).collect();
     for (name, g) in &cfg.groups {
+        if g.choose == ChooseStrategy::Chain {
+            return Err(ConfigError::invalid(format!(
+                "groups.{name}.choose = chain 尚未实现多跳 relay"
+            ))
+            .at(format!("groups.{name}.choose"))
+            .hint(
+                "请改用 manual / smart / fast / stable / spread；\
+                     多跳链路实现前不会静默退化为单跳",
+            ));
+        }
         let mut members = Vec::new();
         for src in &g.r#use {
             if src == "nodes" {
@@ -1268,6 +1279,50 @@ fn try_classical_to_dsl(line: &str) -> Option<String> {
     };
 
     Some(format!("{} -> {}", lhs_parts.join(","), policy))
+}
+
+/// 非本机 API 面板暴露时必须配置 `ui.secret`，避免空 secret 的全开控制面。
+fn validate_ui_secret_for_bind(listen: &ListenPlan, ui: &Ui) -> ConfigResult<()> {
+    if !ui.on {
+        return Ok(());
+    }
+    let Some(panel) = listen.panel.as_ref() else {
+        return Ok(());
+    };
+    if is_loopback_bind_host(&panel.host) {
+        return Ok(());
+    }
+    let secret_ok = ui
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if secret_ok {
+        return Ok(());
+    }
+    Err(ConfigError::invalid(
+        "管理 API 绑定了非本机地址，但 ui.secret 为空；拒绝启动以避免未鉴权控制面",
+    )
+    .at("ui.secret")
+    .hint(
+        "为 ui.secret 设置足够长的随机串，或把 listen.panel / listen.share 限制在 127.0.0.1 / ::1；\
+             share: home|all 会把面板绑到 0.0.0.0",
+    ))
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn validate_capture_platform(c: &Capture) -> ConfigResult<()> {
@@ -2059,6 +2114,87 @@ listen:
         assert_eq!(
             plan.listen.panel.unwrap().socket_addr().unwrap(),
             "[::1]:9090".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn non_loopback_panel_requires_ui_secret() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 9090
+  share: home
+ui:
+  on: true
+"#,
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("ui.secret") || msg.contains("未鉴权"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_loopback_panel_with_secret_is_allowed() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: 9090
+  share: home
+ui:
+  on: true
+  secret: "test-secret-please-change"
+"#,
+        );
+        assert_eq!(plan.listen.panel.as_ref().unwrap().host, "0.0.0.0");
+        assert_eq!(plan.ui.secret.as_deref(), Some("test-secret-please-change"));
+    }
+
+    #[test]
+    fn loopback_panel_allows_empty_secret() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: "127.0.0.1:9090"
+  share: false
+ui:
+  on: true
+"#,
+        );
+        assert!(plan.ui.secret.is_none() || plan.ui.secret.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn choose_chain_is_rejected_at_compile() {
+        let error = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#A"]
+groups:
+  relay:
+    choose: chain
+    use: [nodes]
+    path: [A]
+route:
+  preset: direct
+"#,
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("chain") && msg.contains("尚未实现"),
+            "unexpected error: {msg}"
         );
     }
 

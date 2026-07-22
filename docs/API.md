@@ -18,7 +18,8 @@ ui:
     - "http://127.0.0.1:3000"
 ```
 
-没有配置 `ui.secret` 时，API 不鉴权，只适合严格本机监听。暴露到局域网或容器网络时必须配置密钥和 CORS allowlist。
+没有配置 `ui.secret` 时，API 不鉴权，**仅允许本机 loopback 监听**。  
+`listen.share: home|all`、`0.0.0.0`/`::` 或其它非本机 `listen.panel` 且 `ui.secret` 为空时，配置编译会失败（`check`/`run` 拒绝启动）。暴露到局域网或容器网络时还必须配置 CORS allowlist。
 
 ## 鉴权
 
@@ -35,6 +36,10 @@ x-api-secret: <secret>
 ```
 
 WebSocket/SSE 因浏览器协议限制，可使用 `?token=<secret>`。普通 GET/POST 不接受 query token，避免凭据进入访问日志和 Referer。
+
+Clash 兼容 `GET /configs` 的 `authentication` 字段只返回用户名列表，不回传 Mixed 入站密码。  
+`PUT /configs` 的 `mode`（`rule` / `global` / `direct`）会真正改变选路；`log-level` 更新运行时视图。  
+`allow-lan` / `tun.enable` 不能热切换：值与启动配置不同时返回 `501`，避免 dashboard 假安全控制。
 
 以下路径不要求密钥：
 

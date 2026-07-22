@@ -195,8 +195,10 @@ impl Runtime {
         }
 
         let mutable = MutableConfig {
+            // share=home/all 时 Mixed/API 绑定 0.0.0.0，与 Clash allow-lan 语义对齐。
+            allow_lan: !matches!(plan.listen.share, core_config::model::Share::False),
             tun_enable: plan.capture.on,
-            ipv6: true,
+            ipv6: plan.resolver.ipv6,
             ..MutableConfig::default()
         };
         let node_info = initial_node_info(&plan);
@@ -439,12 +441,27 @@ impl Runtime {
 
     pub fn pick_outbound_for_context(&self, ctx: FlowContext) -> RoutePick {
         self.metrics.inc_route();
-        let (decision, kind, source) = self.route.decide(&ctx);
+        // Clash `/configs` mode：rule 走规则；global 强制 route.final 组；direct 强制 DIRECT。
+        // 未接线前 dashboard 改 mode 是假热改；这里让 mode 真正影响选路。
+        let mode = self.mutable.read().mode.clone();
+        let (decision, kind, source) = match mode.to_ascii_lowercase().as_str() {
+            "direct" => (RouteDecision::Direct, "MODE", "mode:direct".into()),
+            "global" => (
+                global_mode_decision(&self.plan.route.r#final),
+                "MODE",
+                "mode:global".into(),
+            ),
+            _ => {
+                let (decision, kind, source) = self.route.decide(&ctx);
+                (decision, kind, source)
+            }
+        };
         debug!(
             target: "route",
             host = %ctx.host,
             port = ctx.port,
             network = ctx.network.as_str(),
+            mode = %mode,
             ?decision,
             kind,
             source = %source,
@@ -1074,7 +1091,17 @@ fn route_rule_name(kind: &str) -> &'static str {
         "network" | "proto" => "NETWORK",
         "process" => "PROCESS-NAME",
         "set" => "RULE-SET",
+        "MODE" | "mode" => "MODE",
         _ => "MATCH",
+    }
+}
+
+/// Clash `mode=global`：全部流量进 `route.final`（组 / DIRECT / BLOCK）。
+fn global_mode_decision(final_target: &str) -> RouteDecision {
+    match final_target {
+        "direct" | "DIRECT" => RouteDecision::Direct,
+        "block" | "BLOCK" | "REJECT" | "reject" => RouteDecision::Block,
+        other => RouteDecision::Group(other.to_string()),
     }
 }
 
@@ -1772,6 +1799,63 @@ find-process-mode: strict
             runtime.process_finder.is_some(),
             "find-process-mode: strict → finder 必须构建"
         );
+    }
+
+    #[test]
+    fn mutable_mode_direct_bypasses_rules() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: global
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        // rule 模式应进 main 组。
+        let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(rule_pick.label, "HK");
+
+        runtime.mutable.write().mode = "direct".into();
+        let direct_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(direct_pick.label, "DIRECT");
+        assert_eq!(direct_pick.rule, "MODE");
+    }
+    #[test]
+    fn mutable_mode_global_forces_final_group() {
+        let plan = load_plan(
+            r#"
+version: 1
+profile: desktop
+listen:
+  panel: false
+nodes: ["ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#HK"]
+groups:
+  main:
+    choose: manual
+    use: [nodes]
+route:
+  preset: direct
+  final: main
+"#,
+        );
+        let runtime = Runtime::build(plan);
+        // direct preset 默认应 DIRECT。
+        let rule_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(rule_pick.label, "DIRECT");
+
+        runtime.mutable.write().mode = "global".into();
+        let global_pick = runtime.pick_outbound("www.google.com", 443, NetworkKind::Tcp);
+        assert_eq!(global_pick.label, "HK");
+        assert_eq!(global_pick.rule, "MODE");
     }
 
     #[test]

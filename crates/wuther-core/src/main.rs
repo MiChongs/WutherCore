@@ -16,9 +16,7 @@ use clap::{Parser, Subcommand};
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_inbound::{
-    MixedListener, RealityListener, ensure_best_effort_privilege, run_mixed, run_reality,
-};
+use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
 use core_store::Store;
@@ -880,7 +878,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     };
 
     // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
+    // auto_route / auto_redirect 会改系统路由：启动失败必须 fail-closed，
+    // 不能 warn 后继续跑“半透明代理”状态。
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
+    let capture_fail_closed = plan.capture.on
+        && (plan.capture.tun.auto_route
+            || plan.capture.tun.auto_redirect
+            || matches!(
+                plan.capture.method,
+                core_config::model::CaptureMethod::Tproxy
+                    | core_config::model::CaptureMethod::Redirect
+            ));
     match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6) {
         Ok(Some(sup)) => {
             // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
@@ -888,6 +896,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 index: ruleset_index.clone(),
             }));
             if let Err(e) = sup.start(runtime.clone()).await {
+                if capture_fail_closed {
+                    // 尽力停掉可能半装好的状态，再把错误抛给 CLI。
+                    let _ = sup.stop().await;
+                    let _ = mesh_supervisor.stop().await;
+                    runtime.shutdown().await;
+                    anyhow::bail!(
+                        "capture supervisor start failed under auto_route/tproxy/redirect \
+                         (fail-closed): {e}"
+                    );
+                }
                 warn!(target: "capture", error = %e, "capture supervisor start failed");
                 // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
                 // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
@@ -904,7 +922,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             }
         }
         Ok(None) => {}
-        Err(e) => warn!(target: "capture", error = %e, "capture supervisor build failed"),
+        Err(e) => {
+            if capture_fail_closed {
+                let _ = mesh_supervisor.stop().await;
+                runtime.shutdown().await;
+                anyhow::bail!(
+                    "capture supervisor build failed under auto_route/tproxy/redirect \
+                     (fail-closed): {e}"
+                );
+            }
+            warn!(target: "capture", error = %e, "capture supervisor build failed");
+        }
     }
 
     let mut handles = Vec::new();
@@ -965,21 +993,6 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         info!(addr = %addr, udp = mixed.udp, "mixed inbound: HTTP+SOCKS5 ready");
     } else {
         info!("listen.local 未配置，跳过 Mixed 入站");
-    }
-
-    // REALITY 入站。构造阶段会再次做密钥与资源上限的防御性校验；监听
-    // future 直接持有真实 RealityServer，不存在普通 TLS 或占位回退路径。
-    for config in &plan.listen.reality {
-        let listener = RealityListener::from_config(config)
-            .map_err(|error| anyhow::anyhow!("REALITY listener configuration failed: {error}"))?;
-        let address = listener.listen_addr();
-        let rt = runtime.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(error) = run_reality(listener, rt).await {
-                warn!(target: "inbound::reality", %address, %error, "REALITY listener exited");
-            }
-        }));
-        info!(addr = %address, "VLESS-over-REALITY inbound ready");
     }
 
     // 控制面板/API
