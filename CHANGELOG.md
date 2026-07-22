@@ -14,6 +14,7 @@
 - `allow-lan` / `tun.enable` 热切换改为 `501`，不再写成功假象。
 - 非本机管理面板（`listen.share: home|all` 或非 loopback `listen.panel`）在 `ui.secret` 为空时拒绝编译/启动。
 - `groups.*.choose: chain` 在配置编译期拒绝，避免静默退化为单跳第一节点。
+- `auto_route` / TPROXY / REDIRECT 下 capture 启动失败改为 fail-closed。
 
 ### Added
 
