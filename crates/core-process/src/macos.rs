@@ -306,7 +306,10 @@ unsafe fn read_pidpath(pid: i32) -> Option<String> {
         return None;
     }
     buf.truncate(r as usize);
-    let cstr = CStr::from_bytes_with_nul(&[&buf[..], &[0]].concat()).ok()?;
+    let path_len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    buf.truncate(path_len);
+    buf.push(0);
+    let cstr = CStr::from_bytes_with_nul(&buf).ok()?;
     Some(cstr.to_string_lossy().into_owned())
 }
 
