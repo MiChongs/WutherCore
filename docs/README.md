@@ -22,6 +22,7 @@
 | [内核设计文档](../RP内核设计文档.md) | 完整设计背景和实现细节 |
 | [构建性能](BUILD-PERF.md) | Cargo profile、缓存与编译性能 |
 | [构建脚本](../scripts/README.md) | 多平台构建方式和产物 |
+| [发版指南](RELEASING.md) | Pre-release / Release 规则、标签、产物与校验 |
 | [参与贡献](../CONTRIBUTING.md) | 开发环境、提交要求和 Review 标准 |
 | [项目治理](../GOVERNANCE.md) | 合并门禁、角色和紧急处置 |
 | [路线图](../ROADMAP.md) | 1.0 前的工程重点和完成标准 |

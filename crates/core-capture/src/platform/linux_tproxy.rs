@@ -1105,7 +1105,8 @@ fn recvmsg_with_origdst(
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-    hdr.msg_controllen = control.0.len() as libc::size_t;
+    // glibc exposes msg_controllen as size_t while musl uses socklen_t.
+    hdr.msg_controllen = control.0.len() as _;
 
     // SAFETY: msghdr 字段全部初始化；recvmsg 写入 name/iov/control 不超过提供长度。
     let n = unsafe { libc::recvmsg(fd, &mut hdr, 0) };
@@ -1139,7 +1140,7 @@ unsafe fn extract_origdst(hdr: &libc::msghdr) -> Option<SocketAddr> {
             && cmsg_len
                 >= unsafe {
                     libc::CMSG_LEN(std::mem::size_of::<libc::sockaddr_in>() as libc::c_uint)
-                } as usize
+                } as _
         {
             let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in;
             let sa = unsafe { std::ptr::read_unaligned(data) };
@@ -1152,7 +1153,7 @@ unsafe fn extract_origdst(hdr: &libc::msghdr) -> Option<SocketAddr> {
             && cmsg_len
                 >= unsafe {
                     libc::CMSG_LEN(std::mem::size_of::<libc::sockaddr_in6>() as libc::c_uint)
-                } as usize
+                } as _
         {
             let data = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in6;
             let sa = unsafe { std::ptr::read_unaligned(data) };
