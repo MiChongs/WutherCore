@@ -51,6 +51,10 @@ pub struct FetchOptions {
     ///
     /// 同时限制两侧，避免无限 chunked response 与 gzip/brotli 解压炸弹。
     pub max_body_bytes: usize,
+    /// 是否跳过私网 / loopback / 元数据目标拦截。
+    ///
+    /// 生产路径保持 `false`（默认）；仅本地单测或显式诊断工具可打开。
+    pub allow_private_targets: bool,
 }
 
 impl Default for FetchOptions {
@@ -63,6 +67,7 @@ impl Default for FetchOptions {
             headers: Vec::new(),
             accept_encoding: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            allow_private_targets: false,
         }
     }
 }
@@ -101,6 +106,8 @@ pub enum FetchError {
     Decompress(String),
     #[error("响应体超过上限 ({limit} bytes)")]
     BodyTooLarge { limit: usize },
+    #[error("目标地址被安全策略拒绝: {0}")]
+    BlockedTarget(String),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -129,7 +136,12 @@ pub async fn fetch_raw(url: &str, opts: &FetchOptions) -> Result<FetchResult, Fe
 async fn fetch_inner(url: &str, opts: &FetchOptions) -> Result<FetchResult, FetchError> {
     let mut current = url.to_string();
     for hop in 0..opts.max_redirects {
-        debug!(target: "fetch", url = %current, hop, "GET");
+        // 日志只打 host，避免订阅 token 落盘。
+        let log_host = url::Url::parse(&current)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "-".into());
+        debug!(target: "fetch", host = %log_host, hop, "GET");
         let parsed = url::Url::parse(&current).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
@@ -139,6 +151,11 @@ async fn fetch_inner(url: &str, opts: &FetchOptions) -> Result<FetchResult, Fetc
             .host_str()
             .ok_or_else(|| FetchError::BadUrl("missing host".into()))?
             .to_string();
+        if !opts.allow_private_targets && core_outbound::is_blocked_host_literal(&host) {
+            return Err(FetchError::BlockedTarget(
+                core_outbound::blocked_target_message(&host),
+            ));
+        }
         let port = parsed
             .port_or_known_default()
             .ok_or_else(|| FetchError::BadUrl("unknown port for scheme".into()))?;
@@ -154,6 +171,12 @@ async fn fetch_inner(url: &str, opts: &FetchOptions) -> Result<FetchResult, Fetc
                 "no address resolved",
             ))
         })?;
+        // 解析后复查：防 DNS 指到内网 / 元数据（含 redirect 每一跳）。
+        if !opts.allow_private_targets && core_outbound::is_blocked_ip(peer.ip()) {
+            return Err(FetchError::BlockedTarget(
+                core_outbound::blocked_target_message(&peer.ip().to_string()),
+            ));
+        }
 
         // 2) 开 TCP 走 bind_outbound_socket —— 这才是本 crate 存在的核心理由。
         let tcp = tokio::time::timeout(opts.connect_timeout, connect_tcp_outbound_bound(peer))
@@ -183,10 +206,23 @@ async fn fetch_inner(url: &str, opts: &FetchOptions) -> Result<FetchResult, Fetc
                     url::Url::parse(&current).map_err(|e| FetchError::BadUrl(e.to_string()))?;
                 let next = base
                     .join(loc)
-                    .map_err(|e| FetchError::BadUrl(format!("redirect target invalid: {e}")))?
-                    .to_string();
-                debug!(target: "fetch", from = %current, to = %next, status, hop, "redirect");
-                current = next;
+                    .map_err(|e| FetchError::BadUrl(format!("redirect target invalid: {e}")))?;
+                if let Some(h) = next.host_str() {
+                    if !opts.allow_private_targets && core_outbound::is_blocked_host_literal(h) {
+                        return Err(FetchError::BlockedTarget(
+                            core_outbound::blocked_target_message(h),
+                        ));
+                    }
+                }
+                debug!(
+                    target: "fetch",
+                    from_host = %host,
+                    to_host = %next.host_str().unwrap_or("-"),
+                    status,
+                    hop,
+                    "redirect"
+                );
+                current = next.to_string();
                 continue;
             }
         }
@@ -521,6 +557,8 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             accept_encoding: false,
             max_body_bytes: 6,
+            // 本测用 127.0.0.1 本地 HTTP 服验证 chunked body 上限，需显式放行私网。
+            allow_private_targets: true,
             ..Default::default()
         };
         let error = fetch(&format!("http://{address}/rules"), &options)

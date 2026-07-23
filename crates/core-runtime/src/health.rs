@@ -59,6 +59,8 @@ pub enum DelayError {
     UnknownNode(String),
     #[error("URL 非法: {0}")]
     BadUrl(String),
+    #[error("目标被安全策略拒绝: {0}")]
+    BlockedTarget(String),
     #[error("dial 失败: {0}")]
     Dial(String),
     #[error("HTTP 失败: {0}")]
@@ -285,6 +287,33 @@ impl UrlTester {
         let unified = opts.unified_delay.unwrap_or(cfg.default_unified_delay);
 
         let parsed = parse_test_url(&url)?;
+        // 主机名字面量阶段先拦 loopback/metadata；解析后的 IP 再拦。
+        if core_outbound::is_blocked_host_literal(&parsed.host) {
+            return Err(DelayError::BlockedTarget(
+                core_outbound::blocked_target_message(&parsed.host),
+            ));
+        }
+        // 字面 IP 立即拒绝；域名先 resolve 再复查，避免 DNS rebinding 打到元数据。
+        if let Ok(ip) = parsed.host.parse::<std::net::IpAddr>() {
+            if core_outbound::is_blocked_ip(ip) {
+                return Err(DelayError::BlockedTarget(
+                    core_outbound::blocked_target_message(&parsed.host),
+                ));
+            }
+        } else {
+            match core_outbound::resolve_host(&parsed.host, parsed.port).await {
+                Ok(addrs) => {
+                    if addrs.iter().any(|a| core_outbound::is_blocked_ip(a.ip())) {
+                        return Err(DelayError::BlockedTarget(
+                            core_outbound::blocked_target_message(&parsed.host),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(DelayError::Dial(format!("resolve {}: {e}", parsed.host)));
+                }
+            }
+        }
         let ob = runtime
             .outbounds
             .read()
@@ -730,6 +759,15 @@ mod tests {
     #[test]
     fn rejects_unsupported_scheme() {
         assert!(parse_test_url("ws://x").is_err());
+    }
+
+    #[test]
+    fn parse_private_literal_is_still_parsed_for_policy_layer() {
+        // 解析层只认 scheme；私网拦截在 test_node_with 的 policy 层。
+        let p = parse_test_url("http://127.0.0.1/").unwrap();
+        assert_eq!(p.host, "127.0.0.1");
+        assert!(core_outbound::is_blocked_host_literal(&p.host));
+        assert!(core_outbound::is_blocked_ip("169.254.169.254".parse().unwrap()));
     }
 
     #[test]

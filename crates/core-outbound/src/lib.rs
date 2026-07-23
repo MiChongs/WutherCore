@@ -13,6 +13,7 @@
 #[allow(unsafe_code)]
 pub mod adapter;
 pub mod loopback;
+pub mod net_guard;
 pub mod registry;
 
 pub mod block;
@@ -43,4 +44,5 @@ pub use loopback::{
     LoopbackTcpGuard, LoopbackUdpGuard, TrackedTcpStream, is_loopback_tcp_source,
     is_loopback_udp_source, register_tcp, register_udp,
 };
+pub use net_guard::{blocked_target_message, is_blocked_host_literal, is_blocked_ip};
 pub use registry::{OutboundRegistry, ResolveFn};
