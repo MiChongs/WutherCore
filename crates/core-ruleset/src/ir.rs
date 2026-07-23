@@ -436,6 +436,36 @@ impl RulesetExpr {
             Self::Predicate(predicate) => predicate.item_count(),
         }
     }
+
+    fn visit_destination_ip_cidrs(&self, visitor: &mut impl FnMut(&IpNet) -> bool) -> bool {
+        match self {
+            Self::Any(children) | Self::All(children) => {
+                for child in children {
+                    if !child.visit_destination_ip_cidrs(visitor) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // This intentionally mirrors sing-box RuleSet.ExtractIPSet:
+            // route_address_set extracts every destination IP item from a
+            // logical rule, independent of the rule's boolean/invert shape.
+            Self::Not(child) => child.visit_destination_ip_cidrs(visitor),
+            Self::Predicate(RulesetPredicate::DstIpCidr(prefixes)) => prefixes.iter().all(visitor),
+            Self::Predicate(_) => true,
+        }
+    }
+
+    fn is_destination_ip_union(&self) -> bool {
+        match self {
+            Self::Predicate(RulesetPredicate::DstIpCidr(_)) => true,
+            Self::Any(children) => children.iter().all(Self::is_destination_ip_union),
+            // A one-element conjunction is semantically transparent. Multiple
+            // destination sets would require intersection, not extraction.
+            Self::All(children) if children.len() == 1 => children[0].is_destination_ip_union(),
+            Self::All(_) | Self::Not(_) | Self::Predicate(_) => false,
+        }
+    }
 }
 
 /// 一份完整、已校验且可直接求值的语义规则集。
@@ -469,6 +499,39 @@ impl RulesetProgram {
 
     pub fn matches(&self, ctx: &RulesetMatchContext<'_>) -> bool {
         self.root.matches(ctx)
+    }
+
+    /// Return every destination `ip_cidr` item embedded in this program.
+    ///
+    /// The extraction deliberately ignores surrounding logical conditions and
+    /// inversion. This matches sing-box's `RuleSet.ExtractIPSet` contract for
+    /// TUN `route_address_set`: source CIDRs and non-IP predicates are omitted,
+    /// while destination CIDRs nested in logical rules are retained.
+    pub fn destination_ip_cidrs(&self) -> Vec<IpNet> {
+        let mut prefixes = Vec::new();
+        self.visit_destination_ip_cidrs(|prefix| {
+            prefixes.push(*prefix);
+            true
+        });
+        prefixes
+    }
+
+    /// Visit destination CIDRs with sing-box `RuleSet.ExtractIPSet` semantics.
+    ///
+    /// Returning `false` from `visitor` stops traversal and makes this method
+    /// return `false`. This lets untrusted binary rulesets be projected into a
+    /// bounded prefix snapshot without first allocating an unbounded `Vec`.
+    pub fn visit_destination_ip_cidrs(&self, mut visitor: impl FnMut(&IpNet) -> bool) -> bool {
+        self.root.visit_destination_ip_cidrs(&mut visitor)
+    }
+
+    /// Whether the full program is exactly a union of destination CIDR items.
+    ///
+    /// `false` does not prevent official sing-box-style extraction; it tells
+    /// safety-sensitive consumers that the extracted projection is not
+    /// semantically equivalent to evaluating the whole ruleset.
+    pub fn is_exact_destination_ip_set(&self) -> bool {
+        self.root.is_destination_ip_union()
     }
 }
 
@@ -563,5 +626,48 @@ mod tests {
                 ..Default::default()
             }));
         }
+    }
+
+    #[test]
+    fn destination_ip_extraction_matches_singbox_route_set_contract() {
+        let program = RulesetProgram::new(
+            5,
+            2,
+            RulesetExpr::All(vec![
+                RulesetExpr::Predicate(RulesetPredicate::Network(vec!["tcp".into()])),
+                RulesetExpr::Not(Box::new(RulesetExpr::Any(vec![
+                    RulesetExpr::Predicate(RulesetPredicate::DstIpCidr(vec![
+                        "10.0.0.0/8".parse().unwrap(),
+                        "2001:db8::/32".parse().unwrap(),
+                    ])),
+                    RulesetExpr::Predicate(RulesetPredicate::SrcIpCidr(vec![
+                        "192.0.2.0/24".parse().unwrap(),
+                    ])),
+                ]))),
+            ]),
+        );
+
+        assert_eq!(
+            program.destination_ip_cidrs(),
+            vec![
+                "10.0.0.0/8".parse::<IpNet>().unwrap(),
+                "2001:db8::/32".parse::<IpNet>().unwrap(),
+            ]
+        );
+        assert!(!program.is_exact_destination_ip_set());
+
+        let exact = RulesetProgram::new(
+            5,
+            2,
+            RulesetExpr::Any(vec![
+                RulesetExpr::Predicate(RulesetPredicate::DstIpCidr(vec![
+                    "10.0.0.0/8".parse().unwrap(),
+                ])),
+                RulesetExpr::All(vec![RulesetExpr::Predicate(RulesetPredicate::DstIpCidr(
+                    vec!["2001:db8::/32".parse().unwrap()],
+                ))]),
+            ]),
+        );
+        assert!(exact.is_exact_destination_ip_set());
     }
 }

@@ -17,12 +17,13 @@ members = [
     "crates/core-mesh",
     "crates/core-observe",
     "crates/core-process",
+    "crates/core-reality",
     "crates/wuther-core",
     "tests-e2e",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1-rc.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -97,7 +98,7 @@ sha2              = "0.10"
 hmac              = "0.12"
 md-5              = "0.10"
 blake3            = "1"
-rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls            = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls      = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pki-types  = "1"
 webpki-roots      = "0.26"
@@ -153,6 +154,15 @@ core-capture  = { path = "crates/core-capture" }
 core-mesh     = { path = "crates/core-mesh" }
 core-observe  = { path = "crates/core-observe" }
 core-process  = { path = "crates/core-process" }
+core-reality  = { path = "crates/core-reality" }
+xray-routing  = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-routing" }
+xray-transport = { path = "third_party/xray-transport" }
+xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-utls" }
+
+[patch.crates-io]
+# REALITY 必须在同一个真实 ClientHello 上完成 session-id 封装并继续握手；
+# 上游 rustls 没有 finalizer hook，固定使用经过该能力审阅的 shaped-rustls 提交。
+rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "94f088e210fd2a56e413cce1c6d79c10852d500a" }
 
 # ============================================================================
 # 编译时间 / 二进制大小 / 运行性能的权衡

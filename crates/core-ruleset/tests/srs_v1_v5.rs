@@ -1,6 +1,6 @@
 use core_ruleset::{
-    ParseError, RulesetCompiled, RulesetFormat, RulesetInterfaceAddress, RulesetMatchContext,
-    RulesetMatcher, parse_ruleset, parse_ruleset_compiled,
+    ParseError, RulesetCompiled, RulesetFormat, RulesetInterfaceAddress, RulesetIpPrefixSemantics,
+    RulesetMatchContext, RulesetMatcher, parse_ruleset, parse_ruleset_compiled,
 };
 
 const FIXTURES: [(&[u8], u8); 5] = [
@@ -80,6 +80,17 @@ fn official_writer_v1_through_v5_preserve_semantics() {
             process_name: Some("curl"),
             ..base
         }));
+
+        let (semantics, ipv4, ipv6) = matcher.destination_ip_prefixes().unwrap();
+        assert_eq!(semantics, RulesetIpPrefixSemantics::Extracted);
+        assert!(ipv4.contains(&"192.0.2.0/24".parse::<ipnet::Ipv4Net>().unwrap()));
+        assert!(
+            !ipv4.iter().any(|prefix| {
+                prefix.contains(&"10.1.2.3".parse::<std::net::Ipv4Addr>().unwrap())
+            }),
+            "source_ip_cidr must not leak into destination prefixes"
+        );
+        assert!(ipv6.is_empty());
     }
 }
 

@@ -16,6 +16,7 @@ use crate::adapter::BoxedStream;
 pub mod grpc_transport;
 pub mod h2_transport;
 pub mod http_transport;
+pub mod reality;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
@@ -24,6 +25,7 @@ pub mod xhttp_transport;
 pub use grpc_transport::{GrpcOptions, GrpcTransport};
 pub use h2_transport::{H2Options, H2Transport};
 pub use http_transport::{HttpOptions, HttpTransport};
+pub use reality::{RealityOptions, RealityTransport};
 pub use xhttp_transport::{XhttpOptions, XhttpTransport};
 
 #[async_trait]

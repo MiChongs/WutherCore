@@ -27,9 +27,10 @@ use uuid::Uuid;
 use crate::{
     adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter},
     transport::{
-        GrpcOptions, H2Options, HttpOptions, TlsOptions, Transport, WsOptions, XhttpOptions,
-        grpc_transport::GrpcTransport, h2_transport::H2Transport, http_transport::HttpTransport,
-        tcp::TcpTransport, tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
+        GrpcOptions, H2Options, HttpOptions, RealityOptions, RealityTransport, TlsOptions,
+        Transport, WsOptions, XhttpOptions, grpc_transport::GrpcTransport,
+        h2_transport::H2Transport, http_transport::HttpTransport, tcp::TcpTransport,
+        tls::TlsTransport, ws::WsTransport, xhttp_transport::XhttpTransport,
     },
 };
 
@@ -72,6 +73,7 @@ pub struct VlessOutbound {
     pub sni: Option<String>,
     pub insecure: bool,
     pub alpn: Vec<String>,
+    pub reality: Option<RealityOptions>,
     pub network: VlessNetwork,
     pub ws: Option<WsOptions>,
     pub http: Option<HttpOptions>,
@@ -104,7 +106,11 @@ impl VlessOutbound {
     async fn dial_transport(&self) -> std::io::Result<BoxedStream> {
         match self.network {
             VlessNetwork::Tcp => {
-                if self.tls {
+                if let Some(reality) = &self.reality {
+                    RealityTransport::new(reality.clone())?
+                        .connect(&self.host, self.port)
+                        .await
+                } else if self.tls {
                     TlsTransport::new(self.tls_opts())
                         .connect(&self.host, self.port)
                         .await
@@ -113,6 +119,12 @@ impl VlessOutbound {
                 }
             }
             VlessNetwork::Ws => {
+                if self.reality.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "VLESS REALITY over WebSocket requires a carrier-aware WebSocket transport and is not enabled",
+                    ));
+                }
                 let ws = self.ws.clone().unwrap_or_else(|| WsOptions {
                     enabled: true,
                     path: "/".into(),
@@ -124,24 +136,48 @@ impl VlessOutbound {
                     .await
             }
             VlessNetwork::Http => {
+                if self.reality.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "VLESS REALITY over HTTP obfuscation is not enabled",
+                    ));
+                }
                 let opts = self.http.clone().unwrap_or_default();
                 HttpTransport::new(opts, self.tls_opts())
                     .connect(&self.host, self.port)
                     .await
             }
             VlessNetwork::H2 => {
+                if self.reality.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "VLESS REALITY over H2 requires a carrier-aware H2 transport and is not enabled",
+                    ));
+                }
                 let opts = self.h2.clone().unwrap_or_default();
                 H2Transport::new(opts, self.tls_opts())
                     .connect(&self.host, self.port)
                     .await
             }
             VlessNetwork::Grpc => {
+                if self.reality.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "VLESS REALITY over gRPC requires a carrier-aware gRPC transport and is not enabled",
+                    ));
+                }
                 let opts = self.grpc.clone().unwrap_or_default();
                 GrpcTransport::new(opts, self.tls_opts())
                     .connect(&self.host, self.port)
                     .await
             }
             VlessNetwork::Xhttp => {
+                if self.reality.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "VLESS REALITY over XHTTP is composed by the full XHTTP branch and is not enabled in this isolated REALITY branch",
+                    ));
+                }
                 let opts = self.xhttp.clone().unwrap_or_default();
                 XhttpTransport::new(self.host.clone(), self.port, opts)
                     .connect(&self.host, self.port)

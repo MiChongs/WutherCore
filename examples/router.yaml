@@ -5,7 +5,13 @@ name: "transparent-gateway"
 listen:
   local: 7890
   panel: 9090
+  # share: home 会把 Mixed/API 绑到 0.0.0.0；非本机 API 必须配置 ui.secret。
   share: home
+
+ui:
+  on: true
+  # 部署前请换成足够长的随机串；空 secret + 非本机 panel 会在 check/run 阶段被拒绝。
+  secret: "change-me-router-panel-secret"
 
 feeds:
   my_airport: "https://example.com/sub"

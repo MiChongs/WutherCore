@@ -48,6 +48,10 @@ pub use ir::{
     RulesetProgram,
 };
 pub use manager::{RulesetManager, RulesetSink, RulesetUpdate};
-pub use matcher::{ClassicalEntry, RulesetIndex, RulesetMatcher};
+pub use matcher::{
+    ClassicalEntry, RulesetDestinationPrefixes, RulesetIndex, RulesetIpPrefixSemantics,
+    RulesetIpPrefixSet, RulesetIpPrefixSnapshot, RulesetIpPrefixStatus, RulesetMatcher,
+    RulesetPrefixError,
+};
 pub use parser::{ParseError, RulesetCompiled, parse_ruleset, parse_ruleset_compiled};
 pub use spec::{RulesetSpec, RulesetType};

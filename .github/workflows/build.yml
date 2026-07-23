@@ -1,18 +1,46 @@
-name: Build and Release (Cross Matrix)
+name: Build Matrix
 on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; defaults to the triggering ref.
+        required: false
+        type: string
+        default: ""
+      version:
+        description: Optional version included in archive filenames.
+        required: false
+        type: string
+        default: ""
+      retention-days:
+        description: Artifact retention period.
+        required: false
+        type: number
+        default: 1
   workflow_dispatch:
   push:
     branches: ["main"]
     paths:
       - 'crates/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'Cross.toml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
       - '.github/workflows/build.yml'
+
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
 jobs:
   build:
     name: Build (${{ matrix.platform.name }})
@@ -27,6 +55,12 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
             is_android: false
+          - target: x86_64-unknown-linux-musl
+            name: linux-amd64-musl
+            is_android: false
+          - target: aarch64-unknown-linux-musl
+            name: linux-arm64-musl
+            is_android: false
           - target: aarch64-linux-android
             name: android-arm64
             is_android: true
@@ -39,53 +73,75 @@ jobs:
           - target: s390x-unknown-linux-gnu
             name: linux-s390x
             is_android: false
-          - target: x86_64-pc-windows-gnu
-            name: windows-amd64
-            is_android: false
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: ${{ matrix.platform.target }}
-          components: rust-src
+
       - name: Setup Android NDK
         if: matrix.platform.is_android == true
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@v1.6.0
         with:
           ndk-version: r29
           add-to-path: true
+          local-cache: true
+
+      - name: Cache Cargo
+        # Cross runs builds inside target-specific containers. Do not restore or
+        # save host-side Cargo/target caches for those jobs.
+        if: matrix.platform.is_android == true
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          prefix-key: v1-wuther-core
+          shared-key: build-android
+          key: ${{ matrix.platform.target }}
+          workspaces: |
+            . -> target
+          cache-bin: false
+          cache-on-failure: true
+          cache-targets: true
+
       - name: Install cargo-ndk
         if: matrix.platform.is_android == true
-        run: |
-          cargo install cargo-ndk --locked
+        uses: taiki-e/install-action@v2.84.0
+        with:
+          tool: cargo-ndk@4.1.2
+
       - name: Install Cross
         if: matrix.platform.is_android != true
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross.git --rev v0.2.5 --locked
-      - uses: Swatinem/rust-cache@v2
+        uses: taiki-e/install-action@v2.84.0
         with:
-          key: ${{ matrix.platform.target }}
-          save-if: ${{ github.event_name == 'push' }}
+          tool: cross@0.2.5
+
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
-          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release
+          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release --locked -p wuther-core
+
       - name: Run Cross Build (Non-Android)
         if: matrix.platform.is_android != true
         run: |
-          cross build --release --target ${{ matrix.platform.target }}
+          cross build --release --locked --target ${{ matrix.platform.target }} -p wuther-core
+
       - name: Package Artifacts
+        env:
+          PLATFORM_NAME: ${{ matrix.platform.name }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          mkdir -p ./dist
-          mkdir -p ./pkg_dir
+          set -euo pipefail
+          mkdir -p ./dist ./pkg_dir/licenses
           FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core"
 
           if [ -f "target/${{ matrix.platform.target }}/release/wuther-core.exe" ]; then
-            FILE_PATH="target/${{ matrix.platform.target}}/release/wuther-core.exe"
+            FILE_PATH="target/${{ matrix.platform.target }}/release/wuther-core.exe"
           fi
 
           if [ -f "$FILE_PATH" ]; then
@@ -95,13 +151,23 @@ jobs:
             exit 1
           fi
 
+          cp README.md LICENSE ./pkg_dir/
+          cp third_party/xray-transport/LICENSE-MPL-2.0 ./pkg_dir/licenses/xray-transport-MPL-2.0.txt
+          cp -R examples ./pkg_dir/
+
+          ARCHIVE_NAME="wuther-core-${PLATFORM_NAME}.zip"
+          if [ -n "$RELEASE_VERSION" ]; then
+            ARCHIVE_NAME="wuther-core-${RELEASE_VERSION}-${PLATFORM_NAME}.zip"
+          fi
+
           cd ./pkg_dir
-          zip -r ../dist/wuther-core-${{ matrix.platform.name }}.zip ./*
-          cd ..
+          zip -X -r "../dist/${ARCHIVE_NAME}" .
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
-          name: wuther-core-${{ matrix.platform.name }}
-          path: ./dist/*
-          retention-days: 1
+          path: ./dist/*.zip
+          if-no-files-found: error
+          archive: false
+          overwrite: true
+          retention-days: ${{ inputs.retention-days || 1 }}

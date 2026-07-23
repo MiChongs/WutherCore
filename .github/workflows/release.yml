@@ -1,0 +1,381 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish, for example v0.3.0 or v0.3.0-rc.1.
+        required: true
+        type: string
+      channel:
+        description: Release channel; auto derives it from the tag suffix.
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - prerelease
+          - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+
+    steps:
+      - name: Resolve release metadata
+        id: metadata
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+          REQUESTED_CHANNEL: ${{ inputs.channel || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          semver_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$'
+          if [[ ! "$REQUESTED_TAG" =~ $semver_pattern ]]; then
+            echo "::error::Tag must match vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-(alpha|beta|rc).N"
+            exit 1
+          fi
+
+          inferred_channel="release"
+          prerelease="false"
+          if [ -n "${BASH_REMATCH[4]:-}" ]; then
+            inferred_channel="prerelease"
+            prerelease="true"
+          fi
+
+          if [ "$REQUESTED_CHANNEL" != "auto" ] && [ "$REQUESTED_CHANNEL" != "$inferred_channel" ]; then
+            echo "::error::Channel '$REQUESTED_CHANNEL' conflicts with tag '$REQUESTED_TAG' ($inferred_channel)."
+            exit 1
+          fi
+
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${REQUESTED_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ steps.metadata.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify version and source
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          IS_PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          workspace_version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$workspace_version" != "$RELEASE_VERSION" ]; then
+            echo "::error::Tag version $RELEASE_VERSION does not match workspace version $workspace_version."
+            exit 1
+          fi
+
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+          if [ "$IS_PRERELEASE" = "false" ]; then
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::Stable releases must point to a commit already contained in main."
+              exit 1
+            fi
+          fi
+
+  quality:
+    name: Validate release tag
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
+  build-cross:
+    name: Build cross-platform artifacts
+    needs:
+      - prepare
+      - quality
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+      version: ${{ needs.prepare.outputs.version }}
+      retention-days: 14
+
+  build-native:
+    name: Build (${{ matrix.platform.name }})
+    needs:
+      - prepare
+      - quality
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: x86_64-pc-windows-msvc
+            name: windows-amd64-msvc
+            runner: windows-latest
+            executable: wuther-core.exe
+          - target: aarch64-pc-windows-msvc
+            name: windows-arm64-msvc
+            runner: windows-11-arm
+            executable: wuther-core.exe
+          - target: x86_64-apple-darwin
+            name: macos-amd64
+            runner: macos-15-intel
+            executable: wuther-core
+          - target: aarch64-apple-darwin
+            name: macos-arm64
+            runner: macos-15
+            executable: wuther-core
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.platform.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          prefix-key: v1-wuther-core
+          shared-key: release-native
+          key: ${{ matrix.platform.target }}
+          workspaces: |
+            . -> target
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.platform.target }} -p wuther-core
+
+      - name: Smoke test macOS binary
+        if: runner.os != 'Windows'
+        run: ./target/${{ matrix.platform.target }}/release/${{ matrix.platform.executable }} --version
+
+      - name: Smoke test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: '& "target/$env:TARGET/release/wuther-core.exe" --version'
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        env:
+          PLATFORM_NAME: ${{ matrix.platform.name }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.platform.target }}
+        run: |
+          set -euo pipefail
+          package_dir="pkg"
+          archive="wuther-core-${RELEASE_VERSION}-${PLATFORM_NAME}.zip"
+
+          mkdir -p "dist" "$package_dir/licenses"
+          cp "target/${TARGET}/release/wuther-core" "$package_dir/"
+          cp README.md LICENSE "$package_dir/"
+          cp third_party/xray-transport/LICENSE-MPL-2.0 "$package_dir/licenses/xray-transport-MPL-2.0.txt"
+          cp -R examples "$package_dir/"
+
+          cd "$package_dir"
+          zip -X -r "../dist/$archive" .
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PLATFORM_NAME: ${{ matrix.platform.name }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.platform.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageDir = Join-Path $PWD 'pkg'
+          $licenseDir = Join-Path $packageDir 'licenses'
+          $distDir = Join-Path $PWD 'dist'
+          $archive = Join-Path $distDir "wuther-core-$env:RELEASE_VERSION-$env:PLATFORM_NAME.zip"
+
+          New-Item -ItemType Directory -Force -Path $packageDir, $licenseDir, $distDir | Out-Null
+          Copy-Item "target/$env:TARGET/release/wuther-core.exe" $packageDir
+          Copy-Item README.md, LICENSE $packageDir
+          Copy-Item examples (Join-Path $packageDir 'examples') -Recurse
+          Copy-Item third_party/xray-transport/LICENSE-MPL-2.0 (Join-Path $licenseDir 'xray-transport-MPL-2.0.txt')
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $archive -CompressionLevel Optimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          path: dist/*.zip
+          if-no-files-found: error
+          archive: false
+          overwrite: true
+          retention-days: 14
+
+  collect:
+    name: Collect release assets
+    needs:
+      - prepare
+      - build-cross
+      - build-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: wuther-core-${{ needs.prepare.outputs.version }}-*.zip
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Validate and checksum release assets
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          archives=(dist/wuther-core-"$RELEASE_VERSION"-*.zip)
+          if [ "${#archives[@]}" -ne 12 ]; then
+            echo "::error::Expected 12 release archives, found ${#archives[@]}."
+            printf 'Found: %s\n' "${archives[@]:-none}"
+            exit 1
+          fi
+
+          cd dist
+          printf '%s\0' wuther-core-"$RELEASE_VERSION"-*.zip \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          test -s SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload collected release assets
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-assets
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download and decompress collected assets
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v4.1.1
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          IS_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.zip dist/SHA256SUMS)
+
+          if [ "${#assets[@]}" -lt 2 ]; then
+            echo "::error::No release archives were downloaded."
+            exit 1
+          fi
+
+          clobber_assets="false"
+          if release_json="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease 2>/dev/null)"; then
+            is_draft="$(jq -r '.isDraft' <<< "$release_json")"
+            actual_prerelease="$(jq -r '.isPrerelease' <<< "$release_json")"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $RELEASE_TAG is already published and will not be mutated."
+              exit 1
+            fi
+            if [ "$actual_prerelease" != "$IS_PRERELEASE" ]; then
+              echo "::error::Existing draft channel does not match the requested channel."
+              exit 1
+            fi
+
+            clobber_assets="true"
+          else
+            create_args=(
+              --verify-tag
+              --title "WutherCore $RELEASE_VERSION"
+              --generate-notes
+              --draft
+              --latest=false
+            )
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              create_args+=(--prerelease)
+            fi
+
+            gh release create "$RELEASE_TAG" "${create_args[@]}"
+          fi
+
+          if [ "$clobber_assets" = "true" ]; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release upload "$RELEASE_TAG" "${assets[@]}"
+          fi
+
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+          fi
+
+          {
+            echo "## WutherCore $RELEASE_VERSION"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Channel: $([ "$IS_PRERELEASE" = "true" ] && echo 'Pre-release' || echo 'Release')"
+            echo "- Assets: $((${#assets[@]} - 1)) archives plus SHA256SUMS"
+          } >> "$GITHUB_STEP_SUMMARY"

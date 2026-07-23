@@ -8,7 +8,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use core_ruleset::{
-    RulesetFormat,
+    RulesetFormat, RulesetIpPrefixSemantics,
     matcher::RulesetMatcher,
     parser::{RulesetCompiled, parse_ruleset_compiled},
 };
@@ -66,6 +66,10 @@ fn domain_mrs_round_trip_matches_mihomo_semantics() {
         !matcher.matches("bilibili.com", None, None, None),
         "exact only on www.bilibili.com"
     );
+    let (semantics, ipv4, ipv6) = matcher.destination_ip_prefixes().unwrap();
+    assert_eq!(semantics, RulesetIpPrefixSemantics::NotIpSet);
+    assert!(ipv4.is_empty());
+    assert!(ipv6.is_empty());
 }
 
 #[test]
@@ -137,6 +141,26 @@ fn ipcidr_mrs_round_trip_matches_mihomo_semantics() {
     ));
     let public_v6 = "2606:4700::1111".parse::<Ipv6Addr>().unwrap();
     assert!(!matcher.matches("2606:4700::1111", Some(IpAddr::V6(public_v6)), None, None));
+
+    let (semantics, ipv4, ipv6) = matcher.destination_ip_prefixes().unwrap();
+    assert_eq!(semantics, RulesetIpPrefixSemantics::Exact);
+    assert_eq!(
+        ipv4.as_ref(),
+        &[
+            "1.1.1.1/32".parse().unwrap(),
+            "8.8.8.8/32".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+            "172.16.0.0/12".parse().unwrap(),
+            "192.168.0.0/16".parse().unwrap(),
+        ]
+    );
+    assert_eq!(
+        ipv6.as_ref(),
+        &[
+            "2001:db8::/32".parse().unwrap(),
+            "fc00::/7".parse().unwrap()
+        ]
+    );
 }
 
 #[test]

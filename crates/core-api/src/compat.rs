@@ -1321,13 +1321,22 @@ fn build_configs_value(s: &NativeState) -> Value {
         core_config::model::FindProcessMode::Strict => "strict",
         core_config::model::FindProcessMode::Always => "always",
     };
+    // 只回用户名，永不回明文密码。空数组表示未启用入站认证。
+    let authentication: Vec<String> = s
+        .runtime
+        .plan
+        .listen
+        .auth
+        .iter()
+        .map(|up| up.user.clone())
+        .collect();
     json!({
         "port": port,
         "socks-port": port,
         "redir-port": 0,
         "tproxy-port": 0,
         "mixed-port": port,
-        "authentication": &s.runtime.plan.listen.auth,
+        "authentication": authentication,
         "allow-lan": mc.allow_lan,
         "bind-address": "*",
         "mode": mc.mode,
@@ -1379,22 +1388,65 @@ async fn configs_put(
     State(s): State<NativeState>,
     Json(body): Json<ConfigsPut>,
 ) -> impl IntoResponse {
+    // mode 已接入选路；其余字段仍只更新 MutableConfig 视图。
+    // allow-lan / tun_enable / ipv6 / log-level 的真实副作用尚未热切换绑定/capture，
+    // 但至少 mode 不再是“写成功假象”。
     let mut mc = s.runtime.mutable.write();
     if let Some(v) = body.mode {
-        mc.mode = v.to_lowercase();
+        let normalized = v.to_lowercase();
+        match normalized.as_str() {
+            "rule" | "global" | "direct" => mc.mode = normalized,
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "message": format!(
+                            "unsupported mode \"{other}\"; expected rule|global|direct"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
     if let Some(v) = body.log_level {
         mc.log_level = v.to_lowercase();
     }
     if let Some(v) = body.allow_lan {
-        mc.allow_lan = v;
+        // 入站 bind 在启动时由 listen.share / host 决定，运行时无法安全热切换。
+        // 拒绝静默写入，避免 dashboard 显示 allow-lan=false 但端口仍对外监听。
+        let current = mc.allow_lan;
+        if v != current {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "message": format!(
+                        "allow-lan cannot be changed at runtime (current={current}, requested={v}); \
+                         restart with listen.share false|home|all"
+                    )
+                })),
+            )
+                .into_response();
+        }
     }
     if let Some(v) = body.ipv6 {
         mc.ipv6 = v;
     }
     if let Some(t) = body.tun {
         if let Some(e) = t.enable {
-            mc.tun_enable = e;
+            let current = mc.tun_enable;
+            if e != current {
+                return (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "message": format!(
+                            "tun.enable cannot be changed at runtime (current={current}, requested={e}); \
+                             restart with capture.on"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
     drop(mc);

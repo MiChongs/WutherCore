@@ -9,7 +9,7 @@
 | Friendly YAML | 已实现 | Profile 默认值、显式覆盖、`check` 与 `explain` |
 | Mixed 入站 | 已实现 | 一个监听端口同时接受 HTTP 和 SOCKS5 |
 | 订阅管理 | 已实现 | 拉取、缓存、解析、过滤、重命名与去重 |
-| 外部规则集 | 已实现 | Mihomo YAML/文本、sing-box JSON、内联 Payload、RRS |
+| 外部规则集 | 已实现 | Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5、内联 Payload、RRS |
 | 路由匹配 | 已实现 | 域名、IP、端口、进程、规则集与嗅探信息 |
 | 策略组 | 已实现 | Manual、Load Balance、URLTest、Smart |
 | DNS | 已实现 | 多上游、缓存、Hosts、Fallback、Fake IP、IPv6 策略 |
@@ -55,7 +55,17 @@
 - 配置迁移生成的节点；
 - 运行时订阅更新。
 
-规则集转换支持 YAML、文本、sing-box JSON 和 WutherCore RRS。`mrs`/`srs` 等输入能力以命令行 `--help` 和解析错误为准。
+规则集运行时支持 Mihomo YAML/文本/MRS v1、sing-box JSON/SRS v1–v5 和 WutherCore RRS。二进制输入会先经过有界解压与结构校验，再编译为与文本规则共用的 matcher。
+
+规则集索引还提供版本化的 destination-IP 前缀快照与 `watch` 更新通知：
+
+- 一次读取多个规则集时共享同一 revision，重复名称按首次出现去重；
+- 首次加载中的集合、首次加载失败、未知名称和合法的非 IP 集合具有不同状态；
+- MRS 闭区间无损转换为最小 IPv4/IPv6 CIDR，转换有总量和分配保护；
+- `Exact` 表示前缀与完整规则语义等价；`Extracted` 明确表示采用 sing-box `RuleSet.ExtractIPSet` 兼容投影，安全敏感的绕过/排除消费者可以拒绝；
+- 内容相同的前缀替换不会产生伪 revision，慢消费者可以直接收敛到最新完整快照。
+
+这是一项跨平台 provider 能力；把快照原子安装进 Linux nftables、策略路由或其他平台数据面仍由各 capture 后端分别完成。
 
 ## 已知边界
 

@@ -468,6 +468,83 @@ mod tests {
         assert!(tracing.file.is_some());
     }
 
+    #[tokio::test]
+    async fn ruleset_ipset_provider_publishes_atomic_versioned_prefixes() {
+        let index = core_ruleset::RulesetIndex::new();
+        index.declare(["geoip-cn", "not-ready"]);
+        let provider = RulesetIpSetProvider {
+            index: index.clone(),
+        };
+        let names = vec![
+            "geoip-cn".to_string(),
+            "not-ready".to_string(),
+            "missing".to_string(),
+            "geoip-cn".to_string(),
+        ];
+
+        let (initial, mut updates) =
+            core_capture::IpSetProvider::prefix_snapshot_and_subscribe(&provider, &names).unwrap();
+        assert_eq!(initial.revision, *updates.borrow());
+        assert_eq!(initial.sets.len(), 3);
+        assert!(matches!(
+            initial.sets[0].status,
+            core_capture::IpSetPrefixStatus::Pending
+        ));
+        assert!(matches!(
+            initial.sets[2].status,
+            core_capture::IpSetPrefixStatus::Missing
+        ));
+
+        index.insert(Arc::new(core_ruleset::RulesetMatcher::compile_ipcidr(
+            "geoip-cn",
+            [
+                "10.0.0.0/9".to_string(),
+                "10.128.0.0/9".to_string(),
+                "2001:db8::/32".to_string(),
+            ],
+        )));
+        tokio::time::timeout(std::time::Duration::from_secs(1), updates.changed())
+            .await
+            .expect("prefix update should wake subscriber")
+            .expect("ruleset index keeps the watch sender alive");
+
+        let current = core_capture::IpSetProvider::prefix_snapshot(&provider, &names).unwrap();
+        assert_eq!(current.revision, *updates.borrow());
+        assert_eq!(
+            current.sets[0].status,
+            core_capture::IpSetPrefixStatus::Ready {
+                semantics: core_capture::IpSetPrefixSemantics::Exact,
+            }
+        );
+        assert_eq!(
+            current.sets[0].ipv4.as_ref(),
+            &["10.0.0.0/8".parse().unwrap()]
+        );
+        assert_eq!(
+            current.sets[0].ipv6.as_ref(),
+            &["2001:db8::/32".parse().unwrap()]
+        );
+
+        let unchanged_revision = current.revision;
+        index.insert(Arc::new(core_ruleset::RulesetMatcher::compile_ipcidr(
+            "geoip-cn",
+            ["2001:db8::/32".to_string(), "10.0.0.0/8".to_string()],
+        )));
+        assert_eq!(index.ip_prefix_revision(), unchanged_revision);
+        assert!(!updates.has_changed().unwrap());
+
+        index.mark_unavailable("not-ready");
+        tokio::time::timeout(std::time::Duration::from_secs(1), updates.changed())
+            .await
+            .expect("availability update should wake subscriber")
+            .expect("ruleset index keeps the watch sender alive");
+        let unavailable = core_capture::IpSetProvider::prefix_snapshot(&provider, &names).unwrap();
+        assert!(matches!(
+            unavailable.sets[1].status,
+            core_capture::IpSetPrefixStatus::Unavailable
+        ));
+    }
+
     #[test]
     fn capture_claims_only_attach_the_static_host_owner() {
         let config = core_config::loader::load_from_str(
@@ -801,7 +878,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     };
 
     // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
+    // auto_route / auto_redirect 会改系统路由：启动失败必须 fail-closed，
+    // 不能 warn 后继续跑“半透明代理”状态。
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
+    let capture_fail_closed = plan.capture.on
+        && (plan.capture.tun.auto_route
+            || plan.capture.tun.auto_redirect
+            || matches!(
+                plan.capture.method,
+                core_config::model::CaptureMethod::Tproxy
+                    | core_config::model::CaptureMethod::Redirect
+            ));
     match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6) {
         Ok(Some(sup)) => {
             // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
@@ -809,6 +896,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 index: ruleset_index.clone(),
             }));
             if let Err(e) = sup.start(runtime.clone()).await {
+                if capture_fail_closed {
+                    // 尽力停掉可能半装好的状态，再把错误抛给 CLI。
+                    let _ = sup.stop().await;
+                    let _ = mesh_supervisor.stop().await;
+                    runtime.shutdown().await;
+                    anyhow::bail!(
+                        "capture supervisor start failed under auto_route/tproxy/redirect \
+                         (fail-closed): {e}"
+                    );
+                }
                 warn!(target: "capture", error = %e, "capture supervisor start failed");
                 // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
                 // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
@@ -825,7 +922,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             }
         }
         Ok(None) => {}
-        Err(e) => warn!(target: "capture", error = %e, "capture supervisor build failed"),
+        Err(e) => {
+            if capture_fail_closed {
+                let _ = mesh_supervisor.stop().await;
+                runtime.shutdown().await;
+                anyhow::bail!(
+                    "capture supervisor build failed under auto_route/tproxy/redirect \
+                     (fail-closed): {e}"
+                );
+            }
+            warn!(target: "capture", error = %e, "capture supervisor build failed");
+        }
     }
 
     let mut handles = Vec::new();
@@ -986,6 +1093,88 @@ impl core_capture::IpSetProvider for RulesetIpSetProvider {
     }
     fn names(&self) -> Vec<String> {
         self.index.names()
+    }
+
+    fn prefix_snapshot(
+        &self,
+        names: &[String],
+    ) -> Result<core_capture::IpSetPrefixSnapshot, core_capture::IpSetSnapshotError> {
+        Ok(map_ruleset_prefix_snapshot(
+            self.index.ip_prefix_snapshot(names),
+        ))
+    }
+
+    fn subscribe_prefix_updates(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.index.subscribe_ip_prefix_updates())
+    }
+
+    fn prefix_snapshot_and_subscribe(
+        &self,
+        names: &[String],
+    ) -> Result<
+        (
+            core_capture::IpSetPrefixSnapshot,
+            tokio::sync::watch::Receiver<u64>,
+        ),
+        core_capture::IpSetSnapshotError,
+    > {
+        let (snapshot, receiver) = self.index.ip_prefix_snapshot_and_subscribe(names);
+        Ok((map_ruleset_prefix_snapshot(snapshot), receiver))
+    }
+}
+
+fn map_ruleset_prefix_snapshot(
+    snapshot: core_ruleset::RulesetIpPrefixSnapshot,
+) -> core_capture::IpSetPrefixSnapshot {
+    let sets = snapshot
+        .sets
+        .iter()
+        .map(|set| {
+            let status = match &set.status {
+                core_ruleset::RulesetIpPrefixStatus::Ready { semantics } => {
+                    let semantics = match semantics {
+                        core_ruleset::RulesetIpPrefixSemantics::Exact => {
+                            core_capture::IpSetPrefixSemantics::Exact
+                        }
+                        core_ruleset::RulesetIpPrefixSemantics::Extracted => {
+                            core_capture::IpSetPrefixSemantics::Extracted
+                        }
+                        core_ruleset::RulesetIpPrefixSemantics::NotIpSet => {
+                            core_capture::IpSetPrefixSemantics::NotIpSet
+                        }
+                    };
+                    core_capture::IpSetPrefixStatus::Ready { semantics }
+                }
+                core_ruleset::RulesetIpPrefixStatus::Pending => {
+                    core_capture::IpSetPrefixStatus::Pending
+                }
+                core_ruleset::RulesetIpPrefixStatus::Unavailable => {
+                    core_capture::IpSetPrefixStatus::Unavailable
+                }
+                core_ruleset::RulesetIpPrefixStatus::Missing => {
+                    core_capture::IpSetPrefixStatus::Missing
+                }
+                core_ruleset::RulesetIpPrefixStatus::TooManyPrefixes { limit } => {
+                    core_capture::IpSetPrefixStatus::TooManyPrefixes { limit: *limit }
+                }
+                core_ruleset::RulesetIpPrefixStatus::AllocationFailed => {
+                    core_capture::IpSetPrefixStatus::AllocationFailed
+                }
+                core_ruleset::RulesetIpPrefixStatus::InvalidRange { family } => {
+                    core_capture::IpSetPrefixStatus::InvalidRange { family }
+                }
+            };
+            core_capture::IpSetPrefixSet {
+                name: set.name.clone(),
+                status,
+                ipv4: set.ipv4.clone(),
+                ipv6: set.ipv6.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    core_capture::IpSetPrefixSnapshot {
+        revision: snapshot.revision,
+        sets: Arc::new(sets),
     }
 }
 

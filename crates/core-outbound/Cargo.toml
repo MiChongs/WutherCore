@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 core-config = { workspace = true }
+core-reality = { workspace = true }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
