@@ -45,7 +45,6 @@ use crate::{
     },
     socket_policy::ConfiguredOutbound,
     socks5::Socks5Outbound,
-    stub::StubOutbound,
     transport::{GrpcOptions, H2Options, HttpOptions, RealityOptions, WsOptions, XhttpOptions},
 };
 
@@ -149,22 +148,24 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
             }
             ob.into_arc()
         }
-        NodeProtocol::Shadowsocks => build_shadowsocks(node),
-        NodeProtocol::ShadowsocksR => build_ssr(node),
+        NodeProtocol::Shadowsocks => build_shadowsocks(node)?,
+        NodeProtocol::ShadowsocksR => build_ssr(node)?,
         NodeProtocol::Vmess => return build_vmess(node),
         NodeProtocol::Vless => return build_vless(node),
         NodeProtocol::Trojan => Arc::new(build_trojan(node)?),
-        NodeProtocol::Snell => build_snell(node),
+        NodeProtocol::Snell => build_snell(node)?,
         NodeProtocol::AnyTls => build_anytls(node),
         NodeProtocol::Ssh => build_ssh(node),
         NodeProtocol::Hysteria => build_hysteria_v1(node),
         NodeProtocol::Hysteria2 => build_hysteria2(node),
         NodeProtocol::Tuic => build_tuic(node)?,
-        NodeProtocol::Wireguard => build_wireguard(node),
+        NodeProtocol::Wireguard => build_wireguard(node)?,
         NodeProtocol::Mieru => build_mieru(node),
-        NodeProtocol::Sudoku => build_sudoku(node),
+        NodeProtocol::Sudoku => build_sudoku(node)?,
         NodeProtocol::TrustTunnel => build_trusttunnel(node),
-        ref other => StubOutbound::new(node.name.clone(), proto_static_name(other)),
+        NodeProtocol::Other(ref protocol) => {
+            return Err(format!("unsupported outbound protocol `{protocol}`"));
+        }
     };
     Ok(outbound)
 }
@@ -174,33 +175,37 @@ pub fn try_build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
     build_outbound(node)
 }
 
-fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
+fn build_shadowsocks(node: &ParsedNode) -> Result<SharedOutbound, String> {
     let method = node.method.as_deref().unwrap_or("aes-256-gcm");
     let pwd = node.password.as_deref().unwrap_or("");
+    if pwd.is_empty() {
+        return Err("shadowsocks password must not be empty".into());
+    }
     if let Some(c) = Ss22Cipher::parse(method) {
-        if !pwd.is_empty() {
-            return match Ss2022Outbound::new(&node.name, &node.host, node.port, c, pwd) {
-                Ok(mut ob) => {
-                    ob.udp = node.udp;
-                    Arc::new(ob)
-                }
-                Err(_) => StubOutbound::new(node.name.clone(), "ss2022(invalid-psk)"),
-            };
-        }
+        return match Ss2022Outbound::new(&node.name, &node.host, node.port, c, pwd) {
+            Ok(mut ob) => {
+                ob.udp = node.udp;
+                Ok(Arc::new(ob))
+            }
+            Err(error) => Err(format!("invalid Shadowsocks 2022 PSK: {error}")),
+        };
     }
     match SsCipher::parse(method) {
-        Some(c) if !pwd.is_empty() => {
+        Some(c) => {
             let mut ob = ShadowsocksOutbound::new(&node.name, &node.host, node.port, c, pwd);
             ob.udp = node.udp;
-            Arc::new(ob)
+            Ok(Arc::new(ob))
         }
-        _ => StubOutbound::new(node.name.clone(), "shadowsocks(unknown-cipher)"),
+        None => Err(format!("unsupported Shadowsocks cipher `{method}`")),
     }
 }
 
-fn build_ssr(node: &ParsedNode) -> SharedOutbound {
+fn build_ssr(node: &ParsedNode) -> Result<SharedOutbound, String> {
     let method = node.method.as_deref().unwrap_or("aes-256-cfb");
     let pwd = node.password.as_deref().unwrap_or("");
+    if pwd.is_empty() {
+        return Err("ShadowsocksR password must not be empty".into());
+    }
     let obfs_str = node
         .params
         .get("obfs")
@@ -213,14 +218,14 @@ fn build_ssr(node: &ParsedNode) -> SharedOutbound {
         .unwrap_or("origin");
     let obfs = match SsrObfs::parse(obfs_str, &node.host) {
         Some(o) => o,
-        None => return StubOutbound::new(node.name.clone(), "ssr(unsupported-obfs)"),
+        None => return Err(format!("unsupported ShadowsocksR obfs `{obfs_str}`")),
     };
     let proto = match SsrProtocol::parse(proto_str) {
         Some(p) => p,
-        None => return StubOutbound::new(node.name.clone(), "ssr(unsupported-protocol)"),
+        None => return Err(format!("unsupported ShadowsocksR protocol `{proto_str}`")),
     };
     match SsrCipher::parse(method) {
-        Some(c) if !pwd.is_empty() => {
+        Some(c) => {
             let mut ob = SsrOutbound::new(&node.name, &node.host, node.port, c, pwd);
             ob.obfs = obfs;
             ob.protocol = proto;
@@ -230,9 +235,9 @@ fn build_ssr(node: &ParsedNode) -> SharedOutbound {
                 .get("protocol-param")
                 .cloned()
                 .unwrap_or_default();
-            Arc::new(ob)
+            Ok(Arc::new(ob))
         }
-        _ => StubOutbound::new(node.name.clone(), "ssr(unsupported-cipher)"),
+        None => Err(format!("unsupported ShadowsocksR cipher `{method}`")),
     }
 }
 
@@ -1392,29 +1397,26 @@ fn build_trojan(node: &ParsedNode) -> Result<TrojanOutbound, String> {
     Ok(ob)
 }
 
-fn build_snell(node: &ParsedNode) -> SharedOutbound {
-    let cipher = node
-        .params
-        .get("cipher")
-        .or_else(|| node.method.as_ref())
-        .and_then(|s| SnellCipher::parse(s))
-        .unwrap_or(SnellCipher::Aes128Gcm);
+fn build_snell(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    let cipher = match node.params.get("cipher").or_else(|| node.method.as_ref()) {
+        Some(value) => SnellCipher::parse(value)
+            .ok_or_else(|| format!("unsupported Snell cipher `{value}`"))?,
+        None => SnellCipher::Aes128Gcm,
+    };
     let pwd = node
         .password
         .as_deref()
         .or_else(|| node.params.get("psk").map(|s| s.as_str()))
         .unwrap_or("");
     if pwd.is_empty() {
-        return StubOutbound::new(node.name.clone(), "snell(missing-psk)");
+        return Err("Snell PSK must not be empty".into());
     }
     let mut ob = SnellOutbound::new(&node.name, &node.host, node.port, cipher, pwd);
     ob.udp = node.udp;
-    if let Some(v) = node
-        .params
-        .get("version")
-        .and_then(|s| s.parse::<u8>().ok())
-    {
-        ob.version = v;
+    if let Some(value) = node.params.get("version") {
+        ob.version = value
+            .parse::<u8>()
+            .map_err(|_| format!("invalid Snell version `{value}`"))?;
     }
     if let Some(obfs_type) = node.params.get("obfs").map(|s| s.as_str()) {
         let obfs_host = node
@@ -1425,10 +1427,10 @@ fn build_snell(node: &ParsedNode) -> SharedOutbound {
         match obfs_type {
             "http" => ob = ob.with_obfs_http(obfs_host),
             "tls" => ob = ob.with_obfs_tls(obfs_host),
-            _ => {}
+            other => return Err(format!("unsupported Snell obfs `{other}`")),
         }
     }
-    Arc::new(ob)
+    Ok(Arc::new(ob))
 }
 
 fn build_anytls(node: &ParsedNode) -> SharedOutbound {
@@ -1623,42 +1625,43 @@ fn parse_tuic_duration(value: &str) -> Option<std::time::Duration> {
     std::time::Duration::try_from_secs_f64(seconds).ok()
 }
 
-fn build_wireguard(node: &ParsedNode) -> SharedOutbound {
+fn build_wireguard(node: &ParsedNode) -> Result<SharedOutbound, String> {
     let priv_b64 = match node
         .params
         .get("private-key")
         .or_else(|| node.password.as_ref())
     {
         Some(s) => s,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(missing-private-key)"),
+        None => return Err("WireGuard private-key is required".into()),
     };
     let peer_b64 = match node.params.get("public-key") {
         Some(s) => s,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(missing-public-key)"),
+        None => return Err("WireGuard public-key is required".into()),
     };
     let priv_key = match decode_b64_32(priv_b64) {
         Some(k) => k,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(invalid-private-key)"),
+        None => return Err("WireGuard private-key must decode to exactly 32 bytes".into()),
     };
     let peer_key = match decode_b64_32(peer_b64) {
         Some(k) => k,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(invalid-public-key)"),
+        None => return Err("WireGuard public-key must decode to exactly 32 bytes".into()),
     };
     let mut ob = WireGuardOutbound::new(&node.name, &node.host, node.port, priv_key, peer_key);
     if let Some(psk_b64) = node.params.get("preshared-key") {
-        if let Some(psk) = decode_b64_32(psk_b64) {
-            ob = ob.with_preshared_key(psk);
-        }
+        let psk = decode_b64_32(psk_b64)
+            .ok_or_else(|| "WireGuard preshared-key must decode to exactly 32 bytes".to_string())?;
+        ob = ob.with_preshared_key(psk);
     }
     if let Some(addr) = node.params.get("address") {
         for a in addr.split(',') {
             let a = a.trim().split('/').next().unwrap_or("");
-            if let Ok(ip) = a.parse() {
-                ob = ob.with_local_address(ip);
-            }
+            let ip = a
+                .parse()
+                .map_err(|_| format!("invalid WireGuard address `{a}`"))?;
+            ob = ob.with_local_address(ip);
         }
     }
-    Arc::new(ob)
+    Ok(Arc::new(ob))
 }
 
 fn build_mieru(node: &ParsedNode) -> SharedOutbound {
@@ -1675,7 +1678,7 @@ fn build_mieru(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
-fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
+fn build_sudoku(node: &ParsedNode) -> Result<SharedOutbound, String> {
     let key = node
         .params
         .get("key")
@@ -1683,7 +1686,7 @@ fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
         .or_else(|| node.password.clone())
         .unwrap_or_default();
     if key.is_empty() {
-        return StubOutbound::new(node.name.clone(), "sudoku(missing-key)");
+        return Err("Sudoku key must not be empty".into());
     }
     let mut cfg = crate::proto::sudoku::outbound::SudokuConfig::default();
     cfg.key = key;
@@ -1694,9 +1697,7 @@ fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
     {
         match SudokuAead::parse(method) {
             Ok(m) => cfg.aead_method = m,
-            Err(_) => {
-                return StubOutbound::new(node.name.clone(), "sudoku(invalid-aead)");
-            }
+            Err(error) => return Err(format!("invalid Sudoku AEAD method `{method}`: {error}")),
         }
     }
     if let Some(t) = node.params.get("table-type") {
@@ -1705,19 +1706,15 @@ fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
     if let Some(t) = node.params.get("custom-table") {
         cfg.custom_table = t.clone();
     }
-    if let Some(min) = node
-        .params
-        .get("padding-min")
-        .and_then(|s| s.parse::<i32>().ok())
-    {
-        cfg.padding_min = min;
+    if let Some(value) = node.params.get("padding-min") {
+        cfg.padding_min = value
+            .parse::<i32>()
+            .map_err(|_| format!("invalid Sudoku padding-min `{value}`"))?;
     }
-    if let Some(max) = node
-        .params
-        .get("padding-max")
-        .and_then(|s| s.parse::<i32>().ok())
-    {
-        cfg.padding_max = max;
+    if let Some(value) = node.params.get("padding-max") {
+        cfg.padding_max = value
+            .parse::<i32>()
+            .map_err(|_| format!("invalid Sudoku padding-max `{value}`"))?;
     }
     if let Some(d) = node
         .params
@@ -1729,10 +1726,9 @@ fn build_sudoku(node: &ParsedNode) -> SharedOutbound {
     if let Some(pr) = node.params.get("path-root") {
         cfg.http_mask_path_root = pr.clone();
     }
-    match SudokuOutbound::new(&node.name, &node.host, node.port, cfg) {
-        Ok(ob) => Arc::new(ob),
-        Err(_) => StubOutbound::new(node.name.clone(), "sudoku(table-build-error)"),
-    }
+    SudokuOutbound::new(&node.name, &node.host, node.port, cfg)
+        .map(|ob| Arc::new(ob) as SharedOutbound)
+        .map_err(|error| format!("invalid Sudoku table configuration: {error}"))
 }
 
 fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
@@ -1797,28 +1793,6 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn proto_static_name(p: &NodeProtocol) -> &'static str {
-    match p {
-        NodeProtocol::Dns => "dns",
-        NodeProtocol::Shadowsocks => "shadowsocks",
-        NodeProtocol::ShadowsocksR => "shadowsocksr",
-        NodeProtocol::Vmess => "vmess",
-        NodeProtocol::Vless => "vless",
-        NodeProtocol::Trojan => "trojan",
-        NodeProtocol::Hysteria => "hysteria",
-        NodeProtocol::Hysteria2 => "hysteria2",
-        NodeProtocol::Tuic => "tuic",
-        NodeProtocol::Wireguard => "wireguard",
-        NodeProtocol::Ssh => "ssh",
-        NodeProtocol::Snell => "snell",
-        NodeProtocol::AnyTls => "anytls",
-        NodeProtocol::Mieru => "mieru",
-        NodeProtocol::Sudoku => "sudoku",
-        NodeProtocol::TrustTunnel => "trusttunnel",
-        _ => "stub",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -1832,6 +1806,117 @@ mod tests {
         DownloadTlsSettings, build_outbound, build_trojan, build_xhttp_options, tuic_from_node,
     };
     use crate::proto::tuic::TuicUdpMode;
+
+    fn node(protocol: NodeProtocol) -> ParsedNode {
+        ParsedNode::new("validation-test", protocol, "127.0.0.1", 443)
+    }
+
+    fn build_error(node: &ParsedNode) -> String {
+        match build_outbound(node) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid test node unexpectedly registered"),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_unknown_protocol_and_missing_required_credentials() {
+        let cases = [
+            (
+                node(NodeProtocol::Other("future-protocol".into())),
+                "unsupported outbound protocol `future-protocol`",
+            ),
+            (
+                node(NodeProtocol::Shadowsocks),
+                "shadowsocks password must not be empty",
+            ),
+            (
+                node(NodeProtocol::ShadowsocksR),
+                "ShadowsocksR password must not be empty",
+            ),
+            (node(NodeProtocol::Snell), "Snell PSK must not be empty"),
+            (
+                node(NodeProtocol::Wireguard),
+                "WireGuard private-key is required",
+            ),
+            (node(NodeProtocol::Sudoku), "Sudoku key must not be empty"),
+        ];
+
+        for (node, expected) in cases {
+            let error = build_error(&node);
+            assert!(error.contains(expected), "error={error:?}");
+        }
+    }
+
+    #[test]
+    fn registry_rejects_invalid_protocol_options_instead_of_registering_stubs() {
+        let mut ss = node(NodeProtocol::Shadowsocks);
+        ss.password = Some("secret".into());
+        ss.method = Some("not-a-cipher".into());
+        assert!(build_error(&ss).contains("unsupported Shadowsocks cipher"));
+
+        let mut ss2022 = node(NodeProtocol::Shadowsocks);
+        ss2022.password = Some("not-a-valid-2022-key".into());
+        ss2022.method = Some("2022-blake3-aes-128-gcm".into());
+        assert!(build_error(&ss2022).contains("invalid Shadowsocks 2022 PSK"));
+
+        let mut ssr = node(NodeProtocol::ShadowsocksR);
+        ssr.password = Some("secret".into());
+        ssr.params.insert("obfs".into(), "unknown-obfs".into());
+        assert!(build_error(&ssr).contains("unsupported ShadowsocksR obfs"));
+        ssr.params.insert("obfs".into(), "plain".into());
+        ssr.params
+            .insert("protocol".into(), "unknown-protocol".into());
+        assert!(build_error(&ssr).contains("unsupported ShadowsocksR protocol"));
+        ssr.params.insert("protocol".into(), "origin".into());
+        ssr.method = Some("unknown-cipher".into());
+        assert!(build_error(&ssr).contains("unsupported ShadowsocksR cipher"));
+
+        let mut snell = node(NodeProtocol::Snell);
+        snell.password = Some("secret".into());
+        snell.method = Some("unknown-cipher".into());
+        assert!(build_error(&snell).contains("unsupported Snell cipher"));
+        snell.method = None;
+        snell.params.insert("version".into(), "not-a-number".into());
+        assert!(build_error(&snell).contains("invalid Snell version"));
+        snell.params.insert("version".into(), "3".into());
+        snell.params.insert("obfs".into(), "unknown-obfs".into());
+        assert!(build_error(&snell).contains("unsupported Snell obfs"));
+
+        let valid_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let mut wireguard = node(NodeProtocol::Wireguard);
+        wireguard
+            .params
+            .insert("private-key".into(), valid_key.clone());
+        wireguard
+            .params
+            .insert("public-key".into(), valid_key.clone());
+        wireguard
+            .params
+            .insert("preshared-key".into(), "invalid".into());
+        assert!(build_error(&wireguard).contains("WireGuard preshared-key"));
+        wireguard.params.remove("preshared-key");
+        wireguard
+            .params
+            .insert("address".into(), "not-an-address".into());
+        assert!(build_error(&wireguard).contains("invalid WireGuard address"));
+
+        let mut sudoku = node(NodeProtocol::Sudoku);
+        sudoku.password = Some("secret".into());
+        sudoku
+            .params
+            .insert("aead-method".into(), "unknown-aead".into());
+        assert!(build_error(&sudoku).contains("invalid Sudoku AEAD"));
+        sudoku.params.remove("aead-method");
+        sudoku
+            .params
+            .insert("padding-min".into(), "not-a-number".into());
+        assert!(build_error(&sudoku).contains("invalid Sudoku padding-min"));
+        sudoku.params.remove("padding-min");
+        sudoku
+            .params
+            .insert("padding-max".into(), "not-a-number".into());
+        assert!(build_error(&sudoku).contains("invalid Sudoku padding-max"));
+    }
 
     #[test]
     fn ss2022_registry_preserves_udp_flag_and_eih_chain() {
