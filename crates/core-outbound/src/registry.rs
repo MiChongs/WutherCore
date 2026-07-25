@@ -135,7 +135,7 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Ssh => build_ssh(node),
         NodeProtocol::Hysteria => build_hysteria_v1(node),
         NodeProtocol::Hysteria2 => build_hysteria2(node),
-        NodeProtocol::Tuic => build_tuic(node),
+        NodeProtocol::Tuic => build_tuic(node)?,
         NodeProtocol::Wireguard => build_wireguard(node),
         NodeProtocol::Mieru => build_mieru(node),
         NodeProtocol::Sudoku => build_sudoku(node),
@@ -2178,11 +2178,10 @@ fn build_hysteria2(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
-fn build_tuic(node: &ParsedNode) -> SharedOutbound {
-    match tuic_from_node(node) {
-        Ok(outbound) => Arc::new(outbound),
-        Err(protocol) => StubOutbound::new(node.name.clone(), protocol),
-    }
+fn build_tuic(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    tuic_from_node(node)
+        .map(|outbound| Arc::new(outbound) as SharedOutbound)
+        .map_err(str::to_owned)
 }
 
 fn tuic_from_node(node: &ParsedNode) -> Result<TuicOutbound, &'static str> {
