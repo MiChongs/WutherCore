@@ -21,6 +21,8 @@ pub(crate) mod linux_auto_redirect;
 pub(crate) mod linux_auto_redirect_route;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux_identity_bypass;
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_recovery;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux_tproxy;
 #[cfg(any(target_os = "linux", target_os = "android"))]

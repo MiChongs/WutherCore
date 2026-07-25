@@ -1022,7 +1022,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     info!("WutherCore started, press Ctrl-C to stop.");
     let mut mesh_updates = mesh_supervisor.subscribe();
     let shutdown_signal = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
+        signal = wait_for_shutdown_signal() => {
             info!("shutdown signal, bye.");
             signal
         }
@@ -1059,6 +1059,22 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
     shutdown_signal?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 async fn wait_for_mesh_fail_stop(
