@@ -9,8 +9,7 @@
 //!   - 用户 + 密码
 //!   - 用户 + 私钥（OpenSSH 文件路径或字符串内容）
 //!   - 用户 + 私钥 + passphrase
-//!   - 用户 + agent（占位，需外部 agent socket）
-//!   - 用户 + 主机鉴权（host-based，预留接口）
+//!   - 私钥与密码按 mihomo 顺序回退
 //! * **Session 复用**：同一 SshOutbound 实例的多个 dial 共享同一条 SSH 会话；
 //!   会话失效时自动重连
 //! * **Host key 校验**：可选 known_hosts 列表（accept_unknown=false 时严格校验）
@@ -18,7 +17,7 @@
 //! * **Channel 数限制**：通过 `russh::client::Config.maximum_channels`
 //! * **失败重连**：断线时下一个 dial 触发重新握手
 
-use std::{path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
@@ -28,15 +27,7 @@ use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter};
 #[derive(Debug, Clone)]
 pub enum SshAuth {
     Password(String),
-    PrivateKeyPath {
-        path: PathBuf,
-        passphrase: Option<String>,
-    },
-    PrivateKeyContent {
-        content: String,
-        passphrase: Option<String>,
-    },
-    None,
+    PrivateKey(Arc<russh_keys::key::KeyPair>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,7 +35,7 @@ pub struct SshHostKeyCheck {
     /// 不校验 host key（默认；mihomo 行为）
     pub accept_unknown: bool,
     /// 已知公钥列表（OpenSSH 格式，每行一条；非空时严格校验）
-    pub known_hosts_lines: Vec<String>,
+    pub keys: Vec<russh_keys::key::PublicKey>,
 }
 
 #[derive(Clone)]
@@ -53,7 +44,7 @@ pub struct SshOutbound {
     pub host: String,
     pub port: u16,
     pub user: String,
-    pub auth: SshAuth,
+    pub auth: Vec<SshAuth>,
     pub host_key_check: SshHostKeyCheck,
     pub host_key_alg: Vec<String>,
     pub client_version: String,
@@ -74,20 +65,20 @@ impl SshOutbound {
             host: host.into(),
             port,
             user: user.into(),
-            auth: SshAuth::None,
+            auth: Vec::new(),
             host_key_check: SshHostKeyCheck {
                 accept_unknown: true,
-                known_hosts_lines: vec![],
+                keys: vec![],
             },
             host_key_alg: vec![],
-            client_version: format!("SSH-2.0-WutherCore_{}", env!("CARGO_PKG_VERSION")),
+            client_version: "SSH-2.0-OpenSSH_8.9".into(),
             keepalive_interval_secs: 30,
             session: Arc::new(AsyncMutex::new(None)),
         }
     }
 
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.auth = SshAuth::Password(password.into());
+        self.auth.push(SshAuth::Password(password.into()));
         self
     }
 
@@ -95,32 +86,54 @@ impl SshOutbound {
         mut self,
         path: impl Into<PathBuf>,
         passphrase: Option<String>,
-    ) -> Self {
-        self.auth = SshAuth::PrivateKeyPath {
-            path: path.into(),
-            passphrase,
-        };
-        self
+    ) -> Result<Self, String> {
+        let path = path.into();
+        let key = russh_keys::load_secret_key(&path, passphrase.as_deref()).map_err(|error| {
+            format!(
+                "failed to load SSH private key `{}`: {error}",
+                path.display()
+            )
+        })?;
+        self.auth.push(SshAuth::PrivateKey(Arc::new(key)));
+        Ok(self)
     }
 
     pub fn with_private_key_content(
         mut self,
         content: impl Into<String>,
         passphrase: Option<String>,
-    ) -> Self {
-        self.auth = SshAuth::PrivateKeyContent {
-            content: content.into(),
-            passphrase,
+    ) -> Result<Self, String> {
+        let content = content.into();
+        let key = russh_keys::decode_secret_key(&content, passphrase.as_deref())
+            .map_err(|error| format!("failed to decode SSH private key: {error}"))?;
+        self.auth.push(SshAuth::PrivateKey(Arc::new(key)));
+        Ok(self)
+    }
+
+    pub fn with_host_keys(mut self, keys: Vec<russh_keys::key::PublicKey>) -> Self {
+        self.host_key_check = SshHostKeyCheck {
+            accept_unknown: false,
+            keys,
         };
         self
     }
 
-    pub fn with_known_hosts(mut self, lines: Vec<String>) -> Self {
-        self.host_key_check = SshHostKeyCheck {
-            accept_unknown: false,
-            known_hosts_lines: lines,
-        };
-        self
+    pub fn with_host_key_algorithms(mut self, algorithms: Vec<String>) -> Result<Self, String> {
+        // Validate here so a misspelt security policy never degrades into the
+        // library default during the first network connection.
+        parse_host_key_algorithms(&algorithms)?;
+        self.host_key_alg = algorithms;
+        Ok(self)
+    }
+
+    pub fn with_client_version(mut self, version: impl Into<String>) -> Result<Self, String> {
+        let version = version.into();
+        if !version.starts_with("SSH-2.0-") || version.contains(['\r', '\n']) || version.len() > 255
+        {
+            return Err("SSH client version must be one RFC 4253 `SSH-2.0-*` line".into());
+        }
+        self.client_version = version;
+        Ok(self)
     }
 
     async fn ensure_session(&self) -> std::io::Result<Arc<russh::client::Handle<NopHandler>>> {
@@ -136,13 +149,20 @@ impl SshOutbound {
     }
 
     async fn connect_session_inner(&self) -> std::io::Result<russh::client::Handle<NopHandler>> {
-        let config = Arc::new(russh::client::Config {
+        let mut config = russh::client::Config {
+            client_id: russh::SshId::Standard(self.client_version.clone()),
             inactivity_timeout: Some(std::time::Duration::from_secs(
                 self.keepalive_interval_secs.max(60),
             )),
-            keepalive_interval: Some(std::time::Duration::from_secs(self.keepalive_interval_secs)),
+            keepalive_interval: (self.keepalive_interval_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.keepalive_interval_secs)),
             ..Default::default()
-        });
+        };
+        if !self.host_key_alg.is_empty() {
+            config.preferred.key =
+                Cow::Owned(parse_host_key_algorithms(&self.host_key_alg).map_err(io_err)?);
+        }
+        let config = Arc::new(config);
         let addr = format!("{}:{}", self.host, self.port);
         let handler = NopHandler {
             check: self.host_key_check.clone(),
@@ -150,35 +170,29 @@ impl SshOutbound {
         let mut session = russh::client::connect(config, addr, handler)
             .await
             .map_err(|e| io_err(format!("ssh connect: {e}")))?;
-        let auth_ok = match &self.auth {
-            SshAuth::Password(pw) => session
-                .authenticate_password(&self.user, pw)
-                .await
-                .map_err(|e| io_err(format!("ssh auth password: {e}")))?,
-            SshAuth::PrivateKeyPath { path, passphrase } => {
-                let key = russh_keys::load_secret_key(path, passphrase.as_deref())
-                    .map_err(|e| io_err(format!("ssh load key path: {e}")))?;
-                session
-                    .authenticate_publickey(&self.user, Arc::new(key))
-                    .await
-                    .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?
-            }
-            SshAuth::PrivateKeyContent {
-                content,
-                passphrase,
-            } => {
-                let key = russh_keys::decode_secret_key(content, passphrase.as_deref())
-                    .map_err(|e| io_err(format!("ssh decode key: {e}")))?;
-                session
-                    .authenticate_publickey(&self.user, Arc::new(key))
-                    .await
-                    .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?
-            }
-            SshAuth::None => session
+        let mut auth_ok = false;
+        if self.auth.is_empty() {
+            auth_ok = session
                 .authenticate_none(&self.user)
                 .await
-                .map_err(|e| io_err(format!("ssh auth none: {e}")))?,
-        };
+                .map_err(|e| io_err(format!("ssh auth none: {e}")))?;
+        } else {
+            for auth in &self.auth {
+                auth_ok = match auth {
+                    SshAuth::Password(password) => session
+                        .authenticate_password(&self.user, password)
+                        .await
+                        .map_err(|e| io_err(format!("ssh auth password: {e}")))?,
+                    SshAuth::PrivateKey(key) => session
+                        .authenticate_publickey(&self.user, key.clone())
+                        .await
+                        .map_err(|e| io_err(format!("ssh auth pubkey: {e}")))?,
+                };
+                if auth_ok {
+                    break;
+                }
+            }
+        }
         if !auth_ok {
             return Err(io_err("ssh authentication rejected".to_string()));
         }
@@ -227,7 +241,7 @@ impl OutboundAdapter for SshOutbound {
     }
 }
 
-/// host key 校验 handler。`accept_unknown=true` 时全接受；否则在 known_hosts_lines 中查找。
+/// host key 校验 handler。`accept_unknown=true` 时全接受；否则做公钥字节精确匹配。
 #[derive(Clone)]
 struct NopHandler {
     check: SshHostKeyCheck,
@@ -248,21 +262,62 @@ impl russh::client::Handler for NopHandler {
         Self: 'async_trait,
     {
         let accept = self.check.accept_unknown;
-        let known = self.check.known_hosts_lines.clone();
-        // 取公钥 fingerprint（SHA256 base64）
-        let fp = server_public_key.fingerprint();
+        let known = self.check.keys.clone();
+        let server_public_key = server_public_key.clone();
         Box::pin(async move {
             if accept {
                 return Ok(true);
             }
-            for line in &known {
-                if line.contains(&fp) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            Ok(known.iter().any(|key| key == &server_public_key))
         })
     }
+}
+
+pub fn parse_host_key(value: &str) -> Result<russh_keys::key::PublicKey, String> {
+    let mut fields = value.split_whitespace();
+    let first = fields
+        .next()
+        .ok_or_else(|| "SSH host-key must not be empty".to_string())?;
+    let encoded = if first.starts_with("ssh-") || first.starts_with("ecdsa-") {
+        fields
+            .next()
+            .ok_or_else(|| "SSH host-key is missing base64 key data".to_string())?
+    } else {
+        first
+    };
+    russh_keys::parse_public_key_base64(encoded)
+        .map_err(|error| format!("invalid SSH host-key: {error}"))
+}
+
+fn parse_host_key_algorithms(algorithms: &[String]) -> Result<Vec<russh_keys::key::Name>, String> {
+    let mut parsed = Vec::new();
+    for algorithm in algorithms {
+        let names: &[russh_keys::key::Name] = match algorithm.trim().to_ascii_lowercase().as_str() {
+            "rsa" => &[
+                russh_keys::key::RSA_SHA2_512,
+                russh_keys::key::RSA_SHA2_256,
+                russh_keys::key::SSH_RSA,
+            ],
+            "ed25519" => &[russh_keys::key::ED25519],
+            "ecdsa" => &[
+                russh_keys::key::ECDSA_SHA2_NISTP521,
+                russh_keys::key::ECDSA_SHA2_NISTP384,
+                russh_keys::key::ECDSA_SHA2_NISTP256,
+            ],
+            exact => {
+                let name = russh_keys::key::Name::try_from(exact)
+                    .map_err(|_| format!("unsupported SSH host-key algorithm `{algorithm}`"))?;
+                parsed.push(name);
+                continue;
+            }
+        };
+        for name in names {
+            if !parsed.contains(name) {
+                parsed.push(*name);
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 /// 把 russh::Channel 包成 AsyncRead+AsyncWrite。
@@ -316,14 +371,16 @@ fn io_err<S: Into<String>>(s: S) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use russh_keys::PublicKeyBase64;
+
     use super::*;
 
     #[test]
     fn ssh_outbound_construct() {
         let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice").with_password("p");
         assert_eq!(ob.protocol(), "ssh");
-        match ob.auth {
-            SshAuth::Password(ref p) => assert_eq!(p, "p"),
+        match &ob.auth[0] {
+            SshAuth::Password(p) => assert_eq!(p, "p"),
             _ => panic!(),
         }
     }
@@ -332,20 +389,64 @@ mod tests {
     fn known_hosts_default_accept() {
         let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice");
         assert!(ob.host_key_check.accept_unknown);
-        assert!(ob.host_key_check.known_hosts_lines.is_empty());
+        assert!(ob.host_key_check.keys.is_empty());
     }
 
     #[test]
     fn known_hosts_strict_mode() {
-        let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice")
-            .with_known_hosts(vec!["ssh-ed25519 AAAAxxx".into()]);
+        let key = russh_keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice").with_host_keys(vec![key]);
         assert!(!ob.host_key_check.accept_unknown);
-        assert_eq!(ob.host_key_check.known_hosts_lines.len(), 1);
+        assert_eq!(ob.host_key_check.keys.len(), 1);
     }
 
     #[test]
     fn capabilities_show_mux() {
         let ob = SshOutbound::new("ssh1", "1.2.3.4", 22, "alice");
         assert!(ob.capabilities().multiplex);
+    }
+
+    #[test]
+    fn host_key_parser_accepts_authorized_key_and_raw_base64() {
+        let key = russh_keys::key::KeyPair::generate_ed25519()
+            .clone_public_key()
+            .unwrap();
+        let encoded = key.public_key_base64();
+        assert_eq!(parse_host_key(&encoded).unwrap(), key);
+        assert_eq!(
+            parse_host_key(&format!("ssh-ed25519 {encoded} test@example")).unwrap(),
+            key
+        );
+    }
+
+    #[test]
+    fn host_key_algorithm_aliases_expand_and_unknown_values_fail() {
+        let parsed = parse_host_key_algorithms(&["rsa".into(), "ed25519".into()]).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                russh_keys::key::RSA_SHA2_512,
+                russh_keys::key::RSA_SHA2_256,
+                russh_keys::key::SSH_RSA,
+                russh_keys::key::ED25519,
+            ]
+        );
+        assert!(parse_host_key_algorithms(&["not-an-algorithm".into()]).is_err());
+    }
+
+    #[test]
+    fn client_version_is_strictly_validated() {
+        assert!(
+            SshOutbound::new("ssh1", "1.2.3.4", 22, "alice")
+                .with_client_version("SSH-2.0-OpenSSH_9.9")
+                .is_ok()
+        );
+        assert!(
+            SshOutbound::new("ssh1", "1.2.3.4", 22, "alice")
+                .with_client_version("SSH-2.0-good\r\ninjected")
+                .is_err()
+        );
     }
 }
