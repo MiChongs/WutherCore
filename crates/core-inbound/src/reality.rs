@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use core_config::model::RealityListen as RealityListenConfig;
+use core_outbound::BoxedStream;
 use core_reality::{
     ClientHelloLimits, FallbackLimit, ProxyProtocolVersion, RealityServer, RealityServerConfig,
     RealityServerError, RealityServerLimits, decode_private_key, decode_short_id,
 };
 use core_runtime::Runtime;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -27,6 +28,7 @@ pub struct RealityListener {
     server: RealityServer,
     target: CamouflageTarget,
     vless: Arc<VlessInboundConfig>,
+    stream_settings: Option<Arc<core_config::NodeStreamSettings>>,
 }
 
 impl fmt::Debug for RealityListener {
@@ -37,6 +39,7 @@ impl fmt::Debug for RealityListener {
             .field("server", &self.server.config())
             .field("target", &self.target)
             .field("vless", &self.vless)
+            .field("has_stream_settings", &self.stream_settings.is_some())
             .finish()
     }
 }
@@ -50,6 +53,7 @@ enum CamouflageTarget {
 
 impl RealityListener {
     pub fn from_config(config: &RealityListenConfig) -> io::Result<Self> {
+        validate_reality_stream_settings(config.stream_settings.as_ref())?;
         let listen = format!("{}:{}", config.host, config.port)
             .parse()
             .map_err(|error| invalid_input(format!("invalid REALITY listen address: {error}")))?;
@@ -168,6 +172,7 @@ impl RealityListener {
             server,
             target,
             vless,
+            stream_settings: config.stream_settings.clone().map(Arc::new),
         })
     }
 
@@ -185,7 +190,13 @@ fn target_address(target: &CamouflageTarget) -> &str {
 }
 
 pub async fn run_reality(listener: RealityListener, runtime: Arc<Runtime>) -> io::Result<()> {
-    let socket = TcpListener::bind(listener.listen).await?;
+    let socket = core_outbound::transport::tcp::bind_inbound_listener(
+        listener.listen,
+        listener
+            .stream_settings
+            .as_deref()
+            .and_then(|settings| settings.sockopt.as_ref()),
+    )?;
     let bound = socket.local_addr()?;
     info!(addr = %bound, "REALITY inbound listening");
     let cancellation = CancellationToken::new();
@@ -194,13 +205,28 @@ pub async fn run_reality(listener: RealityListener, runtime: Arc<Runtime>) -> io
     loop {
         tokio::select! {
             accepted = socket.accept() => {
-                let (stream, peer) = accepted?;
-                let local = stream.local_addr()?;
+                let (stream, kernel_peer) = accepted?;
+                let kernel_local = stream.local_addr()?;
                 let _ = stream.set_nodelay(true);
                 let listener = listener.clone();
                 let runtime = runtime.clone();
                 let cancellation = cancellation.clone();
                 connections.spawn(async move {
+                    let (stream, peer, local) = match prepare_reality_carrier(
+                        stream,
+                        kernel_peer,
+                        kernel_local,
+                        listener.stream_settings.as_deref(),
+                        listener.server.config().limits.handshake_timeout,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            debug!(%kernel_peer, %error, "REALITY FinalMask/PROXY preparation failed");
+                            return;
+                        }
+                    };
                     if let Err(error) = authenticate_and_serve(
                         listener,
                         stream,
@@ -229,7 +255,7 @@ pub async fn run_reality(listener: RealityListener, runtime: Arc<Runtime>) -> io
 
 async fn authenticate_and_serve(
     listener: RealityListener,
-    stream: TcpStream,
+    stream: BoxedStream,
     peer: SocketAddr,
     local: SocketAddr,
     runtime: Arc<Runtime>,
@@ -275,6 +301,83 @@ async fn authenticate_and_serve(
     )
     .await?;
     Ok(())
+}
+
+fn validate_reality_stream_settings(
+    settings: Option<&core_config::NodeStreamSettings>,
+) -> io::Result<()> {
+    use core_config::{AddressPortStrategy, DomainStrategy};
+
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+    if let Some(network) = settings.network.as_deref()
+        && !network.is_empty()
+        && !network.eq_ignore_ascii_case("tcp")
+        && !network.eq_ignore_ascii_case("raw")
+    {
+        return Err(invalid_input(format!(
+            "REALITY streamSettings.network must be tcp/raw, got `{network}`"
+        )));
+    }
+    if let Some(finalmask) = settings.finalmask.as_ref()
+        && (!finalmask.udp.is_empty() || finalmask.quic_params.is_some())
+    {
+        return Err(invalid_input(
+            "REALITY TCP listener cannot execute UDP finalmask or quicParams",
+        ));
+    }
+    if let Some(sockopt) = settings.sockopt.as_ref() {
+        if !matches!(sockopt.domain_strategy, DomainStrategy::AsIs)
+            || !sockopt.dialer_proxy.trim().is_empty()
+            || sockopt.penetrate
+            || !matches!(sockopt.address_port_strategy, AddressPortStrategy::None)
+            || sockopt.happy_eyeballs != Default::default()
+            || !sockopt.trusted_x_forwarded_for.is_empty()
+        {
+            return Err(invalid_input(
+                "REALITY inbound streamSettings.sockopt contains outbound/HTTP-only fields",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_reality_carrier(
+    stream: TcpStream,
+    mut peer: SocketAddr,
+    mut local: SocketAddr,
+    settings: Option<&core_config::NodeStreamSettings>,
+    timeout: Duration,
+) -> io::Result<(BoxedStream, SocketAddr, SocketAddr)> {
+    let mut stream: BoxedStream = Box::pin(stream);
+    if settings
+        .and_then(|settings| settings.sockopt.as_ref())
+        .is_some_and(|sockopt| sockopt.accept_proxy_protocol)
+    {
+        let endpoints = tokio::time::timeout(
+            timeout,
+            crate::mixed::read_proxy_protocol(&mut stream, peer, local),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "REALITY PROXY header timeout"))??;
+        peer = endpoints.0;
+        local = endpoints.1;
+    }
+    if let Some(masks) = settings
+        .and_then(|settings| settings.finalmask.as_ref())
+        .map(|finalmask| finalmask.tcp.as_slice())
+        .filter(|masks| !masks.is_empty())
+    {
+        stream = core_outbound::transport::finalmask::wrap_tcp_server(
+            stream,
+            masks,
+            Some(local),
+            Some(peer),
+        )
+        .await?;
+    }
+    Ok((stream, peer, local))
 }
 
 fn parse_version(value: &str) -> io::Result<[u8; 3]> {
@@ -337,6 +440,7 @@ mod tests {
             limit_fallback_upload: RealityFallbackLimit::default(),
             limit_fallback_download: RealityFallbackLimit::default(),
             limits: RealityResourceLimits::default(),
+            stream_settings: None,
         }
     }
 

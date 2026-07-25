@@ -23,6 +23,11 @@ hex         = { workspace = true }
 futures     = { workspace = true }
 pin-project-lite = { workspace = true }
 if-addrs    = "0.15"
+hickory-resolver = { workspace = true, features = ["system-config"] }
+hickory-proto = "0.24"
+data-encoding = "2"
+percent-encoding = "2"
+regex       = { workspace = true }
 
 # 协议层依赖
 aes-gcm           = { workspace = true }
@@ -61,6 +66,7 @@ quinn             = { workspace = true }
 quinn-proto       = { workspace = true }
 h3                = { workspace = true }
 h3-quinn          = { workspace = true }
+rsteria2          = "=0.1.1"
 http              = "1"
 blake2            = "0.10"
 # boringtun 0.6 锁定老 dalek 版本与 russh 冲突；改为手工实现 WireGuard
@@ -71,6 +77,9 @@ hyper             = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util        = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2"] }
 http-body-util    = "0.1"
 rand_chacha       = "0.3"
+ggstd             = "0.1"
+rsa               = "0.9"
+num-bigint-dig    = "0.8"
 smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
 # socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合
 # `ip rule fwmark X lookup main` 让代理出站绕开 TUN 自身路由表，

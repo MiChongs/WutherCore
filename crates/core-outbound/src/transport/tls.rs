@@ -25,11 +25,10 @@ use tokio::{net::TcpStream, sync::OnceCell};
 use tokio_rustls::TlsConnector;
 
 use crate::{
-    adapter::{BoxedStream, resolve_host},
-    loopback::TrackedTcpStream,
+    adapter::BoxedStream,
     transport::{
         TlsOptions, Transport,
-        tcp::marked_connect,
+        tcp::connect_boxed,
         utls::{
             fingerprint_is_per_connection_randomized, validate_xray_fingerprint,
             xray_client_hello_settings,
@@ -715,9 +714,15 @@ fn constant_time_eq_32(expected: &[u8; 32], actual: &[u8]) -> bool {
     difference == 0
 }
 
-#[async_trait]
-impl Transport for TlsTransport {
-    async fn connect(&self, host: &str, port: u16) -> std::io::Result<BoxedStream> {
+impl TlsTransport {
+    /// Establish TLS and expose the negotiated ALPN before erasing the stream
+    /// type. Realm uses this to choose HTTP/2 versus HTTP/1.1 with the same
+    /// complete Xray TLS/ECH executor as XHTTP.
+    pub(crate) async fn connect_negotiated(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<(BoxedStream, Option<Vec<u8>>)> {
         if super::boring_tls::is_required(&self.options) {
             let connector = self
                 .boring_config
@@ -726,7 +731,8 @@ impl Transport for TlsTransport {
                 })
                 .await?
                 .clone();
-            return super::boring_tls::connect(connector, &self.options, host, port).await;
+            return super::boring_tls::connect_negotiated(connector, &self.options, host, port)
+                .await;
         }
         let cached_config = self
             .config
@@ -789,52 +795,9 @@ impl Transport for TlsTransport {
                 )
             })?
         };
-        // 同 TcpTransport：先 resolve 走 WutherCore resolver，避免 TUN 死循环。
-        let addrs = resolve_host(host, port).await?;
-        let mut last_err: Option<std::io::Error> = None;
-        let mut tried = 0usize;
-        let tcp = {
-            let mut chosen: Option<TrackedTcpStream<TcpStream>> = None;
-            let mut chosen_peer: Option<std::net::SocketAddr> = None;
-            for addr in addrs {
-                tried += 1;
-                let t = std::time::Instant::now();
-                match marked_connect(addr, CONNECT_TIMEOUT).await {
-                    Ok(s) => {
-                        tracing::debug!(
-                            target: "dial::tls",
-                            %host, port, peer = %addr,
-                            attempt = tried,
-                            connect_ms = t.elapsed().as_millis() as u64,
-                            "tcp ok, begin TLS handshake",
-                        );
-                        chosen = Some(s);
-                        chosen_peer = Some(addr);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "dial::tls",
-                            %host, port, peer = %addr,
-                            attempt = tried, error = %e,
-                            "tcp connect failed",
-                        );
-                        last_err = Some(e);
-                    }
-                }
-            }
-            let _ = chosen_peer;
-            chosen.ok_or_else(|| {
-                tracing::warn!(target: "dial::tls", %host, port, tried, "all candidates failed (tcp)");
-                last_err.unwrap_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        format!("tls connect: no usable address for {host}:{port}"),
-                    )
-                })
-            })?
-        };
-        let _ = tcp.set_nodelay(true);
+        // Node socket policy and FinalMask wrap the raw carrier before TLS,
+        // matching Xray's tcp.Dial ordering.
+        let tcp = connect_boxed(host, port, false).await?;
         let connector = TlsConnector::from(config);
         let handshake_start = std::time::Instant::now();
         let stream =
@@ -871,7 +834,17 @@ impl Transport for TlsTransport {
             total_ms = started.elapsed().as_millis() as u64,
             "TLS handshake ok",
         );
-        Ok(Box::pin(stream))
+        let negotiated = stream.get_ref().1.alpn_protocol().map(ToOwned::to_owned);
+        Ok((Box::pin(stream), negotiated))
+    }
+}
+
+#[async_trait]
+impl Transport for TlsTransport {
+    async fn connect(&self, host: &str, port: u16) -> std::io::Result<BoxedStream> {
+        self.connect_negotiated(host, port)
+            .await
+            .map(|(stream, _)| stream)
     }
 }
 

@@ -45,7 +45,10 @@ enum BoundTransport {
         acceptor: boring::ssl::SslAcceptor,
         policy: HttpVersionPolicy,
     },
-    Http3(quinn::Endpoint),
+    Http3 {
+        endpoint: quinn::Endpoint,
+        quic_params: core_outbound::transport::finalmask::quic::AppliedQuicParams,
+    },
 }
 
 /// Running XHTTP listener and all of its logical Raw relays.
@@ -144,6 +147,13 @@ pub async fn start_xhttp_listener(
     };
     let (mut server, receiver) =
         XhttpServer::new_with_cors(config, Some(plan.accept_queue), cors_policy)?;
+    let trusted_x_forwarded_for = plan
+        .stream_settings
+        .as_ref()
+        .and_then(|settings| settings.sockopt.as_ref())
+        .map(|sockopt| sockopt.trusted_x_forwarded_for.as_slice())
+        .unwrap_or_default();
+    server.configure_trusted_x_forwarded_for(trusted_x_forwarded_for)?;
     server.configure_listener_resources(
         plan.max_active_connections,
         plan.max_concurrent_streams,
@@ -156,6 +166,7 @@ pub async fn start_xhttp_listener(
     let transport = prepare_transport(plan, address).await?;
     let local_addr = transport_local_addr(&transport)?;
     let shutdown = CancellationToken::new();
+    let stream_settings = plan.stream_settings.clone().map(Arc::new);
     let task = tokio::spawn(run_listener(
         server.clone(),
         receiver,
@@ -164,6 +175,7 @@ pub async fn start_xhttp_listener(
         plan.tag.clone(),
         target,
         plan.max_active_relays,
+        stream_settings,
         shutdown.clone(),
     ));
     info!(
@@ -281,32 +293,63 @@ async fn prepare_transport(
         let quic_crypto = QuicServerConfig::try_from(tls).map_err(|error| {
             invalid_input(format!("invalid XHTTP h3 TLS configuration: {error}"))
         })?;
-        let max_idle_timeout = plan.http_idle_timeout.try_into().map_err(|_| {
-            invalid_input(format!(
-                "XHTTP h3 http-idle-timeout {:?} exceeds QUIC's supported range",
-                plan.http_idle_timeout
-            ))
-        })?;
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config
-            .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-        transport_config.max_idle_timeout(Some(max_idle_timeout));
-        transport_config
-            .max_concurrent_bidi_streams(quinn::VarInt::from_u32(plan.max_concurrent_streams));
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-        server_config.transport_config(Arc::new(transport_config));
-        let endpoint = quinn::Endpoint::server(server_config, address).map_err(|error| {
+        let finalmask = plan
+            .stream_settings
+            .as_ref()
+            .and_then(|settings| settings.finalmask.as_ref());
+        let quic_params = core_outbound::transport::finalmask::quic::apply_xhttp_server_config(
+            &mut server_config,
+            finalmask.and_then(|finalmask| finalmask.quic_params.as_ref()),
+            plan.http_idle_timeout,
+            plan.max_concurrent_streams,
+        )?;
+        let socket = core_outbound::transport::tcp::bind_inbound_udp_socket(
+            address,
+            plan.stream_settings
+                .as_ref()
+                .and_then(|settings| settings.sockopt.as_ref()),
+        )?;
+        let local_addr = socket.local_addr()?;
+        let raw = core_outbound::transport::finalmask::inbound_udp_carrier(socket);
+        let carrier = match finalmask
+            .map(|finalmask| finalmask.udp.as_slice())
+            .filter(|masks| !masks.is_empty())
+        {
+            Some(masks) => {
+                core_outbound::transport::finalmask::wrap_udp_server(
+                    raw,
+                    masks,
+                    Some(local_addr),
+                    None,
+                )
+                .await?
+            }
+            None => raw,
+        };
+        let socket =
+            core_outbound::transport::finalmask::QuinnUdpSocket::new_server(carrier, local_addr);
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("bind XHTTP h3 UDP listener {address}: {error}"),
             )
         })?;
-        return Ok(BoundTransport::Http3(endpoint));
+        return Ok(BoundTransport::Http3 {
+            endpoint,
+            quic_params,
+        });
     }
 
     let policy = tcp_http_version_policy(&plan.alpn)?;
     if plan.cleartext {
-        let listener = bind_tcp(address).await?;
+        let listener = bind_tcp(address, plan.stream_settings.as_ref()).await?;
         return Ok(BoundTransport::Cleartext { listener, policy });
     }
 
@@ -317,7 +360,7 @@ async fn prepare_transport(
         &plan.alpn,
         false,
     )?;
-    let listener = bind_tcp(address).await?;
+    let listener = bind_tcp(address, plan.stream_settings.as_ref()).await?;
     Ok(match tls {
         PreparedTlsAcceptor::Rustls(acceptor) => BoundTransport::Tls {
             listener,
@@ -339,8 +382,15 @@ fn tcp_http_version_policy(alpn: &[XhttpListenAlpn]) -> io::Result<HttpVersionPo
         .ok_or_else(|| invalid_input("XHTTP TCP listener ALPN must allow http/1.1 or h2"))
 }
 
-async fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
-    TcpListener::bind(address).await.map_err(|error| {
+async fn bind_tcp(
+    address: SocketAddr,
+    stream_settings: Option<&core_config::NodeStreamSettings>,
+) -> io::Result<TcpListener> {
+    core_outbound::transport::tcp::bind_inbound_listener(
+        address,
+        stream_settings.and_then(|settings| settings.sockopt.as_ref()),
+    )
+    .map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("bind XHTTP TCP listener {address}: {error}"),
@@ -353,7 +403,7 @@ fn transport_local_addr(transport: &BoundTransport) -> io::Result<SocketAddr> {
         BoundTransport::Cleartext { listener, .. } => listener.local_addr(),
         BoundTransport::Tls { listener, .. } => listener.local_addr(),
         BoundTransport::BoringTls { listener, .. } => listener.local_addr(),
-        BoundTransport::Http3(endpoint) => endpoint.local_addr(),
+        BoundTransport::Http3 { endpoint, .. } => endpoint.local_addr(),
     }
 }
 
@@ -365,6 +415,7 @@ async fn run_listener(
     tag: String,
     target: XhttpListenTargetPlan,
     max_active_relays: usize,
+    stream_settings: Option<Arc<core_config::NodeStreamSettings>>,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let transport_server = server.clone();
@@ -373,7 +424,12 @@ async fn run_listener(
         match transport {
             BoundTransport::Cleartext { listener, policy } => {
                 transport_server
-                    .serve_listener_with_policy(listener, transport_shutdown, policy)
+                    .serve_listener_with_policy(
+                        listener,
+                        transport_shutdown,
+                        policy,
+                        stream_settings,
+                    )
                     .await
             }
             BoundTransport::Tls {
@@ -382,7 +438,13 @@ async fn run_listener(
                 policy,
             } => {
                 transport_server
-                    .serve_tls_listener_with_policy(listener, acceptor, transport_shutdown, policy)
+                    .serve_tls_listener_with_policy(
+                        listener,
+                        acceptor,
+                        transport_shutdown,
+                        policy,
+                        stream_settings,
+                    )
                     .await
             }
             BoundTransport::BoringTls {
@@ -396,12 +458,20 @@ async fn run_listener(
                         acceptor,
                         transport_shutdown,
                         policy,
+                        stream_settings,
                     )
                     .await
             }
-            BoundTransport::Http3(endpoint) => {
+            BoundTransport::Http3 {
+                endpoint,
+                quic_params,
+            } => {
                 transport_server
-                    .serve_h3_endpoint(endpoint, transport_shutdown)
+                    .serve_h3_endpoint_with_quic_params(
+                        endpoint,
+                        transport_shutdown,
+                        Some(quic_params),
+                    )
                     .await
             }
         }

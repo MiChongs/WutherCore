@@ -14,6 +14,8 @@
 pub mod adapter;
 pub mod loopback;
 pub mod registry;
+#[allow(unsafe_code)]
+pub mod socket_policy;
 
 pub mod block;
 pub mod direct;

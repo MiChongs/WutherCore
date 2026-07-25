@@ -47,7 +47,7 @@ pub(crate) struct H3Client {
     connection: quinn::Connection,
     sender: H3SendRequest,
     closed: Arc<AtomicBool>,
-    _loopback_guard: LoopbackUdpGuard,
+    _loopback_guard: Option<LoopbackUdpGuard>,
 }
 
 impl H3Client {
@@ -69,23 +69,48 @@ impl H3Client {
         let quic_crypto = QuicClientConfig::try_from(tls)
             .map_err(|error| io_err(format!("xhttp h3 QUIC TLS config: {error}")))?;
         let mut quic_config = QuinnClientConfig::new(Arc::new(quic_crypto));
-        let mut transport = TransportConfig::default();
-        // Xray's quic-go path defaults to standard BBR. Quinn defaults to
-        // Cubic, so select its BBR controller explicitly for wire/runtime
-        // behavior parity rather than inheriting the library default.
-        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-        transport.max_idle_timeout(Some(
-            IdleTimeout::try_from(Duration::from_secs(300))
-                .map_err(|error| io_err(format!("xhttp h3 idle timeout: {error}")))?,
-        ));
-        transport.keep_alive_interval(keep_alive);
-        quic_config.transport_config(Arc::new(transport));
+        let active_policy = crate::socket_policy::current();
+        let quic_params = active_policy
+            .as_ref()
+            .and_then(|policy| policy.settings.finalmask.as_ref())
+            .and_then(|finalmask| finalmask.quic_params.as_ref());
+        let applied_quic = if let Some(quic_params) = quic_params {
+            Some(
+                crate::transport::finalmask::quic::apply_xhttp_client_config(
+                    &mut quic_config,
+                    quic_params,
+                    keep_alive,
+                )?,
+            )
+        } else {
+            let mut transport = TransportConfig::default();
+            // Xray's quic-go path defaults to standard BBR. Quinn defaults to
+            // Cubic, so select its BBR controller explicitly for wire/runtime
+            // behavior parity rather than inheriting the library default.
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+            transport.max_idle_timeout(Some(
+                IdleTimeout::try_from(Duration::from_secs(300))
+                    .map_err(|error| io_err(format!("xhttp h3 idle timeout: {error}")))?,
+            ));
+            transport.keep_alive_interval(keep_alive);
+            quic_config.transport_config(Arc::new(transport));
+            None
+        };
 
         let addresses = resolve_host(host, port).await?;
         let mut last_error = None;
 
         for address in addresses {
-            match connect_one(address, &server_name, quic_config.clone()).await {
+            match connect_one(
+                host,
+                address,
+                &server_name,
+                quic_config.clone(),
+                applied_quic.clone(),
+            )
+            .await
+            {
                 Ok((endpoint, connection, loopback_guard)) => {
                     let h3_connection = h3_quinn::Connection::new(connection.clone());
                     let (mut driver, sender) = with_setup_timeout("handshake", async move {
@@ -446,10 +471,123 @@ impl ManagedConnection for H3Client {
 }
 
 async fn connect_one(
+    host: &str,
     address: SocketAddr,
     server_name: &str,
     config: QuinnClientConfig,
-) -> io::Result<(Endpoint, quinn::Connection, LoopbackUdpGuard)> {
+    applied_quic: Option<crate::transport::finalmask::quic::AppliedQuicParams>,
+) -> io::Result<(Endpoint, quinn::Connection, Option<LoopbackUdpGuard>)> {
+    let active_policy = crate::socket_policy::current();
+    connect_one_with_policy(
+        host,
+        address,
+        server_name,
+        config,
+        applied_quic,
+        active_policy,
+    )
+    .await
+}
+
+async fn connect_one_with_policy(
+    host: &str,
+    address: SocketAddr,
+    server_name: &str,
+    config: QuinnClientConfig,
+    applied_quic: Option<crate::transport::finalmask::quic::AppliedQuicParams>,
+    active_policy: Option<Arc<crate::socket_policy::ActiveStreamPolicy>>,
+) -> io::Result<(Endpoint, quinn::Connection, Option<LoopbackUdpGuard>)> {
+    if let Some(policy) = active_policy {
+        let nominal_local: SocketAddr = if address.is_ipv6() {
+            "[::]:0".parse().expect("valid IPv6 wildcard")
+        } else {
+            "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+        };
+        let masks = policy
+            .settings
+            .finalmask
+            .as_ref()
+            .map(|finalmask| finalmask.udp.clone())
+            .unwrap_or_default();
+        if applied_quic
+            .as_ref()
+            .and_then(|params| params.udp_hop())
+            .is_some()
+            && masks.iter().any(|mask| {
+                matches!(
+                    mask,
+                    core_config::UdpMaskConfig::Realm(_) | core_config::UdpMaskConfig::Xicmp(_)
+                )
+            })
+        {
+            return Err(io_err(
+                "XHTTP finalmask realm/xicmp is incompatible with quicParams.udpHop",
+            ));
+        }
+        let proxy = policy.proxy();
+        let (raw, carrier_local) = if let Some(hop) = applied_quic
+            .as_ref()
+            .and_then(|params| params.udp_hop())
+            .cloned()
+        {
+            crate::transport::finalmask::UdpHopCarrier::open(hop, proxy, host.to_owned(), address)
+                .await?
+        } else if let Some(proxy) = proxy {
+            (
+                crate::socket_policy::dial_udp_through_proxy(
+                    proxy,
+                    host.to_owned(),
+                    address.port(),
+                )
+                .await?,
+                nominal_local,
+            )
+        } else {
+            crate::transport::finalmask::open_direct_carrier(host.to_owned(), address)?
+        };
+        let carrier = if masks.is_empty() {
+            raw
+        } else {
+            crate::transport::finalmask::wrap_udp_client(
+                raw,
+                &masks,
+                host.to_owned(),
+                address.port(),
+                None,
+                Some(address),
+            )
+            .await?
+        };
+        let socket = crate::transport::finalmask::QuinnUdpSocket::new(
+            carrier,
+            carrier_local,
+            address,
+            host.to_owned(),
+            address.port(),
+        );
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|error| io_err(format!("xhttp h3 FinalMask endpoint: {error}")))?;
+        endpoint.set_default_client_config(config);
+        let connecting = endpoint
+            .connect(address, server_name)
+            .map_err(|error| io_err(format!("xhttp h3 connect setup: {error}")))?;
+        let connection = with_setup_timeout("QUIC connect", async move {
+            connecting
+                .await
+                .map_err(|error| io_err(format!("xhttp h3 connect {address}: {error}")))
+        })
+        .await?;
+        if let Some(applied_quic) = applied_quic.as_ref() {
+            applied_quic.apply_max_receive_window(&connection);
+        }
+        return Ok((endpoint, connection, None));
+    }
+
     let bind_address: SocketAddr = if address.is_ipv6() {
         "[::]:0".parse().expect("valid IPv6 wildcard")
     } else {
@@ -475,7 +613,7 @@ async fn connect_one(
             .map_err(|error| io_err(format!("xhttp h3 connect {address}: {error}")))
     })
     .await?;
-    Ok((endpoint, connection, loopback_guard))
+    Ok((endpoint, connection, Some(loopback_guard)))
 }
 
 fn io_err(message: impl Into<String>) -> io::Error {

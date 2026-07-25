@@ -24,7 +24,7 @@ use std::{
 
 use base64::Engine;
 use bytes::{Buf, Bytes};
-use core_config::model::XHTTP_MAX_ACCEPT_QUEUE;
+use core_config::{NodeStreamSettings, model::XHTTP_MAX_ACCEPT_QUEUE};
 use core_outbound::{
     BoxedStream,
     proto::xhttp::{
@@ -324,6 +324,7 @@ struct ServerInner {
     host: String,
     path: String,
     cors_policy: CorsPolicy,
+    trusted_x_forwarded_for: Vec<HeaderName>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     sessions_changed: Notify,
     packet_body_budget: PacketBodyBudget,
@@ -701,6 +702,7 @@ impl XhttpServer {
                     host,
                     path,
                     cors_policy,
+                    trusted_x_forwarded_for: Vec::new(),
                     sessions: Mutex::new(HashMap::new()),
                     sessions_changed: Notify::new(),
                     packet_body_budget,
@@ -719,6 +721,31 @@ impl XhttpServer {
 
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    pub(crate) fn configure_trusted_x_forwarded_for(
+        &mut self,
+        trusted_headers: &[String],
+    ) -> io::Result<()> {
+        let trusted_headers = trusted_headers
+            .iter()
+            .map(|name| {
+                HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid trustedXForwardedFor header name `{name}`: {error}"),
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "XHTTP trustedXForwardedFor must be configured before the server is shared",
+            )
+        })?;
+        inner.trusted_x_forwarded_for = trusted_headers;
+        Ok(())
     }
 
     pub(crate) fn configure_listener_resources(
@@ -1485,6 +1512,36 @@ mod tests {
         assert!(!host_matches("[::1]:not-a-port", "::1"));
         assert!(!host_matches("example.com:99999", "example.com"));
         assert!(!host_matches("user@example.com", "example.com"));
+    }
+
+    #[test]
+    fn trusted_x_forwarded_for_requires_marker_and_uses_first_ip() {
+        let peer: SocketAddr = "127.0.0.1:44321".parse().unwrap();
+        let marker = HeaderName::from_static("x-trusted-cdn");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static(" 2001:db8::7, 198.51.100.2"),
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&headers, std::slice::from_ref(&marker), peer),
+            peer
+        );
+
+        headers.insert(marker.clone(), HeaderValue::from_static("present"));
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&headers, &[marker], peer),
+            "[2001:db8::7]:0".parse().unwrap()
+        );
+        headers.insert("x-forwarded-for", HeaderValue::from_static("proxy.example"));
+        assert_eq!(
+            apply_trusted_x_forwarded_for(
+                &headers,
+                &[HeaderName::from_static("x-trusted-cdn")],
+                peer
+            ),
+            peer
+        );
     }
 
     #[test]
@@ -4159,6 +4216,16 @@ impl XhttpServer {
         endpoint: quinn::Endpoint,
         shutdown: CancellationToken,
     ) -> io::Result<()> {
+        self.serve_h3_endpoint_with_quic_params(endpoint, shutdown, None)
+            .await
+    }
+
+    pub(crate) async fn serve_h3_endpoint_with_quic_params(
+        &self,
+        endpoint: quinn::Endpoint,
+        shutdown: CancellationToken,
+        quic_params: Option<core_outbound::transport::finalmask::quic::AppliedQuicParams>,
+    ) -> io::Result<()> {
         let local_addr = endpoint.local_addr()?;
         let mut connections = JoinSet::new();
         loop {
@@ -4187,10 +4254,14 @@ impl XhttpServer {
             };
             let server = self.clone();
             let connection_shutdown = shutdown.child_token();
+            let quic_params = quic_params.clone();
             connections.spawn(async move {
                 let _connection_slot = connection_slot;
                 match incoming.await {
                     Ok(connection) => {
+                        if let Some(quic_params) = quic_params.as_ref() {
+                            quic_params.apply_max_receive_window(&connection);
+                        }
                         let peer_addr = connection.remote_address();
                         if let Err(error) = server
                             .serve_h3_connection_until(
@@ -4359,6 +4430,11 @@ impl XhttpServer {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
     ) -> io::Result<()> {
+        let peer_addr = apply_trusted_x_forwarded_for(
+            request.headers(),
+            &self.inner.trusted_x_forwarded_for,
+            peer_addr,
+        );
         if let Err(error) = validate_route(&self.inner, &request) {
             return send_h3_request_error(&mut stream, error, HeaderMap::new()).await;
         }
@@ -5249,6 +5325,37 @@ fn validate_head<B>(
     })
 }
 
+/// Xray treats `trustedXForwardedFor` entries as marker header names.  The
+/// first X-Forwarded-For address is trusted only when at least one configured
+/// marker is present; the request source port is deliberately reset to zero.
+fn apply_trusted_x_forwarded_for(
+    headers: &HeaderMap,
+    trusted_headers: &[HeaderName],
+    peer: SocketAddr,
+) -> SocketAddr {
+    let Some(value) = headers.get("x-forwarded-for") else {
+        return peer;
+    };
+    if !trusted_headers
+        .iter()
+        .any(|name| headers.contains_key(name))
+    {
+        return peer;
+    }
+    let first = value
+        .as_bytes()
+        .split(|byte| *byte == b',')
+        .next()
+        .unwrap_or_default();
+    let Ok(first) = std::str::from_utf8(first) else {
+        return peer;
+    };
+    let Ok(ip) = first.trim_matches([' ', '\t']).parse::<std::net::IpAddr>() else {
+        return peer;
+    };
+    SocketAddr::new(ip, 0)
+}
+
 fn validate_route<B>(inner: &ServerInner, request: &Request<B>) -> Result<(), RequestError> {
     if request_header_size(request) > inner.config.normalized_server_max_header_bytes() {
         return Err(RequestError::new(
@@ -5688,14 +5795,58 @@ fn is_clean_h2_streaming_end(error: &(dyn StdError + 'static)) -> bool {
     })
 }
 
-async fn accept_tls_with_timeout(
+async fn accept_tls_with_timeout<S>(
     acceptor: &TlsAcceptor,
-    stream: tokio::net::TcpStream,
+    stream: S,
     timeout: Duration,
-) -> io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+) -> io::Result<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     tokio::time::timeout(timeout, acceptor.accept(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP TLS handshake timed out"))?
+}
+
+async fn prepare_inbound_tcp_carrier(
+    stream: tokio::net::TcpStream,
+    mut peer_addr: SocketAddr,
+    mut local_addr: SocketAddr,
+    settings: Option<&NodeStreamSettings>,
+) -> io::Result<(BoxedStream, SocketAddr, SocketAddr)> {
+    let mut stream: BoxedStream = Box::pin(stream);
+    if settings
+        .and_then(|settings| settings.sockopt.as_ref())
+        .is_some_and(|sockopt| sockopt.accept_proxy_protocol)
+    {
+        let endpoints = tokio::time::timeout(
+            READ_HEADER_TIMEOUT,
+            crate::mixed::read_proxy_protocol(&mut stream, peer_addr, local_addr),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "XHTTP PROXY protocol header timed out",
+            )
+        })??;
+        peer_addr = endpoints.0;
+        local_addr = endpoints.1;
+    }
+    if let Some(masks) = settings
+        .and_then(|settings| settings.finalmask.as_ref())
+        .map(|finalmask| finalmask.tcp.as_slice())
+        .filter(|masks| !masks.is_empty())
+    {
+        stream = core_outbound::transport::finalmask::wrap_tcp_server(
+            stream,
+            masks,
+            Some(local_addr),
+            Some(peer_addr),
+        )
+        .await?;
+    }
+    Ok((stream, peer_addr, local_addr))
 }
 
 impl XhttpServer {
@@ -5845,8 +5996,13 @@ impl XhttpServer {
         listener: TcpListener,
         shutdown: CancellationToken,
     ) -> io::Result<()> {
-        self.serve_listener_with_policy(listener, shutdown, HttpVersionPolicy::HTTP1_AND_HTTP2)
-            .await
+        self.serve_listener_with_policy(
+            listener,
+            shutdown,
+            HttpVersionPolicy::HTTP1_AND_HTTP2,
+            None,
+        )
+        .await
     }
 
     /// Accept and serve plaintext connections under an explicit HTTP version
@@ -5856,6 +6012,7 @@ impl XhttpServer {
         listener: TcpListener,
         shutdown: CancellationToken,
         policy: HttpVersionPolicy,
+        stream_settings: Option<Arc<NodeStreamSettings>>,
     ) -> io::Result<()> {
         let mut connections = JoinSet::new();
         loop {
@@ -5879,12 +6036,27 @@ impl XhttpServer {
                 _ = self.inner.cancelled.cancelled() => break,
                 accepted = listener.accept() => accepted,
             };
-            let (stream, peer_addr) = accepted?;
-            let local_addr = stream.local_addr()?;
+            let (stream, kernel_peer_addr) = accepted?;
+            let kernel_local_addr = stream.local_addr()?;
             let server = self.clone();
             let connection_shutdown = shutdown.child_token();
+            let stream_settings = stream_settings.clone();
             connections.spawn(async move {
                 let _connection_slot = connection_slot;
+                let (stream, peer_addr, local_addr) = match prepare_inbound_tcp_carrier(
+                    stream,
+                    kernel_peer_addr,
+                    kernel_local_addr,
+                    stream_settings.as_deref(),
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::debug!(%kernel_peer_addr, %error, "XHTTP FinalMask/PROXY preparation ended");
+                        return;
+                    }
+                };
                 if let Err(error) = server
                     .serve_io_until_with_policy(
                         stream,
@@ -5922,6 +6094,7 @@ impl XhttpServer {
             acceptor,
             shutdown,
             HttpVersionPolicy::HTTP1_AND_HTTP2,
+            None,
         )
         .await
     }
@@ -5934,6 +6107,7 @@ impl XhttpServer {
         acceptor: TlsAcceptor,
         shutdown: CancellationToken,
         allowed_policy: HttpVersionPolicy,
+        stream_settings: Option<Arc<NodeStreamSettings>>,
     ) -> io::Result<()> {
         let mut connections = JoinSet::new();
         loop {
@@ -5957,13 +6131,28 @@ impl XhttpServer {
                 _ = self.inner.cancelled.cancelled() => break,
                 accepted = listener.accept() => accepted,
             };
-            let (stream, peer_addr) = accepted?;
-            let local_addr = stream.local_addr()?;
+            let (stream, kernel_peer_addr) = accepted?;
+            let kernel_local_addr = stream.local_addr()?;
             let server = self.clone();
             let acceptor = acceptor.clone();
             let connection_shutdown = shutdown.child_token();
+            let stream_settings = stream_settings.clone();
             connections.spawn(async move {
                 let _connection_slot = connection_slot;
+                let (stream, peer_addr, local_addr) = match prepare_inbound_tcp_carrier(
+                    stream,
+                    kernel_peer_addr,
+                    kernel_local_addr,
+                    stream_settings.as_deref(),
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::debug!(%kernel_peer_addr, %error, "XHTTP FinalMask/PROXY preparation ended");
+                        return;
+                    }
+                };
                 match accept_tls_with_timeout(&acceptor, stream, READ_HEADER_TIMEOUT).await {
                     Ok(stream) => {
                         let negotiated_policy = match allowed_policy
@@ -6011,6 +6200,7 @@ impl XhttpServer {
         acceptor: boring::ssl::SslAcceptor,
         shutdown: CancellationToken,
         allowed_policy: HttpVersionPolicy,
+        stream_settings: Option<Arc<NodeStreamSettings>>,
     ) -> io::Result<()> {
         let mut connections = JoinSet::new();
         loop {
@@ -6034,13 +6224,28 @@ impl XhttpServer {
                 _ = self.inner.cancelled.cancelled() => break,
                 accepted = listener.accept() => accepted,
             };
-            let (stream, peer_addr) = accepted?;
-            let local_addr = stream.local_addr()?;
+            let (stream, kernel_peer_addr) = accepted?;
+            let kernel_local_addr = stream.local_addr()?;
             let server = self.clone();
             let acceptor = acceptor.clone();
             let connection_shutdown = shutdown.child_token();
+            let stream_settings = stream_settings.clone();
             connections.spawn(async move {
                 let _connection_slot = connection_slot;
+                let (stream, peer_addr, local_addr) = match prepare_inbound_tcp_carrier(
+                    stream,
+                    kernel_peer_addr,
+                    kernel_local_addr,
+                    stream_settings.as_deref(),
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::debug!(%kernel_peer_addr, %error, "XHTTP FinalMask/PROXY preparation ended");
+                        return;
+                    }
+                };
                 let handshake = tokio::time::timeout(
                     READ_HEADER_TIMEOUT,
                     tokio_boring::accept(&acceptor, stream),
@@ -6090,6 +6295,11 @@ impl XhttpServer {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
     ) -> Response<XhttpBody> {
+        let peer_addr = apply_trusted_x_forwarded_for(
+            request.headers(),
+            &self.inner.trusted_x_forwarded_for,
+            peer_addr,
+        );
         if let Err(error) = validate_route(&self.inner, &request) {
             return error_response(error, HeaderMap::new());
         }

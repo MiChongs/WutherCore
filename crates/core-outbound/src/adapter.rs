@@ -213,6 +213,7 @@ fn prepare_outbound_udp_socket_with(
     if let Err(e) = bind_result {
         tracing::debug!(target: "dial::udp", error = %e, "outbound interface bind failed (non-fatal)");
     }
+    crate::transport::tcp::apply_current_udp_socket_config(&sock, peer)?;
     let local = socket.local_addr()?;
     Ok(crate::loopback::register_udp(local))
 }
@@ -561,6 +562,20 @@ pub type BoxedStream = Pin<Box<dyn ProxyStream>>;
 pub trait UdpSocketLike: Send + Sync {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize>;
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    /// Receive a datagram together with its transport source when the carrier
+    /// can expose one. Connected/proxied associations may return `None`; raw
+    /// carriers override this for finalmask stages such as realm, UDP hopping,
+    /// xdns and server-side demultiplexing.
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<std::net::SocketAddr>)> {
+        self.recv_from(buf).await.map(|length| (length, None))
+    }
+    /// Local transport endpoint when the carrier exposes it.
+    fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(None)
+    }
     /// 关闭通道；某些协议需要发协议级断开。
     async fn close(&self) -> std::io::Result<()> {
         Ok(())

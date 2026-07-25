@@ -314,6 +314,9 @@ pub struct RealityListen {
     pub limit_fallback_download: RealityFallbackLimit,
     #[serde(default)]
     pub limits: RealityResourceLimits,
+    /// Socket policy and TCP FinalMask applied before the REALITY ClientHello.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
 }
 
 impl std::fmt::Debug for RealityListen {
@@ -343,6 +346,7 @@ impl std::fmt::Debug for RealityListen {
             .field("limit_fallback_upload", &self.limit_fallback_upload)
             .field("limit_fallback_download", &self.limit_fallback_download)
             .field("limits", &self.limits)
+            .field("has_stream_settings", &self.stream_settings.is_some())
             .finish()
     }
 }
@@ -499,10 +503,15 @@ pub struct ListenLocalDetail {
     pub auth: Vec<String>,
     #[serde(default = "default_true")]
     pub udp: bool,
+    /// Xray-compatible listener socket policy and server-side final masks.
+    /// Both spellings are accepted so native YAML and imported Xray objects
+    /// share one typed configuration path.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
 }
 
 /// `listen.xhttp` 的单项/数组兼容表示。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum XhttpListenSet {
     One(XhttpListener),
@@ -536,7 +545,7 @@ pub const XHTTP_MAX_ACTIVE_HTTP_STREAMS: usize = 1_000_000;
 /// `settings` 直接复用出站使用的完整 [`XhttpConfig`]，不会把字段降级为
 /// `serde_json::Value` 或字符串 map。TLS 的 `cert` / `key` 都是文件路径；
 /// 文件读取留给运行时，配置编译阶段负责要求路径非空且成对出现。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct XhttpListener {
     #[serde(default = "default_true")]
@@ -626,6 +635,10 @@ pub struct XhttpListener {
         skip_serializing_if = "Option::is_none"
     )]
     pub cors_origins: Option<Vec<String>>,
+    /// Xray-compatible listener socket policy and final masks.  TCP masks are
+    /// applied before TLS; UDP masks and QUIC parameters are applied below H3.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
     #[serde(
         default,
         rename = "settings",
@@ -798,6 +811,8 @@ pub struct NodeDetail {
     pub transport: Option<NodeTransport>,
     #[serde(default)]
     pub network: Option<NodeNetwork>,
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::stream_settings::NodeStreamSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

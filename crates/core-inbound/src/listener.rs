@@ -5,6 +5,7 @@ use std::{
     ops::RangeInclusive,
 };
 
+use core_config::OutboundSocketConfig;
 use core_config::model::Share;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -36,8 +37,18 @@ pub async fn bind_with_fallback(
     report: &PrivilegeReport,
     fallback_range: Option<RangeInclusive<u16>>,
 ) -> std::io::Result<TcpListener> {
+    bind_with_fallback_settings(desired, report, fallback_range, None).await
+}
+
+/// `bind_with_fallback` plus the typed Xray-compatible listener socket policy.
+pub async fn bind_with_fallback_settings(
+    desired: SocketAddr,
+    report: &PrivilegeReport,
+    fallback_range: Option<RangeInclusive<u16>>,
+    socket_config: Option<&OutboundSocketConfig>,
+) -> std::io::Result<TcpListener> {
     // 1) 直接尝试期望端口
-    match TcpListener::bind(desired).await {
+    match core_outbound::transport::tcp::bind_inbound_listener(desired, socket_config) {
         Ok(l) => return Ok(l),
         Err(e) => {
             let reason = match e.kind() {
@@ -62,7 +73,7 @@ pub async fn bind_with_fallback(
     let range = fallback_range.unwrap_or(9001..=9099);
     for port in range.clone() {
         let alt = SocketAddr::new(desired.ip(), port);
-        if let Ok(l) = TcpListener::bind(alt).await {
+        if let Ok(l) = core_outbound::transport::tcp::bind_inbound_listener(alt, socket_config) {
             info!(
                 target: "inbound::listener",
                 want = %desired,

@@ -133,6 +133,10 @@ pub struct ParsedNode {
     pub raw: String,
     /// 协议自定义参数（query / json 字段）。
     pub params: std::collections::BTreeMap<String, String>,
+    /// Typed Xray-compatible transport policy. URI nodes leave this empty;
+    /// structured nodes populate it from `streamSettings`.
+    #[serde(default)]
+    pub stream_settings: Option<crate::stream_settings::NodeStreamSettings>,
 }
 
 impl ParsedNode {
@@ -164,6 +168,7 @@ impl ParsedNode {
             udp: true,
             raw: String::new(),
             params: Default::default(),
+            stream_settings: None,
         }
     }
 }

@@ -204,6 +204,10 @@ impl TrackedTcpStream<tokio::net::TcpStream> {
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.inner.local_addr()
     }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.peer_addr()
+    }
 }
 
 impl<S> AsyncRead for TrackedTcpStream<S>

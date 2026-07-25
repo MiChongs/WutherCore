@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+use super::{TlsOptions, tcp::connect_boxed};
+use crate::adapter::BoxedStream;
 use boring::{
     hash::MessageDigest,
     pkey::{PKey, Private},
@@ -23,13 +25,6 @@ use boring::{
     },
 };
 use core_config::model::{XhttpDownloadTlsCertificate, XhttpTlsCertificateUsage};
-use tokio::net::TcpStream;
-
-use super::{TlsOptions, tcp::marked_connect};
-use crate::{
-    adapter::{BoxedStream, resolve_host},
-    loopback::TrackedTcpStream,
-};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -166,12 +161,12 @@ pub(crate) fn build_connector(options: &TlsOptions) -> io::Result<SslConnector> 
     Ok(builder.build())
 }
 
-pub(crate) async fn connect(
+pub(crate) async fn connect_negotiated(
     connector: Arc<SslConnector>,
     options: &TlsOptions,
     host: &str,
     port: u16,
-) -> io::Result<BoxedStream> {
+) -> io::Result<(BoxedStream, Option<Vec<u8>>)> {
     let domain = options
         .sni
         .as_deref()
@@ -187,7 +182,9 @@ pub(crate) async fn connect(
         configuration.set_verify_hostname(false);
     }
 
-    let tcp = connect_tcp(host, port).await?;
+    // Keep the node socket policy and FinalMask below TLS, exactly like the
+    // shaped-rustls backend.
+    let tcp = connect_boxed(host, port, false).await?;
     let stream = tokio::time::timeout(
         CONNECT_TIMEOUT,
         tokio_boring::connect(configuration, domain, tcp),
@@ -198,27 +195,8 @@ pub(crate) async fn connect(
     if !options.insecure {
         verify_peer(&stream, connector.as_ref(), options, domain)?;
     }
-    Ok(Box::pin(stream))
-}
-
-async fn connect_tcp(host: &str, port: u16) -> io::Result<TrackedTcpStream<TcpStream>> {
-    let addresses = resolve_host(host, port).await?;
-    let mut last_error = None;
-    for address in addresses {
-        match marked_connect(address, CONNECT_TIMEOUT).await {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("TLS connect: no usable address for {host}:{port}"),
-        )
-    }))
+    let negotiated = stream.ssl().selected_alpn_protocol().map(ToOwned::to_owned);
+    Ok((Box::pin(stream), negotiated))
 }
 
 fn verify_peer<S>(
