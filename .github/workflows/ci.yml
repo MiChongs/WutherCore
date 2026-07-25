@@ -57,14 +57,14 @@ jobs:
           toolchain: stable
           components: rustfmt
 
-      - name: Install Firefox Neqo build dependencies
+      - name: Install Firefox Neqo source build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             clang \
             gyp \
-            libnspr4-dev \
-            libnss3-dev \
+            mercurial \
+            ninja-build \
             pkg-config
 
       - name: Cache Cargo

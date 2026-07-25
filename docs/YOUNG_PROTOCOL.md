@@ -270,9 +270,14 @@ young://<base64url-key>@<server-ip-or-host>:443\
 Linux（Debian/Ubuntu）：
 
 ```bash
-sudo apt-get install clang gyp pkg-config libnss3-dev libnspr4-dev libssl-dev
+# Debian/Ubuntu 稳定版的 NSS 若低于 3.121，不要安装 libnss3-dev：
+# nss-rs 会拉取并构建满足版本要求的 NSS/NSPR。
+sudo apt-get install clang gyp mercurial ninja-build pkg-config
 cargo build --release -p wuther-core
 ```
+
+若 `pkg-config --modversion nss` 已报告 `3.121` 或更高版本，可改用发行版提供的
+`libnss3-dev` 与 `libnspr4-dev`，避免源码构建。
 
 Windows 需要可供 `nss-rs` 使用的 NSS/NSPR、Clang/libclang 和相应构建环境；
 MozillaBuild 是推荐的准备方式。若依赖不在默认搜索路径，需要配置
