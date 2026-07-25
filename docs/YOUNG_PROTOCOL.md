@@ -270,7 +270,7 @@ young://<base64url-key>@<server-ip-or-host>:443\
 Linux（Debian/Ubuntu）：
 
 ```bash
-sudo apt-get install clang pkg-config libnss3-dev libnspr4-dev libssl-dev
+sudo apt-get install clang gyp pkg-config libnss3-dev libnspr4-dev libssl-dev
 cargo build --release -p wuther-core
 ```
 
