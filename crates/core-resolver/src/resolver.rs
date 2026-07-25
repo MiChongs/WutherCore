@@ -1619,7 +1619,7 @@ fn register_composite_group(
             continue;
         }
         if let Some(group) = groups.get(spec) {
-            // 保留 group 层级，避免外层并发把内层所有 endpoint 一次性展开。
+            // 保留 group 层级，避免服务级并发与出口级并发被拍平成无界 fan-out。
             members.push(group.clone() as Arc<dyn crate::upstream::DnsUpstream>);
             continue;
         }
@@ -1884,15 +1884,35 @@ fn runtime_strategy(strategy: ResolverStrategy) -> GroupStrategy {
 }
 
 fn configured_server(name: &str, spec: &ResolverServerCfg) -> Result<Arc<DnsGroup>, String> {
-    if spec.endpoints().is_empty() {
-        return Err("endpoints must not be empty".into());
+    let endpoint = spec.endpoint().trim();
+    if endpoint.is_empty() {
+        return Err("endpoint must not be empty".into());
     }
-    let members = spec
-        .endpoints()
-        .iter()
-        .enumerate()
-        .map(|(index, endpoint)| configured_upstream(&format!("{name}#{index}"), endpoint))
-        .collect::<Result<Vec<_>, _>>()?;
+    let params = extract_upstream_params(endpoint);
+    let members = if spec.exits().is_empty() {
+        vec![configured_upstream(&format!("{name}@direct"), endpoint)?]
+    } else {
+        spec.exits()
+            .iter()
+            .map(|outbound| {
+                let outbound = outbound.trim();
+                if outbound.is_empty() {
+                    return Err(format!("resolver server `{name}` contains an empty exit"));
+                }
+                let upstream: Arc<dyn crate::upstream::DnsUpstream> = Arc::new(
+                    crate::upstream::outbound::OutboundDnsUpstream::new(
+                        format!("{name}@{outbound}"),
+                        endpoint,
+                        outbound,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+                Ok(crate::upstream::FilteredUpstream::wrap_if_needed(
+                    upstream, &params,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
     Ok(Arc::new(
         DnsGroup::new(name, runtime_strategy(spec.strategy()), members)
             .with_timeout(spec.timeout())
@@ -3088,11 +3108,13 @@ mode: smart
 fake: off
 servers:
   cf:
-    endpoints: ["udp://1.1.1.1", "udp://1.0.0.1"]
+    endpoint: "https://1.1.1.1/dns-query"
+    exits: [node-a, node-b]
     strategy: adaptive
     max-parallel: 1
   google:
-    endpoints: ["udp://8.8.8.8", "udp://8.8.4.4"]
+    endpoint: "tls://8.8.8.8"
+    exits: [node-a, node-b]
     strategy: random
 groups:
   public:

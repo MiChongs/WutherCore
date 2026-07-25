@@ -26,3 +26,13 @@ thiserror         = { workspace = true }
 tracing           = { workspace = true }
 futures           = { workspace = true }
 rand              = { workspace = true }
+bytes             = { workspace = true }
+url               = { workspace = true }
+hyper             = { workspace = true }
+hyper-util        = { workspace = true }
+http              = { workspace = true }
+http-body-util    = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["http2", "server"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs"] }

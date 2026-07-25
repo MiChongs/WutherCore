@@ -7,27 +7,24 @@ resolver:
   ipv6: true
   listen: 127.0.0.1:1053
 
-  # server 可以是单个字符串，也可以是包含多个 DNS 出口的高级对象。
+  # server 固定一个 DNS endpoint；exits 是访问该服务的代理节点数组。
+  # proxy-hk / proxy-sg 应替换为 nodes 或订阅中真实存在的节点名。
   servers:
     cloudflare:
-      endpoints:
-        - https://1.1.1.1/dns-query
-        - https://1.0.0.1/dns-query
-        - tls://1.1.1.1
+      endpoint: https://1.1.1.1/dns-query
+      exits: [proxy-hk, proxy-sg, DIRECT]
       strategy: adaptive
       timeout: 3s
-      max-parallel: 1
 
     google:
-      endpoints:
-        - https://8.8.8.8/dns-query
-        - tls://8.8.4.4
-      strategy: random
+      endpoint: tls://8.8.8.8
+      exits: [proxy-hk, proxy-sg]
+      strategy: round-robin
       timeout: 3s
 
     ali: https://223.5.5.5/dns-query
 
-  # group 可嵌套；短列表默认使用 adaptive。
+  # group 负责不同 DNS 服务之间的冗余，也可以继续嵌套。
   groups:
     domestic: [ali, udp://119.29.29.29]
     public:

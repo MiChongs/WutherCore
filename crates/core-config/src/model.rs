@@ -1123,8 +1123,8 @@ pub struct Resolver {
     pub direct_nameserver: Vec<String>,
     #[serde(default, rename = "direct-nameserver-follow-policy")]
     pub direct_nameserver_follow_policy: bool,
-    /// 命名 DNS server。字符串是兼容/简洁写法；对象写法可配置多个 endpoint
-    /// 及 endpoint 之间的调度策略。
+    /// 命名 DNS server。字符串是兼容/简洁写法；对象写法可让同一个 endpoint
+    /// 通过多个代理出口查询。
     #[serde(default = "default_resolver_servers")]
     pub servers: BTreeMap<String, ResolverServer>,
     /// 可嵌套 DNS group。列表是简洁写法；对象写法可覆盖策略、超时和并发上限。
@@ -1198,19 +1198,45 @@ fn default_dns_max_parallel() -> usize {
     2
 }
 
-/// 命名 server 的兼容字符串写法或高级多 endpoint 写法。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+/// 命名 server 的兼容字符串写法或高级多出口写法。
+#[derive(Debug, Clone, Serialize)]
 pub enum ResolverServer {
     Simple(String),
     Advanced(ResolverServerAdvanced),
 }
 
+impl<'de> Deserialize<'de> for ResolverServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(endpoint) => Ok(Self::Simple(endpoint)),
+            serde_yaml::Value::Mapping(_) => {
+                serde_yaml::from_value::<ResolverServerAdvanced>(value)
+                    .map(Self::Advanced)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom(
+                "DNS server 必须是 endpoint 字符串，或包含 endpoint/exits 的对象",
+            )),
+        }
+    }
+}
+
 impl ResolverServer {
-    pub fn endpoints(&self) -> &[String] {
+    pub fn endpoint(&self) -> &str {
         match self {
-            Self::Simple(endpoint) => std::slice::from_ref(endpoint),
-            Self::Advanced(config) => &config.endpoints,
+            Self::Simple(endpoint) => endpoint,
+            Self::Advanced(config) => &config.endpoint,
+        }
+    }
+
+    pub fn exits(&self) -> &[String] {
+        match self {
+            Self::Simple(_) => &[],
+            Self::Advanced(config) => &config.exits,
         }
     }
 
@@ -1251,16 +1277,18 @@ impl From<&str> for ResolverServer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverServerAdvanced {
-    /// 可用 DNS endpoint/出口。支持 DoH、DoT、DoQ、UDP、TCP 和 system。
+    /// 唯一 DNS 服务 endpoint。服务级冗余应由 `resolver.groups` 表达。
+    #[serde(alias = "address", alias = "upstream")]
+    pub endpoint: String,
+    /// 访问该 endpoint 的代理节点数组；空数组表示沿用默认直连 DNS socket。
     #[serde(
         default,
         deserialize_with = "deserialize_string_or_vec",
-        alias = "endpoint",
-        alias = "address",
-        alias = "addresses",
-        alias = "upstreams"
+        alias = "outbound",
+        alias = "outbounds",
+        alias = "nodes"
     )]
-    pub endpoints: Vec<String>,
+    pub exits: Vec<String>,
     #[serde(default)]
     pub strategy: ResolverStrategy,
     #[serde(default = "default_dns_group_timeout", with = "humantime_serde")]

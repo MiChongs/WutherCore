@@ -138,9 +138,8 @@ resolver:
   servers:
     local: "udp://223.5.5.5"
     cloudflare:
-      endpoints:
-        - "https://1.1.1.1/dns-query"
-        - "tls://1.0.0.1"
+      endpoint: "https://1.1.1.1/dns-query"
+      exits: [node-a, node-b]
       strategy: adaptive
       timeout: 3s
       max-parallel: 1
@@ -159,7 +158,14 @@ resolver:
         let plan = load_from_str(yaml).unwrap();
 
         assert_eq!(plan.resolver.groups.len(), 2);
-        assert_eq!(plan.resolver.servers["cloudflare"].endpoints().len(), 2);
+        assert_eq!(
+            plan.resolver.servers["cloudflare"].endpoint(),
+            "https://1.1.1.1/dns-query"
+        );
+        assert_eq!(
+            plan.resolver.servers["cloudflare"].exits(),
+            ["node-a", "node-b"]
+        );
         assert_eq!(
             plan.resolver.servers["cloudflare"].strategy(),
             ResolverStrategy::Adaptive
@@ -169,6 +175,19 @@ resolver:
             ResolverStrategy::Parallel
         );
         assert_eq!(plan.resolver.groups["public"].max_parallel(), 2);
+    }
+
+    #[test]
+    fn resolver_rejects_multiple_endpoints_in_one_server() {
+        let yaml = r#"
+version: 1
+resolver:
+  servers:
+    cloudflare:
+      endpoints: [https://1.1.1.1/dns-query, tls://1.1.1.1]
+"#;
+        let error = load_from_str(yaml).unwrap_err().to_string();
+        assert!(error.contains("endpoints"), "{error}");
     }
 
     #[test]

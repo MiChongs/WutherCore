@@ -110,8 +110,9 @@ resolver:
 
 `resolver.listen` 会在同一地址启动 UDP 和 TCP DNS。启用 Fake IP 时，需要确保捕获路径能够把 Fake IP 反查回域名；排错时可先关闭 Fake IP，区分解析问题与路由问题。
 
-高级配置把“DNS 服务”和“服务组”分为两层。一个 server 可有多个
-`endpoints`（同一服务的多个出口），group 也可以引用其它 group：
+高级配置把“DNS 服务”“代理出口”和“服务组”分开：一个 server 固定一个
+DNS `endpoint`，`exits` 指定访问该 endpoint 的代理节点；group 负责在不同
+DNS 服务之间调度，也可以引用其它 group：
 
 ```yaml
 resolver:
@@ -120,19 +121,15 @@ resolver:
 
   servers:
     cloudflare:
-      endpoints:
-        - https://1.1.1.1/dns-query
-        - https://1.0.0.1/dns-query
-        - tls://1.1.1.1
+      endpoint: https://1.1.1.1/dns-query
+      exits: [香港节点, 新加坡节点, DIRECT]
       strategy: adaptive
       timeout: 3s
-      max-parallel: 1
 
     google:
-      endpoints:
-        - https://8.8.8.8/dns-query
-        - tls://8.8.4.4
-      strategy: random
+      endpoint: tls://8.8.8.8
+      exits: [香港节点, 新加坡节点]
+      strategy: round-robin
       timeout: 3s
 
   groups:
@@ -165,10 +162,16 @@ resolver:
 | `sequential` | 按配置顺序逐个尝试 |
 | `all` | 有界并发并合并全部成功答案 |
 
+`exits` 中填写 `nodes` 或订阅加载后的真实节点名，也可以使用 `DIRECT`。
+同一个 DoH/DoT endpoint 会经选中的节点建立连接；节点失效时按 server 的
+策略尝试其它出口。DoH、DoT、TCP DNS 和 UDP DNS 支持命名出口；DoQ 由于
+QUIC 需要完整的代理数据报通道，目前只能使用默认直连 socket。
+
+server 的 `strategy` 只调度代理出口，group 的 `strategy` 只调度 DNS 服务。
 group 会保留嵌套边界，不会把成员拍平。例如 `public` 并发查询
-`cloudflare/google`，两者内部均为 `random/adaptive` 时只产生 2 个上游查询，
-不会把两组的所有 endpoint 同时展开。只有显式把内层也配置成 `parallel/all`
-时才会继续并发。
+`cloudflare/google` 时最多启动 2 个服务查询；每个服务再按自己的
+策略执行。只有 `parallel` / `all` 会并发出口，并受 server 自己的
+`max-parallel` 限制，不会无上限展开。
 
 普通模式会原样转发所有 DNS QTYPE（包括 TXT、MX、SRV、CAA、DNSSEC、
 SVCB/HTTPS、ANY 和未知类型码）；Fake IP 仅对 A/AAAA 合成地址。
