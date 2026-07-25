@@ -39,3 +39,4 @@ pub mod vmess_kdf;
 pub mod vmess_legacy;
 pub mod wireguard;
 pub mod xhttp;
+pub mod young;

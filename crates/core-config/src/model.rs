@@ -211,6 +211,109 @@ pub struct Listen {
     /// `protocol` 指定的内层代理协议。
     #[serde(default, alias = "reality-inbounds", alias = "reality_inbounds")]
     pub reality: Vec<RealityListen>,
+    /// Young 原生入站。传输层是 Firefox 使用的 Mozilla Neqo HTTP/3/WebTransport。
+    #[serde(default, alias = "young-inbounds", alias = "young_inbounds")]
+    pub young: Vec<YoungListen>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YoungListen {
+    #[serde(default = "default_young_listen_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(
+        rename = "nssDatabase",
+        alias = "nss_database",
+        alias = "nss-database",
+        alias = "nss-db"
+    )]
+    pub nss_database: String,
+    #[serde(
+        rename = "certificateNickname",
+        alias = "certificate_nickname",
+        alias = "certificate-nickname",
+        alias = "certificate"
+    )]
+    pub certificate_nickname: String,
+    pub authority: String,
+    #[serde(default = "default_young_path")]
+    pub path: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(
+        default = "default_young_clock_skew",
+        with = "humantime_serde",
+        rename = "clockSkew",
+        alias = "clock_skew",
+        alias = "clock-skew"
+    )]
+    pub clock_skew: Duration,
+    #[serde(
+        default = "default_young_idle_timeout",
+        with = "humantime_serde",
+        rename = "idleTimeout",
+        alias = "idle_timeout",
+        alias = "idle-timeout"
+    )]
+    pub idle_timeout: Duration,
+    #[serde(
+        default = "default_young_max_streams",
+        rename = "maxStreams",
+        alias = "max_streams",
+        alias = "max-streams"
+    )]
+    pub max_streams: u64,
+    #[serde(
+        default = "default_young_max_sessions",
+        rename = "maxSessions",
+        alias = "max_sessions",
+        alias = "max-sessions"
+    )]
+    pub max_sessions: usize,
+    #[serde(
+        default = "default_young_max_flows",
+        rename = "maxFlowsPerSession",
+        alias = "max_flows_per_session",
+        alias = "max-flows-per-session"
+    )]
+    pub max_flows_per_session: usize,
+    #[serde(
+        default = "default_young_decoy_status",
+        rename = "decoyStatus",
+        alias = "decoy_status",
+        alias = "decoy-status"
+    )]
+    pub decoy_status: u16,
+    #[serde(
+        default = "default_young_decoy_body",
+        rename = "decoyBody",
+        alias = "decoy_body",
+        alias = "decoy-body"
+    )]
+    pub decoy_body: String,
+}
+
+impl std::fmt::Debug for YoungListen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("YoungListen")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("nss_database", &self.nss_database)
+            .field("certificate_nickname", &self.certificate_nickname)
+            .field("authority", &self.authority)
+            .field("path", &self.path)
+            .field("user_count", &self.users.len())
+            .field("clock_skew", &self.clock_skew)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_streams", &self.max_streams)
+            .field("max_sessions", &self.max_sessions)
+            .field("max_flows_per_session", &self.max_flows_per_session)
+            .field("decoy_status", &self.decoy_status)
+            .field("decoy_body_bytes", &self.decoy_body.len())
+            .finish()
+    }
 }
 
 /// Xray REALITY 服务端监听配置。
@@ -1744,6 +1847,33 @@ fn default_localhost() -> String {
 }
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()
+}
+fn default_young_listen_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_young_path() -> String {
+    "/assets".into()
+}
+fn default_young_clock_skew() -> Duration {
+    Duration::from_secs(120)
+}
+fn default_young_idle_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+fn default_young_max_streams() -> u64 {
+    1024
+}
+fn default_young_max_sessions() -> usize {
+    4096
+}
+fn default_young_max_flows() -> usize {
+    1024
+}
+fn default_young_decoy_status() -> u16 {
+    404
+}
+fn default_young_decoy_body() -> String {
+    "<!doctype html><html><head><title>Not Found</title></head><body><h1>Not Found</h1></body></html>".into()
 }
 fn default_reality_inner_protocol() -> String {
     "vless".into()
