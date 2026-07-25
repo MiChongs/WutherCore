@@ -5,7 +5,7 @@
 //! | 能力 | 实现 |
 //! |---|---|
 //! | **乐观缓存**（stale-while-revalidate） | [`cache::DnsCache`] |
-//! | **多上游 group 并发**（fastest / fallback / all） | [`group::DnsGroup`] |
+//! | **分层多上游调度**（round-robin / random / parallel / adaptive / sequential / all） | [`group::DnsGroup`] |
 //! | **域名策略**（reject / accept / direct / proxy / fake） | [`policy::PolicyEngine`] |
 //! | **节点 host 走 bootstrap** 防代理回环 | [`resolver::Resolver::resolve_via_bootstrap`] |
 //! | **Fake IP 池**（双栈 + TTL + 保留地址回避） | [`fake_ip::FakeIpPool`] |

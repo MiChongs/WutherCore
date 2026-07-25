@@ -129,6 +129,49 @@ resolver:
     }
 
     #[test]
+    fn resolver_friendly_and_advanced_dns_groups_are_preserved() {
+        let yaml = r#"
+version: 1
+profile: desktop
+resolver:
+  fake: off
+  servers:
+    local: "udp://223.5.5.5"
+    cloudflare:
+      endpoints:
+        - "https://1.1.1.1/dns-query"
+        - "tls://1.0.0.1"
+      strategy: adaptive
+      timeout: 3s
+      max-parallel: 1
+  groups:
+    cn: [local]
+    public:
+      members: [cloudflare, cn]
+      strategy: parallel
+      timeout: 4s
+      max-parallel: 2
+  nameserver: [public]
+  fallback: []
+  rules:
+    - { suffix: example.com, route: public, strategy: round-robin }
+"#;
+        let plan = load_from_str(yaml).unwrap();
+
+        assert_eq!(plan.resolver.groups.len(), 2);
+        assert_eq!(plan.resolver.servers["cloudflare"].endpoints().len(), 2);
+        assert_eq!(
+            plan.resolver.servers["cloudflare"].strategy(),
+            ResolverStrategy::Adaptive
+        );
+        assert_eq!(
+            plan.resolver.groups["public"].strategy(),
+            ResolverStrategy::Parallel
+        );
+        assert_eq!(plan.resolver.groups["public"].max_parallel(), 2);
+    }
+
+    #[test]
     fn resolver_rejects_removed_mainland_overseas_fields() {
         let yaml = r#"
 version: 1
@@ -445,5 +488,10 @@ route:
         let error = load_from_str(yaml).unwrap_err().to_string();
         assert!(error.contains("duplicate"), "{error}");
         assert!(error.contains("重复"), "{error}");
+    }
+
+    #[test]
+    fn advanced_dns_example_loads() {
+        load_from_str(include_str!("../../../examples/dns-advanced.yaml")).unwrap();
     }
 }

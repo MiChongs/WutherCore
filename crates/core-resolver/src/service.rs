@@ -285,6 +285,7 @@ mod tests {
 
     use async_trait::async_trait;
     use core_config::model::{FakeMode, Resolver as ResolverCfg, ResolverMode};
+    use hickory_resolver::proto::rr::{Name, RData, Record, RecordType, rdata::TXT};
     use tokio::net::UdpSocket;
 
     use crate::{
@@ -308,6 +309,43 @@ mod tests {
         }
         async fn query_aaaa(&self, _: &str) -> Result<Vec<IpAddr>, DnsError> {
             Ok(vec!["2001:db8::9".parse().unwrap()])
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AnyRecordUpstream {
+        seen: std::sync::Mutex<Vec<RecordType>>,
+    }
+
+    #[async_trait]
+    impl DnsUpstream for AnyRecordUpstream {
+        fn name(&self) -> &str {
+            "any-record"
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+
+        async fn query_a(&self, _: &str) -> Result<Vec<IpAddr>, DnsError> {
+            Ok(vec!["9.9.9.9".parse().unwrap()])
+        }
+
+        async fn query_aaaa(&self, _: &str) -> Result<Vec<IpAddr>, DnsError> {
+            Ok(vec!["2001:db8::9".parse().unwrap()])
+        }
+
+        async fn query_records(
+            &self,
+            host: &str,
+            record_type: RecordType,
+        ) -> Result<Vec<Record>, DnsError> {
+            self.seen.lock().unwrap().push(record_type);
+            Ok(vec![Record::from_rdata(
+                Name::from_ascii(host).unwrap(),
+                60,
+                RData::TXT(TXT::new(vec!["forwarded".into()])),
+            )])
         }
     }
 
@@ -450,7 +488,7 @@ mod tests {
     async fn normal_dns_service_forwards_non_address_qtype() {
         let dns_addr = spawn_txt_dns_server(b"normal-mode-real-dns").await;
         let mut servers = BTreeMap::new();
-        servers.insert("local".into(), format!("udp://{dns_addr}"));
+        servers.insert("local".into(), format!("udp://{dns_addr}").into());
         let resolver = Arc::new(
             Resolver::try_new(ResolverCfg {
                 mode: ResolverMode::Normal,
@@ -470,6 +508,45 @@ mod tests {
         assert!(
             resp.windows(b"normal-mode-real-dns".len())
                 .any(|w| w == b"normal-mode-real-dns")
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_dns_service_forwards_known_any_and_unknown_qtypes() {
+        let upstream = Arc::new(AnyRecordUpstream::default());
+        let group = Arc::new(DnsGroup::new(
+            "default",
+            GroupStrategy::Sequential,
+            vec![upstream.clone()],
+        ));
+        let resolver = Arc::new(
+            ResolverBuilder::new()
+                .group("default", group.clone())
+                .bootstrap(group)
+                .policy(PolicyEngine::new().with_default(DnsAction::Direct("default".into())))
+                .build(),
+        );
+        let service = DnsService::new(resolver);
+        let qtypes = [
+            2u16, 5, 6, 12, 15, 16, 33, 35, 43, 46, 47, 48, 64, 65, 255, 65400,
+        ];
+
+        for qtype in qtypes {
+            let response = service.serve_packet(&query("all.example", qtype)).await;
+            assert_eq!(
+                u16::from_be_bytes([response[6], response[7]]),
+                1,
+                "qtype {qtype} was not forwarded"
+            );
+        }
+
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(seen.len(), qtypes.len());
+        assert_eq!(
+            seen.iter()
+                .map(|record_type| u16::from(*record_type))
+                .collect::<Vec<_>>(),
+            qtypes
         );
     }
 
