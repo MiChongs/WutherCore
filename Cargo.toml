@@ -160,7 +160,7 @@ core-young    = { path = "crates/core-young", default-features = false }
 neqo-common   = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
 neqo-http3    = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
 neqo-transport = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
-nss           = { package = "nss-rs", git = "https://github.com/mozilla/nss-rs", rev = "b7cfa30c8a526167cf6bd653b4a6d4f8549280eb" }
+nss           = { package = "nss-rs", git = "https://github.com/mozilla/nss-rs" }
 xray-routing  = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-routing" }
 xray-transport = { path = "third_party/xray-transport" }
 xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-utls" }
