@@ -732,7 +732,8 @@ mod tests {
             parse_uri("naive+quic://u:p@[2001:db8::1]:443?quic_congestion_control=bbr2").unwrap();
         assert_eq!(quic.protocol, NodeProtocol::Naive);
         assert_eq!(quic.host, "2001:db8::1");
-        assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));    }
+        assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));
+    }
 
     #[test]
     fn parse_young_requires_firefox_neqo_parameters() {
