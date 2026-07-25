@@ -14,6 +14,7 @@ naive = ["dep:cronet", "dep:hickory-proto"]
 [dependencies]
 core-config = { workspace = true }
 core-reality = { workspace = true }
+core-young   = { workspace = true, features = ["firefox-stack"] }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }

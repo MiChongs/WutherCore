@@ -38,6 +38,7 @@ pub enum NodeProtocol {
     Mieru,
     Sudoku,
     TrustTunnel,
+    Young,
     /// DNS hijack outbound (mihomo `type: dns`)：把 port-53 流量在本地直接
     /// 用 resolver 应答，不连远端。常配合 `RULE-SET / DST-PORT 53 → DNS_Hijack`
     /// 把 LAN 客户端的 DNS 截到本机解析。
@@ -69,6 +70,7 @@ impl NodeProtocol {
             "mieru" => Self::Mieru,
             "sudoku" => Self::Sudoku,
             "trusttunnel" => Self::TrustTunnel,
+            "young" => Self::Young,
             "dns" => Self::Dns,
             other => Self::Other(other.into()),
         }
@@ -96,6 +98,7 @@ impl NodeProtocol {
             Self::Mieru => "mieru",
             Self::Sudoku => "sudoku",
             Self::TrustTunnel => "trusttunnel",
+            Self::Young => "young",
             Self::Dns => "dns",
             Self::Other(s) => s.as_str(),
         }
@@ -169,6 +172,7 @@ pub fn parse_uri(uri: &str) -> ConfigResult<ParsedNode> {
         NodeProtocol::Shadowsocks => parse_ss(uri)?,
         NodeProtocol::Vmess => parse_vmess(uri)?,
         NodeProtocol::Vless
+        | NodeProtocol::Young
         | NodeProtocol::Trojan
         | NodeProtocol::Naive
         | NodeProtocol::Hysteria2
@@ -248,7 +252,11 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     node.raw = uri.to_string();
     node.tls = matches!(
         proto,
-        NodeProtocol::Trojan | NodeProtocol::Naive | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+        NodeProtocol::Trojan
+            | NodeProtocol::Naive
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Young
     ) || params
         .get("security")
         .map(|s| matches!(s.as_str(), "tls" | "reality"))
@@ -289,6 +297,37 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
             }
         }
     }
+    if matches!(proto, NodeProtocol::Young) {
+        let key = node
+            .user
+            .as_deref()
+            .ok_or_else(|| ConfigError::bad_node("Young URI 必须在 userinfo 中携带 256 位密钥"))?;
+        core_young::YoungKey::parse_base64url(key)
+            .map_err(|error| ConfigError::bad_node(format!("Young 密钥无效：{error}")))?;
+        if params
+            .get("security")
+            .is_some_and(|security| !security.eq_ignore_ascii_case("tls"))
+        {
+            return Err(ConfigError::bad_node(
+                "Young 固定使用 Neqo QUIC/TLS；security 只能是 tls",
+            ));
+        }
+        let pin = params
+            .get("pin-sha256")
+            .or_else(|| params.get("pin_sha256"))
+            .or_else(|| params.get("pin"))
+            .ok_or_else(|| ConfigError::bad_node("Young URI 缺少 pin-sha256 证书固定值"))?;
+        validate_young_certificate_pin(pin)?;
+        if params
+            .get("path")
+            .is_some_and(|path| !path.starts_with('/') || path.len() > 512)
+        {
+            return Err(ConfigError::bad_node(
+                "Young path 必须以 / 开头且不超过 512 字节",
+            ));
+        }
+        node.transport = "webtransport".into();
+    }
     node.params = params;
     Ok(node)
 }
@@ -296,6 +335,27 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
 fn scheme_is_naive_quic(uri: &str) -> bool {
     uri.get(..uri.find("://").unwrap_or_default())
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("naive+quic"))
+}
+
+fn validate_young_certificate_pin(value: &str) -> ConfigResult<()> {
+    use base64::Engine as _;
+
+    let decoded = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        hex::decode(value)
+            .map_err(|error| ConfigError::bad_node(format!("Young pin-sha256 hex 无效：{error}")))?
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|error| {
+                ConfigError::bad_node(format!("Young pin-sha256 base64url 无效：{error}"))
+            })?
+    };
+    if decoded.len() != 32 {
+        return Err(ConfigError::bad_node(
+            "Young pin-sha256 解码后必须正好为 32 字节",
+        ));
+    }
+    Ok(())
 }
 
 fn reality_settings_from_params(
@@ -672,7 +732,30 @@ mod tests {
             parse_uri("naive+quic://u:p@[2001:db8::1]:443?quic_congestion_control=bbr2").unwrap();
         assert_eq!(quic.protocol, NodeProtocol::Naive);
         assert_eq!(quic.host, "2001:db8::1");
-        assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));
+        assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));    }
+
+    #[test]
+    fn parse_young_requires_firefox_neqo_parameters() {
+        let node = parse_uri(
+            "young://WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo@203.0.113.8:443?security=tls&sni=cdn.example&authority=cdn.example&path=%2Fassets&pin-sha256=0000000000000000000000000000000000000000000000000000000000000000#YOUNG",
+        )
+        .unwrap();
+        assert_eq!(node.protocol, NodeProtocol::Young);
+        assert_eq!(node.transport, "webtransport");
+        assert!(node.tls);
+        assert!(node.reality.is_none());
+        assert_eq!(node.sni.as_deref(), Some("cdn.example"));
+        assert_eq!(node.params.get("path").map(String::as_str), Some("/assets"));
+    }
+
+    #[test]
+    fn parse_young_rejects_missing_certificate_pin() {
+        let error = parse_uri(
+            "young://WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo@example.com:443?security=tls",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pin-sha256"), "{error}");
     }
 
     #[test]

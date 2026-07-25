@@ -3,7 +3,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -40,7 +42,7 @@ pub enum RuntimeError {
 
 pub struct Runtime {
     pub plan: RuntimePlan,
-    pub outbounds: parking_lot::RwLock<OutboundRegistry>,
+    pub outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
     pub groups: parking_lot::RwLock<BTreeMap<String, Arc<GroupSelector>>>,
     node_info: parking_lot::RwLock<BTreeMap<String, RuntimeNodeInfo>>,
     pub route: RouteEngine,
@@ -127,6 +129,12 @@ impl Runtime {
     ) -> Self {
         let mut reg = OutboundRegistry::new();
         register_nodes(&mut reg, &plan.nodes);
+        let outbounds = Arc::new(parking_lot::RwLock::new(reg));
+        core_resolver::upstream::outbound::set_dns_outbound_provider(Arc::new(
+            RuntimeDnsOutboundProvider {
+                outbounds: outbounds.clone(),
+            },
+        ));
 
         let mut groups = BTreeMap::new();
         for (name, g) in &plan.groups {
@@ -209,7 +217,7 @@ impl Runtime {
         };
         Self {
             plan,
-            outbounds: parking_lot::RwLock::new(reg),
+            outbounds,
             groups: parking_lot::RwLock::new(groups),
             node_info: parking_lot::RwLock::new(node_info),
             route,
@@ -1293,6 +1301,108 @@ impl core_outbound::DialResolver for ResolverAdapter {
     fn ipv6_enabled(&self) -> bool {
         self.resolver.ipv6_enabled()
     }
+}
+
+struct RuntimeDnsOutboundProvider {
+    outbounds: Arc<parking_lot::RwLock<OutboundRegistry>>,
+}
+
+struct RuntimeDnsProxyStream(core_outbound::BoxedStream);
+
+impl tokio::io::AsyncRead for RuntimeDnsProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.get_mut().0.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for RuntimeDnsProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        self.get_mut().0.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        self.get_mut().0.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        self.get_mut().0.as_mut().poll_shutdown(cx)
+    }
+}
+
+#[async_trait::async_trait]
+impl core_resolver::upstream::outbound::DnsOutboundProvider for RuntimeDnsOutboundProvider {
+    async fn dial_tcp(
+        &self,
+        outbound: &str,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<core_resolver::upstream::outbound::BoxedDnsProxyStream> {
+        let adapter = self
+            .outbounds
+            .read()
+            .get(outbound)
+            .ok_or_else(|| unknown_dns_outbound(outbound))?;
+        let stream = adapter
+            .dial_tcp(DialContext::tcp(host, port).with_id(core_outbound::next_dial_id()))
+            .await?;
+        Ok(Box::pin(RuntimeDnsProxyStream(stream)))
+    }
+
+    async fn exchange_udp(
+        &self,
+        outbound: &str,
+        host: &str,
+        port: u16,
+        request: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        let adapter = self
+            .outbounds
+            .read()
+            .get(outbound)
+            .ok_or_else(|| unknown_dns_outbound(outbound))?;
+        if !adapter.capabilities().udp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("DNS 出口 `{outbound}`/{} 不支持 UDP", adapter.protocol()),
+            ));
+        }
+        let socket = adapter
+            .dial_udp(DialContext::udp(host, port).with_id(core_outbound::next_dial_id()))
+            .await?;
+        let written = socket.send_to(request, host, port).await?;
+        if written != request.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "DNS 出口 `{outbound}` UDP 仅发送 {written}/{} bytes",
+                    request.len()
+                ),
+            ));
+        }
+        let mut response = vec![0u8; 65_535];
+        let length = socket.recv_from(&mut response).await?;
+        response.truncate(length);
+        let _ = socket.close().await;
+        Ok(response)
+    }
+}
+
+fn unknown_dns_outbound(outbound: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("DNS 配置引用了不存在的代理出口 `{outbound}`"),
+    )
 }
 
 struct OutboundDnsSocketFactory;

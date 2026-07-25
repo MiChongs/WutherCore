@@ -18,6 +18,7 @@ members = [
     "crates/core-observe",
     "crates/core-process",
     "crates/core-reality",
+    "crates/core-young",
     "crates/wuther-core",
     "tests-e2e",
 ]
@@ -56,7 +57,7 @@ tracing-appender = "0.2"
 bytes = "1"
 url = "2"
 ipnet = { version = "2", features = ["serde"] }
-hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls", "dns-over-https-rustls"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls", "dns-over-https-rustls", "system-config"] }
 hickory-proto = "0.26"
 
 # Hash / 集合 / 内存优化
@@ -84,7 +85,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # 自研 core-fetch 用的 HTTP 1.1 client 栈 —— 直接走 hyper 1.x，注入
 # bind_outbound_socket，关掉所有平台（含 Windows）订阅 / 规则集拉取的 TUN
 # 自循环。已经替代 reqwest，依赖也跟着移除。
-hyper            = { version = "1", features = ["client", "http1"] }
+hyper            = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util       = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 http             = "1"
 http-body-util   = "0.1"
@@ -157,6 +158,11 @@ core-mesh     = { path = "crates/core-mesh" }
 core-observe  = { path = "crates/core-observe" }
 core-process  = { path = "crates/core-process" }
 core-reality  = { path = "crates/core-reality" }
+core-young    = { path = "crates/core-young", default-features = false }
+neqo-common   = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
+neqo-http3    = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
+neqo-transport = { git = "https://github.com/mozilla/neqo", rev = "76673b127251c90ad6250de7a0a7400ddd4661f1" }
+nss           = { package = "nss-rs", git = "https://github.com/mozilla/nss-rs" }
 xray-routing  = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-routing" }
 xray-transport = { path = "third_party/xray-transport" }
 xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3e00da1abfc5fff70487b0dd2ba16054797584", package = "xray-utls" }

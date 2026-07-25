@@ -97,18 +97,86 @@ wuther-core ruleset convert input.json output.txt
 
 ## DNS
 
+最简配置可以直接写 endpoint；旧配置保持兼容：
+
 ```yaml
 resolver:
   mode: smart
   ipv6: true
-  nameserver:
-    - https://1.1.1.1/dns-query
-  fallback:
-    - tls://8.8.8.8
+  servers:
+    cloudflare: https://1.1.1.1/dns-query
+    google: tls://8.8.8.8
+  nameserver: [cloudflare, google]
   listen: 127.0.0.1:1053
 ```
 
 `resolver.listen` 会在同一地址启动 UDP 和 TCP DNS。启用 Fake IP 时，需要确保捕获路径能够把 Fake IP 反查回域名；排错时可先关闭 Fake IP，区分解析问题与路由问题。
+
+高级配置把“DNS 服务”“代理出口”和“服务组”分开：一个 server 固定一个
+DNS `endpoint`，`exits` 指定访问该 endpoint 的代理节点；group 负责在不同
+DNS 服务之间调度，也可以引用其它 group：
+
+```yaml
+resolver:
+  mode: smart
+  fake: off
+
+  servers:
+    cloudflare:
+      endpoint: https://1.1.1.1/dns-query
+      exits: [香港节点, 新加坡节点, DIRECT]
+      strategy: adaptive
+      timeout: 3s
+
+    google:
+      endpoint: tls://8.8.8.8
+      exits: [香港节点, 新加坡节点]
+      strategy: round-robin
+      timeout: 3s
+
+  groups:
+    # 列表是友好短写，默认 strategy=adaptive。
+    domestic: [udp://223.5.5.5, udp://119.29.29.29]
+
+    public:
+      members: [cloudflare, google]
+      strategy: parallel
+      max-parallel: 2
+      timeout: 4s
+
+  nameserver: [public]
+  fallback: [domestic]
+
+  rules:
+    # rule 的 strategy 仅覆盖本次查询；不写则继承 public 的 parallel。
+    - { suffix: example.com, route: public, strategy: round-robin }
+    - "suffix:internal.example -> route:domestic?strategy=sequential"
+```
+
+可用策略：
+
+| 策略 | 行为 |
+|---|---|
+| `round-robin` | 每次从下一个成员开始；当前成员失败后顺序故障转移 |
+| `random` | 随机成员；失败后从剩余成员继续尝试 |
+| `parallel` | 有界并发，首个成功答案返回；并发数受 `max-parallel` 限制 |
+| `adaptive` | 按历史平均 RTT 的倒数加权随机；失败按 timeout 计入，快速稳定的成员权重更高 |
+| `sequential` | 按配置顺序逐个尝试 |
+| `all` | 有界并发并合并全部成功答案 |
+
+`exits` 中填写 `nodes` 或订阅加载后的真实节点名，也可以使用 `DIRECT`。
+同一个 DoH/DoT endpoint 会经选中的节点建立连接；节点失效时按 server 的
+策略尝试其它出口。DoH、DoT、TCP DNS 和 UDP DNS 支持命名出口；DoQ 由于
+QUIC 需要完整的代理数据报通道，目前只能使用默认直连 socket。
+
+server 的 `strategy` 只调度代理出口，group 的 `strategy` 只调度 DNS 服务。
+group 会保留嵌套边界，不会把成员拍平。例如 `public` 并发查询
+`cloudflare/google` 时最多启动 2 个服务查询；每个服务再按自己的
+策略执行。只有 `parallel` / `all` 会并发出口，并受 server 自己的
+`max-parallel` 限制，不会无上限展开。
+
+普通模式会原样转发所有 DNS QTYPE（包括 TXT、MX、SRV、CAA、DNSSEC、
+SVCB/HTTPS、ANY 和未知类型码）；Fake IP 仅对 A/AAAA 合成地址。
 
 ## 流量接管
 
