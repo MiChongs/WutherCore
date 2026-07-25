@@ -30,6 +30,7 @@ uuid          = { workspace = true }
 subtle        = "2.6"
 rand          = { workspace = true }
 url           = { workspace = true }
+shadowsocks   = { workspace = true }
 
 # XHTTP/SplitHTTP inbound: HTTP/1.1 + HTTP/2 over TCP/TLS and HTTP/3 over QUIC.
 http           = "1"

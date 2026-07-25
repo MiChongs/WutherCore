@@ -13,6 +13,7 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         local: None,
         panel: None,
         xhttp: None,
+        shadowsocks: None,
         share: None,
         auth: vec![],
         reality: vec![],

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+shadowsocks = { workspace = true }
 serde_json = { workspace = true }
 humantime-serde = { workspace = true }
 thiserror = { workspace = true }

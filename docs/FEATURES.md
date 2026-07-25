@@ -37,7 +37,7 @@
 | --- | --- | --- |
 | 内置动作 | Direct、Block、DNS Hijack | 直连、拒绝和 DNS 劫持 |
 | 通用代理 | HTTP、SOCKS5 | 支持认证；UDP 能力由具体实现决定 |
-| Shadowsocks | Shadowsocks、Shadowsocks 2022、SSR | 包含多种 AEAD/流加密与 SSR 组件 |
+| Shadowsocks | Shadowsocks、Shadowsocks 2022、SSR | 全加密族 TCP/UDP 客户端与服务端、SIP003 插件、SIP022 EIH 多用户；SSR 保持独立实现 |
 | 经典 TLS | Trojan、VLESS、VMess | 支持对应 TLS、UUID 与安全参数 |
 | 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC、Naive | Naive 为可选 feature，包含 H2/H3、ECH、填充与 UoT v2，见 [Naive 指南](NAIVE.md) |
 | 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | 按各自握手、加密和复用模型实现 |

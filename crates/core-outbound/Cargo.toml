@@ -71,6 +71,7 @@ zeroize           = { workspace = true }
 sha3              = { workspace = true }
 rc4               = { workspace = true }
 chacha20          = { workspace = true }
+shadowsocks       = { workspace = true }
 chrono            = { version = "0.4", default-features = false, features = ["clock"] }
 russh             = { workspace = true }
 russh-keys        = { workspace = true }

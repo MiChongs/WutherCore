@@ -31,7 +31,7 @@ exclude = [
 [workspace.package]
 version = "0.3.1-rc.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 authors = ["WutherCore Contributors"]
 repository = "https://github.com/MiChongs/WutherCore"
@@ -129,6 +129,7 @@ sha1              = "0.10"
 rc4               = "0.1"
 chacha20          = "0.10"
 cronet            = "0.2.0"
+shadowsocks       = { version = "=1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher", "security-replay-attack-detect"] }
 
 # QUIC + UDP 协议（Hysteria / TUIC）
 quinn             = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }

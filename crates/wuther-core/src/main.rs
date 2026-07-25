@@ -17,8 +17,9 @@ use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
 use core_inbound::{
-    GrpcListener, MixedListener, XhttpListenerHandle, ensure_best_effort_privilege, run_grpc,
-    run_mixed, start_xhttp_listeners,
+    GrpcListener, MixedListener, ShadowsocksListenerHandle, XhttpListenerHandle,
+    ensure_best_effort_privilege, run_grpc, run_mixed, start_shadowsocks_listeners,
+    start_xhttp_listeners,
 };
 use core_outbound::proto::wireguard::{
     WireGuardServer, WireGuardServerConfig, WireGuardServerPeerConfig,
@@ -865,6 +866,8 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     // 任何一项失败都会关闭已启动的同类监听并直接返回 cmd_run。
     let mut xhttp_listener_handles =
         start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
+    let mut shadowsocks_listener_handles =
+        start_configured_shadowsocks_inbounds(&plan, runtime.clone()).await?;
 
     // 把运行期 LogBus 挂到 tracing 桥上 —— 让 /v1/logs 与 Clash 兼容 /logs WS
     // 流式输出。tracing 可能已被早期初始化占用，所以 observe 层使用可后挂载的
@@ -1266,6 +1269,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         warn!(target: "mesh", error = %error, "mesh supervisor stop failed");
     }
     feed_mgr_handle.stop();
+    for listener in &mut shadowsocks_listener_handles {
+        if let Err(error) = listener.shutdown().await {
+            warn!(
+                target: "inbound::shadowsocks",
+                tag = listener.tag(),
+                %error,
+                "Shadowsocks listener shutdown failed"
+            );
+        }
+    }
     for listener in &mut xhttp_listener_handles {
         if let Err(error) = listener.shutdown().await {
             warn!(
@@ -1326,6 +1339,15 @@ async fn start_configured_xhttp_inbounds(
     start_xhttp_listeners(&plan.listen.xhttp, runtime)
         .await
         .context("XHTTP 入站启动失败")
+}
+
+async fn start_configured_shadowsocks_inbounds(
+    plan: &core_config::runtime_plan::RuntimePlan,
+    runtime: Arc<Runtime>,
+) -> anyhow::Result<Vec<ShadowsocksListenerHandle>> {
+    start_shadowsocks_listeners(&plan.listen.shadowsocks, runtime)
+        .await
+        .context("Shadowsocks 入站启动失败")
 }
 
 /// 把 [`core_ruleset::RulesetIndex`] 适配为 [`core_capture::IpSetProvider`]。

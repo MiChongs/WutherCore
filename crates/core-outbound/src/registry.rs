@@ -30,9 +30,8 @@ use crate::{
         hysteria::HysteriaOutbound,
         hysteria2::Hysteria2Outbound,
         mieru::{MieruCipher, MieruOutbound},
-        shadowsocks::{ShadowsocksOutbound, SsCipher},
+        shadowsocks::ShadowsocksOutbound,
         snell::{SnellCipher, SnellOutbound},
-        ss2022::{Ss22Cipher, Ss2022Outbound},
         ssh::SshOutbound,
         ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol},
         sudoku::{AeadMethod as SudokuAead, SudokuOutbound},
@@ -363,23 +362,81 @@ fn build_shadowsocks(node: &ParsedNode) -> Result<SharedOutbound, String> {
     if pwd.is_empty() {
         return Err("shadowsocks password must not be empty".into());
     }
-    if let Some(c) = Ss22Cipher::parse(method) {
-        return match Ss2022Outbound::new(&node.name, &node.host, node.port, c, pwd) {
-            Ok(mut ob) => {
-                ob.udp = node.udp;
-                Ok(Arc::new(ob))
+    let method = ShadowsocksOutbound::parse_method(method).map_err(|error| error.to_string())?;
+    let is_2022 = method.is_aead_2022();
+    let mut outbound = ShadowsocksOutbound::new(&node.name, &node.host, node.port, method, pwd)
+        .map_err(|error| {
+            if is_2022 {
+                format!("invalid Shadowsocks 2022 PSK: {error}")
+            } else {
+                format!("invalid Shadowsocks configuration: {error}")
             }
-            Err(error) => Err(format!("invalid Shadowsocks 2022 PSK: {error}")),
-        };
-    }
-    match SsCipher::parse(method) {
-        Some(c) => {
-            let mut ob = ShadowsocksOutbound::new(&node.name, &node.host, node.port, c, pwd);
-            ob.udp = node.udp;
-            Ok(Arc::new(ob))
+        })?;
+    outbound.udp = node.udp;
+    if let Some(spec) = node.params.get("plugin") {
+        let (plugin, inline_opts) = spec
+            .split_once(';')
+            .map_or((spec.as_str(), None), |(name, opts)| (name, Some(opts)));
+        if plugin.trim().is_empty() {
+            return Err("Shadowsocks SIP003 plugin name must not be empty".into());
         }
-        None => Err(format!("unsupported Shadowsocks cipher `{method}`")),
+        let plugin_opts = node
+            .params
+            .get("plugin-opts")
+            .or_else(|| node.params.get("plugin_opts"))
+            .map(String::as_str)
+            .or(inline_opts)
+            .map(ToOwned::to_owned);
+        let plugin_mode = match node
+            .params
+            .get("plugin-mode")
+            .or_else(|| node.params.get("plugin_mode"))
+            .map(|value| value.to_ascii_lowercase().replace('-', "_"))
+            .as_deref()
+            .unwrap_or("tcp_only")
+        {
+            "tcp" | "tcp_only" => shadowsocks::config::Mode::TcpOnly,
+            "udp" | "udp_only" => shadowsocks::config::Mode::UdpOnly,
+            "tcp_and_udp" | "tcp_udp" => shadowsocks::config::Mode::TcpAndUdp,
+            mode => return Err(format!("invalid Shadowsocks SIP003 plugin mode `{mode}`")),
+        };
+        let plugin_args = node
+            .params
+            .get("plugin-args")
+            .or_else(|| node.params.get("plugin_args"))
+            .map(|value| {
+                if value.trim().is_empty() {
+                    Ok(Vec::new())
+                } else if value.trim_start().starts_with('[') {
+                    serde_json::from_str::<Vec<String>>(value).map_err(|error| {
+                        format!("invalid Shadowsocks SIP003 plugin-args JSON array: {error}")
+                    })
+                } else {
+                    Ok(vec![value.clone()])
+                }
+            })
+            .transpose()?
+            .unwrap_or_default();
+        outbound.set_plugin(Some(shadowsocks::plugin::PluginConfig {
+            plugin: plugin.to_owned(),
+            plugin_opts,
+            plugin_args,
+            plugin_mode,
+        }));
+    } else if [
+        "plugin-opts",
+        "plugin_opts",
+        "plugin-args",
+        "plugin_args",
+        "plugin-mode",
+        "plugin_mode",
+    ]
+    .iter()
+    .any(|key| node.params.contains_key(*key))
+    {
+        return Err("Shadowsocks SIP003 plugin options require the `plugin` parameter".to_owned());
     }
+    Ok(Arc::new(outbound))
 }
 
 fn build_ssr(node: &ParsedNode) -> Result<SharedOutbound, String> {
@@ -3248,6 +3305,22 @@ mod tests {
         ss2022.password = Some("not-a-valid-2022-key".into());
         ss2022.method = Some("2022-blake3-aes-128-gcm".into());
         assert!(build_error(&ss2022).contains("invalid Shadowsocks 2022 PSK"));
+
+        let mut ss_plugin = node(NodeProtocol::Shadowsocks);
+        ss_plugin.password = Some("secret".into());
+        ss_plugin.params.insert("plugin-opts".into(), "tls".into());
+        assert!(build_error(&ss_plugin).contains("require the `plugin`"));
+        ss_plugin
+            .params
+            .insert("plugin".into(), "v2ray-plugin".into());
+        ss_plugin
+            .params
+            .insert("plugin-args".into(), "[not-json".into());
+        assert!(build_error(&ss_plugin).contains("plugin-args JSON array"));
+        ss_plugin
+            .params
+            .insert("plugin-args".into(), r#"["--loglevel","warning"]"#.into());
+        assert!(build_outbound(&ss_plugin).is_ok());
 
         let mut ssr = node(NodeProtocol::ShadowsocksR);
         ssr.password = Some("secret".into());

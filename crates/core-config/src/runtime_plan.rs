@@ -52,8 +52,57 @@ pub struct ListenPlan {
     pub grpc: Vec<GrpcListen>,
     pub panel: Option<PanelListen>,
     pub xhttp: Vec<XhttpListenPlan>,
+    pub shadowsocks: Vec<ShadowsocksListenPlan>,
     pub share: Share,
     pub auth: Vec<UserPass>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowsocksListenPlan {
+    pub enabled: bool,
+    pub address: String,
+    pub port: u16,
+    pub method: String,
+    pub password: String,
+    pub mode: String,
+    pub plugin: Option<String>,
+    pub plugin_opts: Option<String>,
+    pub plugin_args: Vec<String>,
+    pub plugin_mode: Option<String>,
+    pub plugin_startup_timeout: Duration,
+    pub users: Vec<ShadowsocksUser>,
+    pub handshake_timeout: Duration,
+    pub udp_timeout: Duration,
+    pub max_connections: usize,
+    pub max_udp_associations: usize,
+    pub tag: String,
+}
+
+impl ShadowsocksListenPlan {
+    pub fn socket_addr(&self) -> ConfigResult<SocketAddr> {
+        parse_shadowsocks_socket(&self.address, self.port).ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "非法 Shadowsocks 监听地址: {}:{}",
+                self.address, self.port
+            ))
+        })
+    }
+
+    pub fn enable_tcp(&self) -> bool {
+        matches!(self.mode.as_str(), "tcp_only" | "tcp_and_udp")
+    }
+
+    pub fn enable_udp(&self) -> bool {
+        matches!(self.mode.as_str(), "udp_only" | "tcp_and_udp")
+    }
+}
+
+fn parse_shadowsocks_socket(address: &str, port: u16) -> Option<SocketAddr> {
+    address
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, port))
+        .or_else(|_| format!("{address}:{port}").parse())
+        .ok()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -344,6 +393,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         local: None,
         panel: None,
         xhttp: None,
+        shadowsocks: None,
         share: None,
         auth: vec![],
         reality: vec![],
@@ -415,6 +465,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
     }
 
     let xhttp = compile_xhttp_listeners(listen.xhttp)?;
+    let shadowsocks = compile_shadowsocks_listeners(listen.shadowsocks)?;
 
     let auth = listen
         .auth
@@ -440,9 +491,176 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         grpc,
         panel,
         xhttp,
+        shadowsocks,
         share,
         auth,
     })
+}
+
+fn compile_shadowsocks_listeners(
+    listeners: Option<ShadowsocksListenSet>,
+) -> ConfigResult<Vec<ShadowsocksListenPlan>> {
+    let listeners = listeners
+        .map(ShadowsocksListenSet::into_vec)
+        .unwrap_or_default();
+    let mut plans = Vec::with_capacity(listeners.len());
+    let mut tags = HashSet::new();
+    let mut tcp_sockets = HashSet::new();
+    let mut udp_sockets = HashSet::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let path = format!("listen.shadowsocks[{index}]");
+        let method = listener.method.to_ascii_lowercase();
+        let cipher = method
+            .parse::<shadowsocks::crypto::CipherKind>()
+            .map_err(|_| {
+                ConfigError::invalid(format!(
+                    "{path}.method 不支持 Shadowsocks 加密方法 `{method}`"
+                ))
+            })?;
+        shadowsocks::config::ServerConfig::new(
+            shadowsocks::config::ServerAddr::DomainName(listener.address.clone(), listener.port),
+            listener.password.clone(),
+            cipher,
+        )
+        .map_err(|error| ConfigError::invalid(format!("{path}.password/ method 无效: {error}")))?;
+        let mode = match listener
+            .mode
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "tcp" | "tcp_only" => "tcp_only",
+            "udp" | "udp_only" => "udp_only",
+            "tcp_and_udp" | "tcp_udp" => "tcp_and_udp",
+            other => {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.mode `{other}` 必须为 tcp_only、udp_only 或 tcp_and_udp"
+                )));
+            }
+        }
+        .to_owned();
+        let plugin_mode = listener
+            .plugin_mode
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().replace('-', "_"))
+            .map(|value| match value.as_str() {
+                "tcp" | "tcp_only" => Ok("tcp_only".to_owned()),
+                "udp" | "udp_only" => Ok("udp_only".to_owned()),
+                "tcp_and_udp" | "tcp_udp" => Ok("tcp_and_udp".to_owned()),
+                other => Err(ConfigError::invalid(format!(
+                    "{path}.plugin-mode `{other}` 必须为 tcp_only、udp_only 或 tcp_and_udp"
+                ))),
+            })
+            .transpose()?;
+        if let Some(plugin) = listener.plugin.as_deref() {
+            if plugin.trim().is_empty() {
+                return Err(ConfigError::invalid(format!("{path}.plugin 不能为空")));
+            }
+            if plugin.contains('\0') || listener.plugin_args.iter().any(|arg| arg.contains('\0')) {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.plugin/plugin-args 不能包含 NUL 字符"
+                )));
+            }
+            if listener.plugin_startup_timeout.is_zero() {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.plugin-startup-timeout 不能为 0"
+                )));
+            }
+            if plugin_mode.as_deref().unwrap_or(&mode) != mode {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.plugin-mode 必须与 mode 一致，避免绕过插件暴露未封装载体"
+                )));
+            }
+        } else if listener.plugin_opts.is_some()
+            || !listener.plugin_args.is_empty()
+            || listener.plugin_mode.is_some()
+        {
+            return Err(ConfigError::invalid(format!(
+                "{path} 配置 plugin-opts/plugin-args/plugin-mode 时必须同时配置 plugin"
+            )));
+        }
+        if listener.enabled {
+            if listener.port == 0 {
+                return Err(ConfigError::invalid(format!("{path}.port 不能为 0")));
+            }
+            if listener.handshake_timeout.is_zero() || listener.udp_timeout.is_zero() {
+                return Err(ConfigError::invalid(format!("{path} 超时必须大于 0")));
+            }
+            if listener.max_connections == 0 || listener.max_udp_associations == 0 {
+                return Err(ConfigError::invalid(format!("{path} 并发上限必须大于 0")));
+            }
+        }
+        if !listener.users.is_empty() && !cipher.is_aead_2022() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.users 仅适用于 Shadowsocks 2022 EIH"
+            )));
+        }
+        let mut user_names = HashSet::new();
+        for (user_index, user) in listener.users.iter().enumerate() {
+            if user.name.trim().is_empty() || !user_names.insert(user.name.clone()) {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.users[{user_index}].name 为空或重复"
+                )));
+            }
+            let parsed_user = shadowsocks::config::ServerUser::with_encoded_key(
+                &user.name, &user.key,
+            )
+            .map_err(|error| {
+                ConfigError::invalid(format!("{path}.users[{user_index}].key 无效: {error}"))
+            })?;
+            if parsed_user.key().len() != cipher.key_len() {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.users[{user_index}].key 解码后必须为 {} 字节，实际为 {} 字节",
+                    cipher.key_len(),
+                    parsed_user.key().len()
+                )));
+            }
+        }
+        let tag = listener
+            .tag
+            .unwrap_or_else(|| format!("shadowsocks-{}", index + 1));
+        if !tags.insert(tag.clone()) {
+            return Err(ConfigError::invalid(format!("{path}.tag `{tag}` 重复")));
+        }
+        let socket = parse_shadowsocks_socket(&listener.address, listener.port)
+            .ok_or_else(|| ConfigError::invalid(format!("{path} 监听地址无效")))?;
+        if listener.enabled
+            && matches!(mode.as_str(), "tcp_only" | "tcp_and_udp")
+            && !tcp_sockets.insert(socket)
+        {
+            return Err(ConfigError::invalid(format!(
+                "{path} TCP 监听地址重复: {socket}"
+            )));
+        }
+        if listener.enabled
+            && matches!(mode.as_str(), "udp_only" | "tcp_and_udp")
+            && !udp_sockets.insert(socket)
+        {
+            return Err(ConfigError::invalid(format!(
+                "{path} UDP 监听地址重复: {socket}"
+            )));
+        }
+        plans.push(ShadowsocksListenPlan {
+            enabled: listener.enabled,
+            address: listener.address,
+            port: listener.port,
+            method,
+            password: listener.password,
+            mode,
+            plugin: listener.plugin,
+            plugin_opts: listener.plugin_opts,
+            plugin_args: listener.plugin_args,
+            plugin_mode,
+            plugin_startup_timeout: listener.plugin_startup_timeout,
+            users: listener.users,
+            handshake_timeout: listener.handshake_timeout,
+            udp_timeout: listener.udp_timeout,
+            max_connections: listener.max_connections,
+            max_udp_associations: listener.max_udp_associations,
+            tag,
+        });
+    }
+    Ok(plans)
 }
 
 fn compile_wireguard_listeners(
@@ -5517,5 +5735,97 @@ route: {preset: direct}
             .unwrap_err()
             .to_string();
         assert!(error.contains("循环链"), "error={error}");
+    }
+
+    #[test]
+    fn shadowsocks_listener_registers_all_fields_and_aliases() {
+        let plan = crate::loader::load_from_str(
+            r#"
+version: 1
+profile: server
+listen:
+  panel: false
+  ss:
+    host: 127.0.0.1
+    port: 8388
+    method: aes-256-gcm
+    password: secret
+    mode: tcp-and-udp
+    plugin: v2ray-plugin
+    plugin_opts: server;tls;host=cdn.example
+    plugin_args: [--loglevel, warning]
+    plugin_mode: tcp-and-udp
+    plugin_startup_timeout: 7s
+    handshake_timeout: 3s
+    udp_timeout: 45s
+    max_connections: 23
+    max_udp_associations: 29
+    tag: full-ss
+route: {preset: direct, final: direct}
+"#,
+        )
+        .unwrap();
+        let listener = &plan.listen.shadowsocks[0];
+        assert_eq!(listener.tag, "full-ss");
+        assert_eq!(listener.mode, "tcp_and_udp");
+        assert_eq!(listener.plugin.as_deref(), Some("v2ray-plugin"));
+        assert_eq!(
+            listener.plugin_opts.as_deref(),
+            Some("server;tls;host=cdn.example")
+        );
+        assert_eq!(listener.plugin_args, ["--loglevel", "warning"]);
+        assert_eq!(listener.plugin_mode.as_deref(), Some("tcp_and_udp"));
+        assert_eq!(listener.plugin_startup_timeout, Duration::from_secs(7));
+        assert_eq!(listener.handshake_timeout, Duration::from_secs(3));
+        assert_eq!(listener.udp_timeout, Duration::from_secs(45));
+        assert_eq!(listener.max_connections, 23);
+        assert_eq!(listener.max_udp_associations, 29);
+        assert!(listener.enable_tcp() && listener.enable_udp());
+        assert_eq!(
+            parse_shadowsocks_socket("::1", 8388),
+            Some("[::1]:8388".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn shadowsocks_listener_rejects_bad_cipher_key_users_and_unknown_fields() {
+        for (fragment, expected) in [
+            ("method: missing\n    password: secret", "method"),
+            (
+                "method: 2022-blake3-aes-128-gcm\n    password: bad-base64",
+                "password",
+            ),
+            (
+                "method: aes-128-gcm\n    password: secret\n    users: [{name: alice, key: YWJjZA==}]",
+                "users",
+            ),
+            (
+                "method: 2022-blake3-aes-128-gcm\n    password: YWJjZGVmZ2hpamtsbW5vcA==\n    users: [{name: alice, key: YWJjZA==}]",
+                "16 字节",
+            ),
+            (
+                "method: aes-128-gcm\n    password: secret\n    plugin-opts: server",
+                "必须同时配置 plugin",
+            ),
+            (
+                "method: aes-128-gcm\n    password: secret\n    mode: tcp_and_udp\n    plugin: v2ray-plugin\n    plugin-mode: tcp_only",
+                "必须与 mode 一致",
+            ),
+            (
+                "method: aes-128-gcm\n    password: secret\n    plugin: v2ray-plugin\n    plugin-startup-timeout: 0s",
+                "不能为 0",
+            ),
+            (
+                "method: aes-128-gcm\n    password: secret\n    typo-field: true",
+                "did not match",
+            ),
+        ] {
+            let yaml = format!(
+                "version: 1\nprofile: server\nlisten:\n  panel: false\n  shadowsocks:\n    port: 8388\n    {fragment}\nroute: {{preset: direct, final: direct}}\n"
+            );
+            let result = crate::loader::load_from_str(&yaml);
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(expected), "error={error}");
+        }
     }
 }

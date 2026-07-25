@@ -212,6 +212,9 @@ pub struct Listen {
         alias = "splithttp"
     )]
     pub xhttp: Option<XhttpListenSet>,
+    /// Shadowsocks SIP003/SIP004/SIP022 服务端监听。
+    #[serde(default, alias = "ss")]
+    pub shadowsocks: Option<ShadowsocksListenSet>,
     #[serde(default)]
     pub share: Option<Share>,
     #[serde(default)]
@@ -231,6 +234,118 @@ pub struct Listen {
     /// 双向流交给 `protocol` 指定的内层代理协议。
     #[serde(default, alias = "grpc-inbounds", alias = "grpc_inbounds")]
     pub grpc: Vec<GrpcListen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShadowsocksListenSet {
+    One(ShadowsocksListen),
+    Many(Vec<ShadowsocksListen>),
+}
+
+impl ShadowsocksListenSet {
+    pub fn into_vec(self) -> Vec<ShadowsocksListen> {
+        match self {
+            Self::One(listener) => vec![listener],
+            Self::Many(listeners) => listeners,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksListen {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_shadowsocks_listen_address", alias = "host")]
+    pub address: String,
+    pub port: u16,
+    pub method: String,
+    pub password: String,
+    #[serde(default = "default_shadowsocks_mode")]
+    pub mode: String,
+    /// SIP003 服务端插件可执行文件。插件监听公开地址，Shadowsocks
+    /// 服务端本身只监听插件分配的回环地址。
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default, rename = "plugin-opts", alias = "plugin_opts")]
+    pub plugin_opts: Option<String>,
+    #[serde(default, rename = "plugin-args", alias = "plugin_args")]
+    pub plugin_args: Vec<String>,
+    #[serde(default, rename = "plugin-mode", alias = "plugin_mode")]
+    pub plugin_mode: Option<String>,
+    #[serde(
+        default = "default_shadowsocks_plugin_startup_timeout",
+        rename = "plugin-startup-timeout",
+        alias = "plugin_startup_timeout",
+        with = "humantime_serde"
+    )]
+    pub plugin_startup_timeout: Duration,
+    #[serde(default)]
+    pub users: Vec<ShadowsocksUser>,
+    #[serde(
+        default = "default_shadowsocks_handshake_timeout",
+        rename = "handshake-timeout",
+        alias = "handshake_timeout",
+        with = "humantime_serde"
+    )]
+    pub handshake_timeout: Duration,
+    #[serde(
+        default = "default_shadowsocks_udp_timeout",
+        rename = "udp-timeout",
+        alias = "udp_timeout",
+        with = "humantime_serde"
+    )]
+    pub udp_timeout: Duration,
+    #[serde(
+        default = "default_shadowsocks_max_connections",
+        rename = "max-connections",
+        alias = "max_connections"
+    )]
+    pub max_connections: usize,
+    #[serde(
+        default = "default_shadowsocks_max_udp_associations",
+        rename = "max-udp-associations",
+        alias = "max_udp_associations"
+    )]
+    pub max_udp_associations: usize,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksUser {
+    pub name: String,
+    pub key: String,
+}
+
+fn default_shadowsocks_listen_address() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_shadowsocks_mode() -> String {
+    "tcp_and_udp".into()
+}
+
+fn default_shadowsocks_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_shadowsocks_udp_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_shadowsocks_plugin_startup_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_shadowsocks_max_connections() -> usize {
+    1024
+}
+
+fn default_shadowsocks_max_udp_associations() -> usize {
+    4096
 }
 
 /// 完整的 Xray gRPC 服务端监听配置。
