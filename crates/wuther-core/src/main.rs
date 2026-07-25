@@ -1175,6 +1175,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             listen: addr,
             auth,
             udp: mixed.udp,
+            stream_settings: mixed.stream_settings.clone(),
         };
         let rt = runtime.clone();
         handles.push(tokio::spawn(async move {

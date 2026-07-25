@@ -49,6 +49,7 @@ use crate::{
         },
         young::YoungOutbound,
     },
+    socket_policy::ConfiguredOutbound,
     socks5::Socks5Outbound,
     stub::StubOutbound,
     transport::{
@@ -97,10 +98,42 @@ impl OutboundRegistry {
 
 /// 把 [`ParsedNode`] 数组注册为一组出站。
 pub fn register_nodes(reg: &mut OutboundRegistry, nodes: &[ParsedNode]) -> Result<(), String> {
+    let mut pending_proxies = Vec::new();
     for node in nodes {
-        let ob = build_outbound(node)
+        let mut ob = build_outbound(node)
             .map_err(|error| format!("node `{}` outbound config invalid: {error}", node.name))?;
+        if let Some(settings) = node.stream_settings.clone() {
+            let proxy_name = settings
+                .sockopt
+                .as_ref()
+                .map(|sockopt| sockopt.dialer_proxy.trim().to_string())
+                .filter(|name| !name.is_empty());
+            let (configured, policy) = ConfiguredOutbound::new(ob, settings);
+            ob = configured;
+            if let Some(proxy_name) = proxy_name {
+                pending_proxies.push((node.name.clone(), proxy_name, policy));
+            }
+        }
         reg.insert(node.name.clone(), ob);
+    }
+
+    // Resolve only after every wrapper has been inserted: Xray permits a
+    // dialerProxy to reference a node declared later in the configuration.
+    for (owner, proxy_name, policy) in pending_proxies {
+        let lookup_name = if proxy_name.eq_ignore_ascii_case("direct") {
+            "DIRECT"
+        } else if proxy_name.eq_ignore_ascii_case("block") {
+            "BLOCK"
+        } else {
+            &proxy_name
+        };
+        if let Some(proxy) = reg.get(lookup_name) {
+            let _ = ConfiguredOutbound::set_dialer_proxy(&policy, proxy);
+        } else {
+            return Err(format!(
+                "node `{owner}` streamSettings.sockopt.dialerProxy target `{proxy_name}` was not registered"
+            ));
+        }
     }
     Ok(())
 }

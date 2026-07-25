@@ -29,16 +29,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use blake2::digest::{Update, VariableOutput};
-use bytes::Bytes;
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, crypto::rustls::QuicClientConfig};
 use rustls::ClientConfig as RustlsConfig;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::adapter::{
-    BoxedStream, Capabilities, DialContext, OutboundAdapter, prepare_outbound_udp_socket_for_addr,
-    resolve_host,
-};
+use crate::adapter::{BoxedStream, Capabilities, DialContext, OutboundAdapter, resolve_host};
 
 #[derive(Debug, Clone)]
 pub struct Hysteria2Outbound {
@@ -117,45 +112,99 @@ impl Hysteria2Outbound {
         }
         let quic_client_config: QuicClientConfig = QuicClientConfig::try_from(tls_config)
             .map_err(|e| io_err(format!("hysteria2 quic config: {e}")))?;
-        let client_config = ClientConfig::new(Arc::new(quic_client_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
+        let active_policy = crate::socket_policy::current();
+        let quic_params = active_policy
+            .as_ref()
+            .and_then(|policy| policy.settings.finalmask.as_ref())
+            .and_then(|finalmask| finalmask.quic_params.as_ref());
+        let applied_quic = crate::transport::finalmask::quic::apply_client_config(
+            &mut client_config,
+            quic_params,
+        )?;
 
-        // 3) 绑定本地 UDP socket（IPv4 + IPv6 双栈）
-        let bind_addr: SocketAddr = if target_addr.is_ipv6() {
+        // 3) 在协议之下构造 UDP carrier。finalmask 必须位于 Quinn 之下；
+        // 对 dial_udp 的返回值做 payload 包装会错误地包住 Hysteria relay。
+        let nominal_local: SocketAddr = if target_addr.is_ipv6() {
             "[::]:0".parse().unwrap()
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-
-        let (endpoint, loopback_guard) = if let Some(obfs_pwd) = &self.obfs_password {
-            // 用 Salamander obfs 包装 UDP socket
-            let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-            let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
-            std_socket.set_nonblocking(true)?;
-            let obfs_runtime = quinn::TokioRuntime;
-            let obfs_socket = SalamanderSocket::new(std_socket, obfs_pwd.as_bytes())?;
-            let mut endpoint = Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
-                None,
-                Arc::new(obfs_socket),
-                Arc::new(obfs_runtime),
+        let mut masks = active_policy
+            .as_ref()
+            .and_then(|policy| policy.settings.finalmask.as_ref())
+            .map(|finalmask| finalmask.udp.clone())
+            .unwrap_or_default();
+        if let Some(password) = &self.obfs_password {
+            masks.push(core_config::UdpMaskConfig::Salamander(
+                core_config::SalamanderMaskConfig {
+                    password: password.clone(),
+                    ..Default::default()
+                },
+            ));
+        }
+        if applied_quic.udp_hop.is_some()
+            && masks.iter().any(|mask| {
+                matches!(
+                    mask,
+                    core_config::UdpMaskConfig::Realm(_) | core_config::UdpMaskConfig::Xicmp(_)
+                )
+            })
+        {
+            return Err(io_err(
+                "finalmask realm/xicmp is incompatible with quicParams.udpHop, matching Xray's outermost-carrier rule",
+            ));
+        }
+        let proxy = active_policy.as_ref().and_then(|policy| policy.proxy());
+        let (raw, carrier_local) = if let Some(hop) = applied_quic.udp_hop.clone() {
+            crate::transport::finalmask::UdpHopCarrier::open(
+                hop,
+                proxy,
+                self.host.clone(),
+                target_addr,
             )
-            .map_err(|e| io_err(format!("hysteria2 endpoint with obfs: {e}")))?;
-            endpoint.set_default_client_config(client_config);
-            (endpoint, loopback_guard)
+            .await?
+        } else if let Some(proxy) = proxy {
+            (
+                crate::socket_policy::dial_udp_through_proxy(
+                    proxy,
+                    self.host.clone(),
+                    target_addr.port(),
+                )
+                .await?,
+                nominal_local,
+            )
         } else {
-            let std_socket = std::net::UdpSocket::bind(bind_addr)?;
-            let loopback_guard = prepare_outbound_udp_socket_for_addr(&std_socket, target_addr)?;
-            std_socket.set_nonblocking(true)?;
-            let mut endpoint = Endpoint::new(
-                quinn::EndpointConfig::default(),
-                None,
-                std_socket,
-                Arc::new(quinn::TokioRuntime),
-            )
-            .map_err(|e| io_err(format!("hysteria2 endpoint: {e}")))?;
-            endpoint.set_default_client_config(client_config);
-            (endpoint, loopback_guard)
+            crate::transport::finalmask::open_direct_carrier(self.host.clone(), target_addr)?
         };
+        let carrier = if masks.is_empty() {
+            raw
+        } else {
+            crate::transport::finalmask::wrap_udp_client(
+                raw,
+                &masks,
+                self.host.clone(),
+                target_addr.port(),
+                None,
+                Some(target_addr),
+            )
+            .await?
+        };
+        let abstract_socket = crate::transport::finalmask::QuinnUdpSocket::new(
+            carrier,
+            carrier_local,
+            target_addr,
+            self.host.clone(),
+            target_addr.port(),
+        );
+        let mut endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            abstract_socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| io_err(format!("hysteria2 finalmask endpoint: {e}")))?;
+        endpoint.set_default_client_config(client_config);
 
         // 4) 建立 QUIC 连接
         let server_name = self.sni.clone().unwrap_or_else(|| self.host.clone());
@@ -187,7 +236,7 @@ impl Hysteria2Outbound {
             .method("POST")
             .uri(auth_uri)
             .header("Hysteria-Auth", self.password.as_str())
-            .header("Hysteria-CC-RX", self.down_mbps.to_string())
+            .header("Hysteria-CC-RX", applied_quic.brutal_down.to_string())
             .header("Hysteria-Padding", random_padding())
             .body(())
             .map_err(|e| io_err(format!("h3 build: {e}")))?;
@@ -209,17 +258,20 @@ impl Hysteria2Outbound {
             return Err(io_err(format!("hysteria2 auth status {}", resp.status())));
         }
         // 必要 headers：Hysteria-CC-RX (server 限速), Hysteria-Padding (校验)
-        let _server_cc_rx = resp
+        let server_cc_rx = resp
             .headers()
             .get("hysteria-cc-rx")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
+        applied_quic.finish_hysteria_negotiation(server_cc_rx);
+        if let Some(window) = applied_quic.max_connection_receive_window {
+            connection.set_receive_window(window);
+        }
 
         Ok(Hysteria2Session {
             connection,
             endpoint,
-            _loopback_guard: loopback_guard,
         })
     }
 }
@@ -287,7 +339,6 @@ struct Hysteria2Session {
     /// endpoint 持有住，否则 socket 关闭
     #[allow(dead_code)]
     endpoint: Endpoint,
-    _loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
 impl Hysteria2Session {
@@ -339,179 +390,6 @@ impl tokio::io::AsyncWrite for QuinnBiStream {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.send).poll_shutdown(cx)
-    }
-}
-
-/* ---------------- Salamander obfs UDP socket ---------------- */
-
-#[derive(Debug)]
-struct SalamanderSocket {
-    inner: Arc<tokio::net::UdpSocket>,
-    state: quinn::udp::UdpSocketState,
-    key: Vec<u8>,
-}
-
-impl SalamanderSocket {
-    fn new(socket: std::net::UdpSocket, key: &[u8]) -> std::io::Result<Self> {
-        let state = quinn::udp::UdpSocketState::new((&socket).into())?;
-        let inner = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
-        Ok(Self {
-            inner,
-            state,
-            key: key.to_vec(),
-        })
-    }
-
-    /// 给 buf 应用 Salamander obfs：buf[..8] 是 salt（出站时随机生成；入站时读取）
-    fn apply_obfs_outbound(&self, buf: &mut Vec<u8>) {
-        use rand::RngCore;
-        let mut salt = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        // keystream = BLAKE2b-256(key || salt)，长度 = buf.len()
-        let mut h = blake2::Blake2bVar::new(32).expect("blake2b 32B");
-        h.update(&self.key);
-        h.update(&salt);
-        let mut ks = [0u8; 32];
-        h.finalize_variable(&mut ks).expect("blake2b finalize");
-        // 扩展 keystream 到 buf 长度（重复 SHAKE 思路：加 counter）
-        let mut full = Vec::with_capacity(buf.len());
-        let mut counter = 0u64;
-        while full.len() < buf.len() {
-            let mut h2 = blake2::Blake2bVar::new(32).expect("blake2b 32B");
-            h2.update(&self.key);
-            h2.update(&salt);
-            h2.update(&counter.to_be_bytes());
-            let mut block = [0u8; 32];
-            h2.finalize_variable(&mut block).expect("blake2b finalize");
-            full.extend_from_slice(&block);
-            counter += 1;
-        }
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b ^= full[i];
-        }
-        // 在 buf 前插入 8 字节 salt
-        let mut new_buf = Vec::with_capacity(buf.len() + 8);
-        new_buf.extend_from_slice(&salt);
-        new_buf.extend_from_slice(buf);
-        *buf = new_buf;
-        let _ = ks;
-    }
-
-    fn apply_obfs_inbound(&self, buf: &mut Vec<u8>) -> bool {
-        if buf.len() < 8 {
-            return false;
-        }
-        let mut salt = [0u8; 8];
-        salt.copy_from_slice(&buf[..8]);
-        let payload_len = buf.len() - 8;
-        let mut full = Vec::with_capacity(payload_len);
-        let mut counter = 0u64;
-        while full.len() < payload_len {
-            let mut h = blake2::Blake2bVar::new(32).expect("blake2b 32B");
-            h.update(&self.key);
-            h.update(&salt);
-            h.update(&counter.to_be_bytes());
-            let mut block = [0u8; 32];
-            h.finalize_variable(&mut block).expect("blake2b finalize");
-            full.extend_from_slice(&block);
-            counter += 1;
-        }
-        let mut new_buf = Vec::with_capacity(payload_len);
-        for i in 0..payload_len {
-            new_buf.push(buf[8 + i] ^ full[i]);
-        }
-        *buf = new_buf;
-        true
-    }
-}
-
-impl quinn::AsyncUdpSocket for SalamanderSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
-        let inner = self.inner.clone();
-        Box::pin(SalamanderPoller { inner })
-    }
-
-    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
-        let mut buf = transmit.contents.to_vec();
-        self.apply_obfs_outbound(&mut buf);
-        let new_transmit = quinn::udp::Transmit {
-            destination: transmit.destination,
-            ecn: transmit.ecn,
-            contents: &buf,
-            segment_size: None, // 改写后不能用 GSO
-            src_ip: transmit.src_ip,
-        };
-        self.state.try_send((&*self.inner).into(), &new_transmit)
-    }
-
-    fn poll_recv(
-        &self,
-        cx: &mut Context,
-        bufs: &mut [std::io::IoSliceMut<'_>],
-        meta: &mut [quinn::udp::RecvMeta],
-    ) -> Poll<std::io::Result<usize>> {
-        loop {
-            ready_or_pending!(self.inner.poll_recv_ready(cx));
-            let res = self.inner.try_io(tokio::io::Interest::READABLE, || {
-                self.state.recv((&*self.inner).into(), bufs, meta)
-            });
-            match res {
-                Ok(n) => {
-                    // 对每条消息做 inbound obfs
-                    for (i, m) in meta.iter_mut().enumerate().take(n) {
-                        let len = m.len;
-                        let buf = &mut bufs[i];
-                        let mut data = buf[..len].to_vec();
-                        if self.apply_obfs_inbound(&mut data) {
-                            buf[..data.len()].copy_from_slice(&data);
-                            m.len = data.len();
-                        }
-                    }
-                    return Poll::Ready(Ok(n));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        1 // 不支持 GSO
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
-    }
-
-    fn may_fragment(&self) -> bool {
-        false
-    }
-}
-
-/// 简易 ready 宏
-macro_rules! ready_or_pending {
-    ($e:expr) => {
-        match $e {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-    };
-}
-pub(crate) use ready_or_pending;
-
-#[derive(Debug)]
-struct SalamanderPoller {
-    inner: Arc<tokio::net::UdpSocket>,
-}
-
-impl quinn::UdpPoller for SalamanderPoller {
-    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
-        self.inner.poll_send_ready(cx)
     }
 }
 

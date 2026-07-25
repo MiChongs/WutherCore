@@ -30,7 +30,6 @@ use crate::{
     BoxedTransportStream, RealityClientConfig, TransportError,
 };
 use async_trait::async_trait;
-use tokio::net::TcpStream;
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +76,7 @@ pub trait RealityTlsSession: Send {
 
     async fn complete(
         self: Box<Self>,
-        tcp_stream: TcpStream,
+        tcp_stream: BoxedTransportStream,
         prepared: RealityPreparedHandshake,
         mldsa65_verify: Option<Vec<u8>>,
     ) -> Result<BoxedTransportStream, TransportError> {
@@ -92,7 +91,7 @@ pub trait RealityTlsSession: Send {
 
     async fn complete_with_outcome(
         self: Box<Self>,
-        tcp_stream: TcpStream,
+        tcp_stream: BoxedTransportStream,
         prepared: RealityPreparedHandshake,
         mldsa65_verify: Option<Vec<u8>>,
     ) -> Result<RealityTlsSessionOutcome, TransportError>;

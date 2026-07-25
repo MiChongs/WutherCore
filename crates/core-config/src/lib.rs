@@ -18,8 +18,10 @@ pub mod node_uri;
 pub mod profile;
 mod ruleset_compat;
 pub mod runtime_plan;
+pub mod stream_settings;
 
 pub use error::{ConfigError, ConfigErrorKind, ConfigResult};
 pub use loader::{load_from_path, load_from_str};
 pub use model::*;
 pub use runtime_plan::RuntimePlan;
+pub use stream_settings::*;

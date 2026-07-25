@@ -36,6 +36,10 @@ ipnet       = { workspace = true }
 if-addrs    = "0.15"
 cronet      = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
+hickory-resolver = { workspace = true, features = ["system-config"] }
+data-encoding = "2"
+percent-encoding = "2"
+regex       = { workspace = true }
 
 # 协议层依赖
 aes-gcm           = { workspace = true }
@@ -74,6 +78,7 @@ quinn             = { workspace = true }
 quinn-proto       = { workspace = true }
 h3                = { workspace = true }
 h3-quinn          = { workspace = true }
+rsteria2          = "=0.1.1"
 http              = "1"
 blake2            = "0.10"
 # WireGuard NoiseIK、Cookie、重放窗口、密钥轮换均由成熟实现负责；
@@ -86,6 +91,9 @@ hyper-util        = { version = "0.1", features = ["client", "client-legacy", "t
 http-body-util    = "0.1"
 rand_chacha       = "0.3"
 smoltcp           = { version = "0.11", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "reassembly-buffer-count-4", "assembler-max-segment-count-32", "iface-max-addr-count-8", "iface-max-route-count-2", "socket-tcp", "socket-udp", "async"] }
+ggstd             = "0.1"
+rsa               = "0.9"
+num-bigint-dig    = "0.8"
 # socket2：在 Linux/Android 上对 outbound socket 设置 SO_MARK，配合
 # `ip rule fwmark X lookup main` 让代理出站绕开 TUN 自身路由表，
 # 避免"resolve 出 IP 后 connect 又被 TUN 截走"的死循环。

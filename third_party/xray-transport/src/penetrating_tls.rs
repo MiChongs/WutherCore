@@ -5,23 +5,25 @@ use std::task::{Context, Poll};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
-use crate::TransportStream;
+use crate::{BoxedTransportStream, TransportStream};
 
 const TLS_READ_CHUNK_LIMIT: usize = 8 * 1024;
 
 pub(crate) type ServerReadLog = Arc<Mutex<Option<Vec<u8>>>>;
 
 pub(crate) struct CapturedTcpStream {
-    stream: TcpStream,
+    stream: BoxedTransportStream,
     server_read_log: Option<ServerReadLog>,
     tls_read_limiter: TlsRecordReadLimiter,
 }
 
 impl CapturedTcpStream {
-    pub(crate) fn new(stream: TcpStream, server_read_log: Option<ServerReadLog>) -> Self {
+    pub(crate) fn new(
+        stream: BoxedTransportStream,
+        server_read_log: Option<ServerReadLog>,
+    ) -> Self {
         Self {
             stream,
             server_read_log,
@@ -29,7 +31,7 @@ impl CapturedTcpStream {
         }
     }
 
-    fn into_inner(self) -> TcpStream {
+    fn into_inner(self) -> BoxedTransportStream {
         self.stream
     }
 }
@@ -143,7 +145,7 @@ impl AsyncWrite for CapturedTcpStream {
 enum PenetratingTlsState {
     Tls(Option<Box<TlsStream<CapturedTcpStream>>>),
     Direct {
-        stream: TcpStream,
+        stream: BoxedTransportStream,
         pending_plaintext: BytesMut,
     },
 }
@@ -207,7 +209,7 @@ impl PenetratingTlsStream {
             return Poll::Ready(Ok(()));
         }
 
-        Pin::new(stream).poll_read(cx, output)
+        Pin::new(stream.as_mut()).poll_read_direct(cx, output)
     }
 
     fn poll_write_direct_mode(
@@ -223,7 +225,9 @@ impl PenetratingTlsStream {
             PenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }
-            PenetratingTlsState::Direct { stream, .. } => Pin::new(stream).poll_write(cx, input),
+            PenetratingTlsState::Direct { stream, .. } => {
+                Pin::new(stream.as_mut()).poll_write_direct(cx, input)
+            }
         }
     }
 }
@@ -268,7 +272,9 @@ impl AsyncWrite for PenetratingTlsStream {
             PenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }
-            PenetratingTlsState::Direct { stream, .. } => Pin::new(stream).poll_flush(cx),
+            PenetratingTlsState::Direct { stream, .. } => {
+                Pin::new(stream.as_mut()).poll_flush_direct(cx)
+            }
         }
     }
 
@@ -279,7 +285,9 @@ impl AsyncWrite for PenetratingTlsStream {
             PenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }
-            PenetratingTlsState::Direct { stream, .. } => Pin::new(stream).poll_shutdown(cx),
+            PenetratingTlsState::Direct { stream, .. } => {
+                Pin::new(stream.as_mut()).poll_shutdown_direct(cx)
+            }
         }
     }
 }
@@ -311,7 +319,9 @@ impl TransportStream for PenetratingTlsStream {
             PenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }
-            PenetratingTlsState::Direct { stream, .. } => Pin::new(stream).poll_flush(cx),
+            PenetratingTlsState::Direct { stream, .. } => {
+                Pin::new(stream.as_mut()).poll_flush_direct(cx)
+            }
         }
     }
 
@@ -325,7 +335,9 @@ impl TransportStream for PenetratingTlsStream {
             PenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }
-            PenetratingTlsState::Direct { stream, .. } => Pin::new(stream).poll_shutdown(cx),
+            PenetratingTlsState::Direct { stream, .. } => {
+                Pin::new(stream.as_mut()).poll_shutdown_direct(cx)
+            }
         }
     }
 }
@@ -338,7 +350,7 @@ mod tests {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     use super::*;
@@ -383,7 +395,7 @@ mod tests {
         });
 
         let client = CapturedTcpStream::new(
-            TcpStream::connect(addr).await.expect("connect TLS client"),
+            Box::new(TcpStream::connect(addr).await.expect("connect TLS client")),
             None,
         );
         let server_name = ServerName::try_from("server.test").expect("server name");

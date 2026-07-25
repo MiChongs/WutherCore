@@ -130,6 +130,7 @@ async fn http_connect_through_mixed() {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime.clone()));
 
@@ -197,6 +198,7 @@ async fn http_absolute_post_preserves_body_and_rewrites_hop_headers() {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -245,6 +247,7 @@ async fn http_absolute_chunked_post_stops_at_message_boundary() {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -292,6 +295,7 @@ async fn socks5_connect_through_mixed() {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;

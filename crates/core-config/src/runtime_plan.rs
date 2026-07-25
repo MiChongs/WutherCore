@@ -19,6 +19,7 @@ use crate::{
     error::{ConfigError, ConfigResult},
     model::*,
     node_uri::{NodeProtocol, ParsedNode, parse_uri, validate_reality_client_settings},
+    stream_settings::NodeStreamSettings,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +124,7 @@ pub struct MixedListen {
     pub host: String,
     pub port: u16,
     pub udp: bool,
+    pub stream_settings: Option<NodeStreamSettings>,
 }
 
 impl MixedListen {
@@ -169,6 +171,9 @@ pub struct XhttpListenPlan {
     /// `None` 使用 XrayCompatible；`Some([])` 禁用 CORS；非空值为 allowlist。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors_origins: Option<Vec<String>>,
+    /// Listener-side socket policy plus the FinalMask layer below HTTP/TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_settings: Option<NodeStreamSettings>,
     /// 与客户端/出站共享同一个完整强类型 XHTTP 配置。
     pub settings: XhttpConfig,
 }
@@ -360,6 +365,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
             host: host_for(share).into(),
             port: p,
             udp: true,
+            stream_settings: None,
         },
         ListenLocal::Detail(d) => MixedListen {
             host: if d.host.is_empty() {
@@ -369,6 +375,7 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
             },
             port: d.port,
             udp: d.udp,
+            stream_settings: d.stream_settings,
         },
     });
     if mixed.as_ref().is_some_and(|listener| listener.port == 0) {
@@ -1070,6 +1077,7 @@ fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<Re
             &format!("{location}.limitFallbackDownload"),
         )?;
         validate_reality_resource_limits(source.limits, &format!("{location}.limits"))?;
+        validate_reality_listener_stream_settings(source.stream_settings.as_ref(), &location)?;
 
         let mut normalized = source.clone();
         normalized.target = Some(RealityTarget::Address(target));
@@ -1428,6 +1436,8 @@ fn compile_xhttp_listeners(
             )));
         }
 
+        validate_xhttp_listener_stream_settings(listener.stream_settings.as_ref(), has_h3, &path)?;
+
         listener
             .settings
             .validate()
@@ -1499,6 +1509,7 @@ fn compile_xhttp_listeners(
             max_active_http_streams: listener.max_active_http_streams,
             http_idle_timeout: listener.http_idle_timeout,
             cors_origins,
+            stream_settings: listener.stream_settings,
             settings: listener.settings,
         });
     }
@@ -1548,7 +1559,69 @@ fn compile_nodes(specs: &[NodeSpec]) -> ConfigResult<Vec<ParsedNode>> {
         }
         out.push(node);
     }
+    validate_dialer_proxy_graph(&out)?;
     Ok(out)
+}
+
+fn validate_dialer_proxy_graph(nodes: &[ParsedNode]) -> ConfigResult<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let by_name = nodes
+        .iter()
+        .map(|node| (node.name.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    for node in nodes {
+        let Some(proxy) = node
+            .stream_settings
+            .as_ref()
+            .and_then(|stream| stream.sockopt.as_ref())
+            .map(|sockopt| sockopt.dialer_proxy.trim())
+            .filter(|proxy| !proxy.is_empty())
+        else {
+            continue;
+        };
+        if !by_name.contains_key(proxy)
+            && !matches!(proxy.to_ascii_uppercase().as_str(), "DIRECT" | "BLOCK")
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {} 的 streamSettings.sockopt.dialerProxy 引用了不存在的 outbound `{proxy}`",
+                node.name
+            )));
+        }
+    }
+
+    fn visit<'a>(
+        name: &'a str,
+        by_name: &BTreeMap<&'a str, &'a ParsedNode>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+    ) -> Result<(), String> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name) {
+            return Err(format!("dialerProxy 检测到循环链：{name}"));
+        }
+        if let Some(next) = by_name
+            .get(name)
+            .and_then(|node| node.stream_settings.as_ref())
+            .and_then(|stream| stream.sockopt.as_ref())
+            .map(|sockopt| sockopt.dialer_proxy.trim())
+            .filter(|next| by_name.contains_key(next))
+        {
+            visit(next, by_name, visiting, visited)?;
+        }
+        visiting.remove(name);
+        visited.insert(name);
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for name in by_name.keys().copied() {
+        visit(name, &by_name, &mut visiting, &mut visited).map_err(ConfigError::bad_node)?;
+    }
+    Ok(())
 }
 
 fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
@@ -1961,6 +2034,7 @@ fn detail_to_parsed(d: &NodeDetail) -> ConfigResult<ParsedNode> {
             node.params.insert("ip-family".into(), ip_family.clone());
         }
     }
+    apply_stream_settings(&mut node, &d.name, d.stream_settings.as_ref())?;
     Ok(node)
 }
 
@@ -2011,6 +2085,50 @@ fn insert_optional_param(
     Ok(())
 }
 
+fn validate_reality_listener_stream_settings(
+    settings: Option<&NodeStreamSettings>,
+    path: &str,
+) -> ConfigResult<()> {
+    use crate::stream_settings::{AddressPortStrategy, DomainStrategy};
+
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+    if let Some(network) = settings.network.as_deref()
+        && !network.is_empty()
+        && !network.eq_ignore_ascii_case("tcp")
+        && !network.eq_ignore_ascii_case("raw")
+    {
+        return Err(ConfigError::invalid(format!(
+            "{path}.streamSettings.network 必须是 tcp/raw，实际为 `{network}`"
+        )));
+    }
+    validate_stream_settings(path, settings).map_err(|error| {
+        ConfigError::invalid(format!("{path}.streamSettings 配置无效: {error}"))
+    })?;
+
+    if let Some(finalmask) = settings.finalmask.as_ref()
+        && (!finalmask.udp.is_empty() || finalmask.quic_params.is_some())
+    {
+        return Err(ConfigError::invalid(format!(
+            "{path}.streamSettings 的 UDP finalmask/quicParams 不能用于 TCP REALITY 监听"
+        )));
+    }
+    if let Some(sockopt) = settings.sockopt.as_ref()
+        && (!matches!(sockopt.domain_strategy, DomainStrategy::AsIs)
+            || !sockopt.dialer_proxy.trim().is_empty()
+            || sockopt.penetrate
+            || !matches!(sockopt.address_port_strategy, AddressPortStrategy::None)
+            || sockopt.happy_eyeballs != Default::default()
+            || !sockopt.trusted_x_forwarded_for.is_empty())
+    {
+        return Err(ConfigError::invalid(format!(
+            "{path}.streamSettings.sockopt 包含 REALITY 入站无法执行的出站拨号/HTTP 字段"
+        )));
+    }
+    Ok(())
+}
+
 fn insert_grpc_duration_param(
     node: &mut ParsedNode,
     key: &str,
@@ -2027,6 +2145,321 @@ fn insert_grpc_duration_param(
         )));
     }
     insert_optional_param(node, key, Some(&duration.as_secs().to_string()))
+}
+
+fn validate_xhttp_listener_stream_settings(
+    settings: Option<&NodeStreamSettings>,
+    uses_http3: bool,
+    path: &str,
+) -> ConfigResult<()> {
+    use crate::stream_settings::{AddressPortStrategy, DomainStrategy};
+
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+    if let Some(network) = settings.network.as_deref()
+        && !network.is_empty()
+        && !network.eq_ignore_ascii_case("xhttp")
+        && !network.eq_ignore_ascii_case("splithttp")
+    {
+        return Err(ConfigError::invalid(format!(
+            "{path}.streamSettings.network 必须是 xhttp/splithttp，实际为 `{network}`"
+        )));
+    }
+    // Reuse the canonical mask and platform validation so listener and node
+    // configurations cannot drift on fragment ranges, XMC credentials, XDNS,
+    // QUIC limits or platform-specific socket options.
+    validate_stream_settings(path, settings).map_err(|error| {
+        ConfigError::invalid(format!("{path}.streamSettings 配置无效: {error}"))
+    })?;
+
+    if let Some(sockopt) = settings.sockopt.as_ref() {
+        let outbound_only = !matches!(sockopt.domain_strategy, DomainStrategy::AsIs)
+            || !sockopt.dialer_proxy.trim().is_empty()
+            || sockopt.penetrate
+            || !matches!(sockopt.address_port_strategy, AddressPortStrategy::None)
+            || sockopt.happy_eyeballs != Default::default();
+        if outbound_only {
+            return Err(ConfigError::invalid(format!(
+                "{path}.streamSettings.sockopt 包含仅出站拨号可执行的 domainStrategy/dialerProxy/penetrate/addressPortStrategy/happyEyeballs"
+            )));
+        }
+        if uses_http3
+            && (sockopt.tcp_fast_open.is_some()
+                || sockopt.tcp_keep_alive_interval != 0
+                || sockopt.tcp_keep_alive_idle != 0
+                || !sockopt.tcp_congestion.is_empty()
+                || sockopt.tcp_window_clamp != 0
+                || sockopt.tcp_user_timeout != 0
+                || sockopt.tcp_max_seg != 0
+                || sockopt.tcp_mptcp
+                || sockopt.accept_proxy_protocol)
+        {
+            return Err(ConfigError::invalid(format!(
+                "{path}.streamSettings.sockopt 的 TCP/PROXY 字段不能用于 H3 UDP 监听"
+            )));
+        }
+    }
+
+    if let Some(finalmask) = settings.finalmask.as_ref() {
+        if uses_http3 {
+            if !finalmask.tcp.is_empty() {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.streamSettings.finalmask.tcp 不能用于 H3 UDP 监听"
+                )));
+            }
+            if finalmask
+                .quic_params
+                .as_ref()
+                .is_some_and(|params| match &params.udp_hop.ports {
+                    crate::stream_settings::PortListValue::Empty => false,
+                    crate::stream_settings::PortListValue::Text(value) => !value.trim().is_empty(),
+                    crate::stream_settings::PortListValue::Number(_) => true,
+                })
+            {
+                return Err(ConfigError::invalid(format!(
+                    "{path}.streamSettings.finalmask.quicParams.udpHop 只改变客户端目标端口，不能在服务端监听中执行"
+                )));
+            }
+        } else if !finalmask.udp.is_empty() || finalmask.quic_params.is_some() {
+            return Err(ConfigError::invalid(format!(
+                "{path}.streamSettings 的 UDP finalmask/quicParams 不能用于 TCP XHTTP 监听"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_stream_settings(
+    node: &mut ParsedNode,
+    node_name: &str,
+    stream: Option<&crate::stream_settings::NodeStreamSettings>,
+) -> ConfigResult<()> {
+    if let Some(stream) = stream {
+        if let Some(network) = stream.network.as_deref() {
+            node.transport = match network.to_ascii_lowercase().as_str() {
+                "raw" | "tcp" => "tcp".to_string(),
+                other => other.to_string(),
+            };
+        }
+        validate_stream_settings(node_name, stream)?;
+        node.stream_settings = Some(stream.clone());
+    }
+    Ok(())
+}
+
+fn validate_stream_settings(
+    node_name: &str,
+    stream: &crate::stream_settings::NodeStreamSettings,
+) -> ConfigResult<()> {
+    use crate::stream_settings::{TcpMaskConfig, UdpMaskConfig};
+
+    if let Some(sockopt) = &stream.sockopt {
+        for (index, name) in sockopt.trusted_x_forwarded_for.iter().enumerate() {
+            http::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                ConfigError::bad_node(format!(
+                    "node {node_name} trustedXForwardedFor[{index}] 不是合法 HTTP 请求头名称：{error}"
+                ))
+            })?;
+        }
+        if sockopt
+            .tcp_keep_alive_idle
+            .saturating_mul(sockopt.tcp_keep_alive_interval)
+            < 0
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {node_name} tcpKeepAliveIdle 与 tcpKeepAliveInterval 必须同时启用或同时禁用"
+            )));
+        }
+        for custom in &sockopt.custom_sockopt {
+            if custom.opt.is_empty() {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} customSockopt.opt 不能为空"
+                )));
+            }
+            if !matches!(custom.value_type.as_str(), "int" | "str") {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} customSockopt.type 仅支持 int 或 str"
+                )));
+            }
+            #[cfg(target_os = "windows")]
+            if custom.value_type == "str"
+                && (custom.system.is_empty() || custom.system.eq_ignore_ascii_case("windows"))
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} 在 Windows 上不支持字符串 customSockopt；配置不会被静默忽略"
+                )));
+            }
+        }
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !sockopt.interface.is_empty() {
+            return Err(ConfigError::bad_node(format!(
+                "node {node_name} 在当前平台不支持 sockopt.interface；配置不会被静默忽略"
+            )));
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+        if sockopt.mark != 0 {
+            return Err(ConfigError::bad_node(format!(
+                "node {node_name} 在当前平台不支持 sockopt.mark；配置不会被静默忽略"
+            )));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        if sockopt.tcp_mptcp {
+            return Err(ConfigError::bad_node(format!(
+                "node {node_name} 在当前平台不支持 tcpMptcp；配置不会被静默忽略"
+            )));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        if sockopt.tcp_window_clamp > 0
+            || sockopt.tcp_user_timeout > 0
+            || sockopt.tcp_max_seg > 0
+            || !sockopt.tcp_congestion.is_empty()
+        {
+            return Err(ConfigError::bad_node(format!(
+                "node {node_name} 配置了当前平台不支持的 Linux TCP 选项（congestion/window/user-timeout/MSS）"
+            )));
+        }
+    }
+
+    if let Some(finalmask) = &stream.finalmask {
+        for mask in &finalmask.tcp {
+            match mask {
+                TcpMaskConfig::Fragment(cfg) => {
+                    let packets = cfg.packets.trim();
+                    if !packets.is_empty() && !packets.eq_ignore_ascii_case("tlshello") {
+                        let valid = packets
+                            .parse::<i64>()
+                            .ok()
+                            .map(|value| value != 0)
+                            .unwrap_or_else(|| {
+                                packets
+                                    .split_once('-')
+                                    .and_then(|(from, to)| {
+                                        Some((
+                                            from.trim().parse::<i64>().ok()?,
+                                            to.trim().parse::<i64>().ok()?,
+                                        ))
+                                    })
+                                    .is_some_and(|(from, _)| from != 0)
+                            });
+                        if !valid {
+                            return Err(ConfigError::bad_node(format!(
+                                "node {node_name} fragment.packets 必须是 tlshello、非零整数或整数范围"
+                            )));
+                        }
+                    }
+                    let lengths = if cfg.lengths.is_empty() {
+                        std::slice::from_ref(&cfg.length)
+                    } else {
+                        cfg.lengths.as_slice()
+                    };
+                    if lengths.last().is_none_or(|range| range.from == 0) {
+                        return Err(ConfigError::bad_node(format!(
+                            "node {node_name} fragment 最后一个 lengths 项的最小值不能为 0"
+                        )));
+                    }
+                }
+                TcpMaskConfig::Xmc(cfg) if cfg.password.is_empty() => {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {node_name} xmc.password 不能为空"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        for mask in &finalmask.udp {
+            if let UdpMaskConfig::Xdns(cfg) = mask {
+                if cfg.domain.is_some() {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {node_name} finalmask.xdns.domain 已被 Xray 26.7.11 移除；请分别使用 domains（服务端）和 resolvers（客户端）"
+                    )));
+                }
+                if cfg.domains.is_empty() && cfg.resolvers.is_empty() {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {node_name} xdns.domains 与 resolvers 不能同时为空"
+                    )));
+                }
+                if let Some(resolver) = cfg
+                    .resolvers
+                    .iter()
+                    .find(|resolver| !resolver.contains("+udp://"))
+                {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {node_name} xdns resolver `{resolver}` 缺少 +udp://"
+                    )));
+                }
+            }
+        }
+        if let Some(quic) = &finalmask.quic_params {
+            let profile = quic.bbr_profile.to_ascii_lowercase();
+            if !matches!(
+                profile.as_str(),
+                "" | "conservative" | "standard" | "aggressive"
+            ) {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.bbrProfile 非法"
+                )));
+            }
+            let congestion = quic.congestion.to_ascii_lowercase();
+            if !matches!(
+                congestion.as_str(),
+                "" | "brutal" | "force-brutal" | "reno" | "bbr"
+            ) {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.congestion 非法"
+                )));
+            }
+            for (field, value) in [
+                ("initStreamReceiveWindow", quic.init_stream_receive_window),
+                ("maxStreamReceiveWindow", quic.max_stream_receive_window),
+                (
+                    "initConnectionReceiveWindow",
+                    quic.init_connection_receive_window,
+                ),
+                (
+                    "maxConnectionReceiveWindow",
+                    quic.max_connection_receive_window,
+                ),
+            ] {
+                if value > 0 && value < 16_384 {
+                    return Err(ConfigError::bad_node(format!(
+                        "node {node_name} quicParams.{field} 至少为 16384"
+                    )));
+                }
+            }
+            if quic.max_idle_timeout != 0 && !(4..=120).contains(&quic.max_idle_timeout) {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.maxIdleTimeout 必须在 4..=120"
+                )));
+            }
+            if quic.keep_alive_period != 0 && !(2..=60).contains(&quic.keep_alive_period) {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.keepAlivePeriod 必须在 2..=60"
+                )));
+            }
+            if quic.max_incoming_streams != 0 && quic.max_incoming_streams < 8 {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.maxIncomingStreams 至少为 8"
+                )));
+            }
+            if (quic.udp_hop.interval.from != 0 && quic.udp_hop.interval.from < 5)
+                || (quic.udp_hop.interval.to != 0 && quic.udp_hop.interval.to < 5)
+            {
+                return Err(ConfigError::bad_node(format!(
+                    "node {node_name} quicParams.udpHop.interval 的非零值至少为 5"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_groups(
@@ -3265,6 +3698,39 @@ limits:
     }
 
     #[test]
+    fn reality_listener_stream_settings_are_preserved_and_fail_closed() {
+        let mut source = valid_reality_listener();
+        source.stream_settings = Some(
+            serde_json::from_value(serde_json::json!({
+                "network": "raw",
+                "sockopt": {"acceptProxyProtocol": true},
+                "finalmask": {
+                    "tcp": [{"type": "sudoku", "settings": {"password": "secret"}}]
+                }
+            }))
+            .unwrap(),
+        );
+        let normalized = compile_reality_listeners(&[source.clone()])
+            .unwrap()
+            .remove(0);
+        let settings = normalized.stream_settings.expect("REALITY streamSettings");
+        assert!(settings.sockopt.unwrap().accept_proxy_protocol);
+        assert!(matches!(
+            &settings.finalmask.unwrap().tcp[..],
+            [crate::stream_settings::TcpMaskConfig::Sudoku(_)]
+        ));
+
+        source.stream_settings = Some(
+            serde_json::from_value(serde_json::json!({
+                "network": "raw",
+                "finalmask": {"udp": [{"type": "noise"}]}
+            }))
+            .unwrap(),
+        );
+        assert!(compile_reality_listeners(&[source]).is_err());
+    }
+
+    #[test]
     fn reality_server_snake_aliases_work_and_unknown_fields_fail() {
         let source: RealityListen = serde_yaml::from_str(&format!(
             r#"
@@ -3711,6 +4177,84 @@ listen:
             Some("certs/server.pem")
         );
         assert_eq!(h3.socket_addr().unwrap(), "[::]:8443".parse().unwrap());
+    }
+
+    #[test]
+    fn xhttp_listener_stream_settings_cover_tcp_h3_and_trusted_xff() {
+        let plan = compile_cfg(
+            r#"
+version: 1
+profile: server
+listen:
+  xhttp:
+    - enabled: false
+      address: 127.0.0.1
+      port: 8080
+      streamSettings:
+        network: xhttp
+        sockopt:
+          acceptProxyProtocol: true
+          trustedXForwardedFor: [X-Trusted-CDN]
+        finalmask:
+          tcp:
+            - type: sudoku
+              settings: {password: tcp-secret}
+    - enabled: false
+      address: "::1"
+      port: 8443
+      tls: {cert: cert.pem, key: key.pem}
+      alpn: [h3]
+      streamSettings:
+        network: splithttp
+        finalmask:
+          udp:
+            - type: salamander
+              settings: {password: udp-secret}
+          quicParams:
+            congestion: reno
+            maxIncomingStreams: 32
+"#,
+        );
+        let tcp = plan.listen.xhttp[0]
+            .stream_settings
+            .as_ref()
+            .expect("TCP listener streamSettings");
+        assert_eq!(
+            tcp.sockopt.as_ref().unwrap().trusted_x_forwarded_for,
+            ["X-Trusted-CDN"]
+        );
+        assert!(matches!(
+            &tcp.finalmask.as_ref().unwrap().tcp[..],
+            [crate::stream_settings::TcpMaskConfig::Sudoku(_)]
+        ));
+
+        let h3 = plan.listen.xhttp[1]
+            .stream_settings
+            .as_ref()
+            .expect("H3 listener streamSettings");
+        assert!(matches!(
+            &h3.finalmask.as_ref().unwrap().udp[..],
+            [crate::stream_settings::UdpMaskConfig::Salamander(_)]
+        ));
+        assert_eq!(
+            h3.finalmask
+                .as_ref()
+                .unwrap()
+                .quic_params
+                .as_ref()
+                .unwrap()
+                .max_incoming_streams,
+            32
+        );
+
+        let mut invalid = plan.listen.xhttp[0].stream_settings.clone().unwrap();
+        invalid.finalmask.as_mut().unwrap().udp =
+            vec![serde_json::from_value(serde_json::json!({"type": "noise"})).unwrap()];
+        assert!(validate_xhttp_listener_stream_settings(Some(&invalid), false, "test").is_err());
+
+        invalid.finalmask.as_mut().unwrap().udp.clear();
+        invalid.sockopt.as_mut().unwrap().trusted_x_forwarded_for = vec!["bad header".into()];
+        assert!(validate_xhttp_listener_stream_settings(Some(&invalid), false, "test").is_err());
     }
 
     #[test]
@@ -4931,5 +5475,47 @@ route: {preset: direct}
         apply_defaults(&mut config);
         let error = compile(config).unwrap_err().to_string();
         assert!(error.contains("不能分配给多个对端"), "error = {error}");
+    }
+
+    #[test]
+    fn link_node_keeps_structured_stream_settings() {
+        let detail: NodeDetail = serde_json::from_str(
+            r#"{
+                "name":"linked",
+                "link":"ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@1.2.3.4:8388#ignored",
+                "streamSettings":{"network":"raw","sockopt":{"domainStrategy":"UseIPv4"}}
+            }"#,
+        )
+        .unwrap();
+        let node = detail_to_parsed(&detail).unwrap();
+        assert_eq!(node.name, "linked");
+        assert_eq!(node.transport, "tcp");
+        assert_eq!(
+            node.stream_settings
+                .unwrap()
+                .sockopt
+                .unwrap()
+                .domain_strategy,
+            crate::stream_settings::DomainStrategy::UseIpv4
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_cycle_is_rejected_before_registry_build() {
+        let make = |name: &str, proxy: &str| {
+            let mut node = ParsedNode::new(name, NodeProtocol::Direct, "127.0.0.1", 1);
+            node.stream_settings = Some(crate::stream_settings::NodeStreamSettings {
+                sockopt: Some(crate::stream_settings::OutboundSocketConfig {
+                    dialer_proxy: proxy.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            node
+        };
+        let error = validate_dialer_proxy_graph(&[make("a", "b"), make("b", "a")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("循环链"), "error={error}");
     }
 }

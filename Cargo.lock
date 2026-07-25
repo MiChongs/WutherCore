@@ -1023,6 +1023,7 @@ dependencies = [
  "base64 0.22.1",
  "core-young",
  "hex",
+ "http 1.4.2",
  "humantime-serde",
  "ipnet",
  "once_cell",
@@ -1150,8 +1151,8 @@ dependencies = [
  "core-smart",
  "futures",
  "h2 0.4.15",
- "h3",
- "h3-quinn",
+ "h3 0.0.8",
+ "h3-quinn 0.0.10 (git+https://github.com/hyperium/h3?rev=c38a1af632afbbbc8f6716c196ad67f40bc122e3)",
  "hex",
  "http 1.4.2",
  "http-body-util",
@@ -1253,14 +1254,17 @@ dependencies = [
  "cronet",
  "ctr",
  "curve25519-dalek",
+ "data-encoding",
  "flate2",
  "fnv",
  "futures",
+ "ggstd",
  "h2 0.4.15",
- "h3",
- "h3-quinn",
+ "h3 0.0.8",
+ "h3-quinn 0.0.10 (git+https://github.com/hyperium/h3?rev=c38a1af632afbbbc8f6716c196ad67f40bc122e3)",
  "hex",
  "hickory-proto 0.26.1",
+ "hickory-resolver",
  "hkdf",
  "hmac",
  "http 1.4.2",
@@ -1271,8 +1275,10 @@ dependencies = [
  "ipnet",
  "libc",
  "md-5",
+ "num-bigint-dig",
  "parking_lot",
  "pbkdf2",
+ "percent-encoding",
  "pin-project-lite",
  "quinn",
  "quinn-proto",
@@ -1280,6 +1286,9 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rc4",
  "rcgen 0.14.8",
+ "regex",
+ "rsa",
+ "rsteria2",
  "russh",
  "russh-keys",
  "rustls 0.23.40",
@@ -2362,6 +2371,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggstd"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e924479d38dab35ad7dae658abe8429467c5ca109a72e50ce61e8e616fd6487"
+
+[[package]]
 name = "ghash"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2458,13 +2473,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http 1.4.2",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "h3-quinn"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
+dependencies = [
+ "bytes",
+ "futures",
+ "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "quinn",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "git+https://github.com/hyperium/h3?rev=c38a1af632afbbbc8f6716c196ad67f40bc122e3#c38a1af632afbbbc8f6716c196ad67f40bc122e3"
 dependencies = [
  "bytes",
  "futures-util",
- "h3",
+ "h3 0.0.8",
  "quinn",
  "tokio-util",
 ]
@@ -3601,6 +3644,7 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand 0.8.7",
+ "serde",
  "smallvec",
  "zeroize",
 ]
@@ -4523,6 +4567,30 @@ dependencies = [
  "spki 0.7.3",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rsteria2"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1abe0be87d7e1a8450a64dba96a009906f5b8a5a5cbe87f6770d3d34d71da9bf"
+dependencies = [
+ "blake2",
+ "bytes",
+ "h3 0.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+ "h3-quinn 0.0.10 (registry+https://github.com/rust-lang/crates.io-index)",
+ "http 1.4.2",
+ "quinn",
+ "quinn-proto",
+ "rand 0.9.5",
+ "rustls 0.23.40",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

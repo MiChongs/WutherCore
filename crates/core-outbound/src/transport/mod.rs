@@ -19,10 +19,12 @@ use crate::adapter::BoxedStream;
 pub(crate) mod boring_tls;
 mod browser_identity;
 pub(crate) mod ech;
+pub mod finalmask;
 pub mod grpc_transport;
 pub mod h2_transport;
 pub mod http_transport;
 pub mod reality;
+#[allow(unsafe_code)]
 pub mod tcp;
 pub mod tls;
 mod utls;

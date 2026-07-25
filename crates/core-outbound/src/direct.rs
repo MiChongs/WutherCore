@@ -137,6 +137,18 @@ impl UdpSocketLike for DirectUdp {
         let _ = &self.loopback_guard;
         self.sock.recv(buf).await
     }
+
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<SocketAddr>)> {
+        let length = self.recv_from(buf).await?;
+        Ok((length, Some(self.peer)))
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        self.sock.local_addr().map(Some)
+    }
 }
 
 impl DirectUdp {
