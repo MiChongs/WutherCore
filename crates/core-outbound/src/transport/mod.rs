@@ -23,6 +23,7 @@ pub mod grpc_transport;
 pub mod h2_transport;
 pub mod http_transport;
 pub mod reality;
+pub mod simple_obfs;
 #[allow(unsafe_code)]
 pub mod tcp;
 pub mod tls;

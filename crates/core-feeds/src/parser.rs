@@ -252,6 +252,7 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         &mut node.params,
         "ech-",
     );
+    flatten_transport_opts(m, "obfs-opts", &["mode", "host"], &mut node.params, "obfs-");
 
     // 5. ws-opts 嵌套 path / headers（headers 是 map）
     if let Some(ws_opts) = g("ws-opts").and_then(|v| v.as_mapping().cloned()) {
@@ -483,6 +484,39 @@ proxies:
                 .map(String::as_str),
             Some("ed25519,rsa")
         );
+    }
+
+    #[test]
+    fn parse_clash_snell_preserves_all_protocol_and_obfs_fields() {
+        let yaml = r#"
+proxies:
+  - name: Snell
+    type: snell
+    server: snell.example.com
+    port: 443
+    psk: secret
+    version: 4
+    udp: true
+    reuse: true
+    obfs-opts:
+      mode: tls
+      host: cdn.example.com
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+        assert_eq!(node.params.get("psk").map(String::as_str), Some("secret"));
+        assert_eq!(node.params.get("version").map(String::as_str), Some("4"));
+        assert_eq!(node.params.get("reuse").map(String::as_str), Some("1"));
+        assert_eq!(
+            node.params.get("obfs-mode").map(String::as_str),
+            Some("tls")
+        );
+        assert_eq!(
+            node.params.get("obfs-host").map(String::as_str),
+            Some("cdn.example.com")
+        );
+        assert!(node.udp);
     }
 
     #[test]
