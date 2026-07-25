@@ -1,0 +1,69 @@
+name: Naive CI
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/naive.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/core-config/**"
+      - "crates/core-feeds/**"
+      - "crates/core-outbound/**"
+      - "crates/wuther-core/**"
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: naive-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  naive:
+    name: Naive / Cronet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          prefix-key: v1-wuther-core
+          shared-key: naive
+          workspaces: |
+            . -> target
+          cache-bin: false
+
+      - name: Fetch verified Cronet SDK
+        shell: bash
+        run: |
+          git clone --branch v0.2.0 --depth 1 https://github.com/MiChongs/cronet-rs.git "$RUNNER_TEMP/cronet-rs"
+          "$RUNNER_TEMP/cronet-rs/scripts/fetch-native.sh" amd64 "$RUNNER_TEMP/cronet-sdk"
+          echo "CRONET_LIB_DIR=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
+          echo "CRONET_LIB_NAME=cronet" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
+
+      - name: Check Naive feature
+        run: cargo check -p wuther-core --features naive --all-targets --locked
+
+      - name: Test Naive URI and native tunnel
+        run: |
+          cargo test -p core-config parse_naive_h2_and_quic_links --locked
+          cargo test -p core-outbound --features naive naive --locked

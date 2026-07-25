@@ -8,6 +8,11 @@ use base64::Engine as _;
 use core_config::node_uri::{NodeProtocol, ParsedNode};
 use uuid::Uuid;
 
+#[cfg(feature = "naive")]
+use crate::proto::naive::{NaiveOutbound, NaiveOutboundConfig};
+#[cfg(feature = "naive")]
+use cronet::Header;
+
 use crate::{
     adapter::SharedOutbound,
     block::BlockOutbound,
@@ -110,6 +115,7 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
         NodeProtocol::Vmess => build_vmess(node),
         NodeProtocol::Vless => build_vless(node),
         NodeProtocol::Trojan => build_trojan(node),
+        NodeProtocol::Naive => build_naive(node),
         NodeProtocol::Snell => build_snell(node),
         NodeProtocol::AnyTls => build_anytls(node),
         NodeProtocol::Ssh => build_ssh(node),
@@ -122,6 +128,177 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
         NodeProtocol::TrustTunnel => build_trusttunnel(node),
         ref other => StubOutbound::new(node.name.clone(), proto_static_name(other)),
     }
+}
+
+#[cfg(feature = "naive")]
+fn build_naive(node: &ParsedNode) -> SharedOutbound {
+    let mut config = NaiveOutboundConfig::new(&node.host, node.port);
+    config.username = node.user.clone();
+    config.password = node.password.clone();
+    config.server_name = node.sni.clone().filter(|value| !value.is_empty());
+    config.insecure_concurrency =
+        param_usize(node, &["insecure-concurrency", "insecure_concurrency"], 1).max(1);
+    config.udp_over_tcp = node.udp && param_bool(node, &["udp-over-tcp", "udp_over_tcp"], false);
+    config.quic = param_bool(node, &["quic"], false);
+    config.quic_congestion_control = node
+        .params
+        .get("quic-congestion-control")
+        .or_else(|| node.params.get("quic_congestion_control"))
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "" => "",
+            "bbr" => "TBBR",
+            "bbr2" => "B2ON",
+            "cubic" => "QBIC",
+            "reno" => "RENO",
+            _ => value.as_str(),
+        })
+        .unwrap_or_default()
+        .to_owned();
+    config.receive_window = param_u64(node, &["stream-receive-window", "stream_receive_window"], 0);
+    config.quic_session_receive_window = param_u64(
+        node,
+        &["quic-session-receive-window", "quic_session_receive_window"],
+        0,
+    );
+    config.extra_headers = node
+        .params
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("extra-header.")
+                .or_else(|| key.strip_prefix("header."))
+                .map(|name| Header {
+                    name: name.to_owned(),
+                    value: value.clone(),
+                })
+        })
+        .collect();
+
+    if param_bool(
+        node,
+        &[
+            "insecure",
+            "allow-insecure",
+            "allowInsecure",
+            "skip-cert-verify",
+        ],
+        false,
+    ) {
+        tracing::warn!(
+            target: "naive",
+            node = %node.name,
+            "Cronet Naive rejects insecure TLS; configure certificate/certificate_path instead"
+        );
+        return StubOutbound::new(node.name.clone(), "naive(insecure-tls-unsupported)");
+    }
+    if let Some(path) = node
+        .params
+        .get("certificate-path")
+        .or_else(|| node.params.get("certificate_path"))
+    {
+        match std::fs::read_to_string(path) {
+            Ok(certificate) => config.trusted_root_certificates = Some(certificate),
+            Err(error) => {
+                tracing::warn!(
+                    target: "naive",
+                    node = %node.name,
+                    path,
+                    error = %error,
+                    "failed to read Naive certificate_path"
+                );
+                return StubOutbound::new(node.name.clone(), "naive(invalid-certificate-path)");
+            }
+        }
+    } else if let Some(certificate) = node.params.get("certificate") {
+        config.trusted_root_certificates = Some(certificate.clone());
+    }
+    config.ech_enabled = param_bool(
+        node,
+        &["ech", "ech-enabled", "ech_enabled", "ech-enable"],
+        false,
+    );
+    if let Some(encoded) = node
+        .params
+        .get("ech-config")
+        .or_else(|| node.params.get("ech_config"))
+    {
+        match decode_config_blob(encoded) {
+            Some(config_list) => {
+                config.ech_enabled = true;
+                config.ech_config_list = config_list;
+            }
+            None => {
+                return StubOutbound::new(node.name.clone(), "naive(invalid-ech-config)");
+            }
+        }
+    }
+    config.ech_query_server_name = node
+        .params
+        .get("ech-query-server-name")
+        .or_else(|| node.params.get("ech_query_server_name"))
+        .cloned();
+
+    match NaiveOutbound::new(&node.name, config) {
+        Ok(outbound) => Arc::new(outbound),
+        Err(error) => {
+            tracing::warn!(target: "naive", node = %node.name, error = %error, "invalid Naive node");
+            StubOutbound::new(node.name.clone(), "naive(invalid-config)")
+        }
+    }
+}
+
+#[cfg(not(feature = "naive"))]
+fn build_naive(node: &ParsedNode) -> SharedOutbound {
+    StubOutbound::new(node.name.clone(), "naive(feature-disabled)")
+}
+
+#[cfg(feature = "naive")]
+fn param_bool(node: &ParsedNode, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn param_usize(node: &ParsedNode, keys: &[&str], default: usize) -> usize {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn param_u64(node: &ParsedNode, keys: &[&str], default: u64) -> u64 {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn decode_config_blob(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+
+    let encoded = value
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .collect::<String>()
+        .replace(char::is_whitespace, "");
+    if encoded.len().is_multiple_of(2)
+        && !encoded.is_empty()
+        && encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return hex::decode(&encoded).ok();
+    }
+    STANDARD
+        .decode(&encoded)
+        .ok()
+        .or_else(|| URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
 }
 
 fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
@@ -978,6 +1155,7 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
         NodeProtocol::Vmess => "vmess",
         NodeProtocol::Vless => "vless",
         NodeProtocol::Trojan => "trojan",
+        NodeProtocol::Naive => "naive",
         NodeProtocol::Hysteria => "hysteria",
         NodeProtocol::Hysteria2 => "hysteria2",
         NodeProtocol::Tuic => "tuic",
@@ -998,8 +1176,41 @@ mod tests {
     use core_config::node_uri::{NodeProtocol, ParsedNode};
     use uuid::Uuid;
 
+    #[cfg(feature = "naive")]
+    use super::decode_config_blob;
     use super::{build_outbound, tuic_from_node};
     use crate::proto::tuic::TuicUdpMode;
+
+    #[cfg(feature = "naive")]
+    #[test]
+    fn naive_registry_enables_uot_and_rejects_unsafe_combinations() {
+        let mut node = ParsedNode::new("naive", NodeProtocol::Naive, "proxy.example", 443);
+        node.udp = true;
+        node.params.insert("udp-over-tcp".into(), "true".into());
+        let outbound = build_outbound(&node);
+        assert_eq!(outbound.protocol(), "naive");
+        assert!(outbound.capabilities().tcp);
+        assert!(outbound.capabilities().udp);
+
+        node.params.insert("quic".into(), "true".into());
+        node.params
+            .insert("insecure-concurrency".into(), "2".into());
+        assert_eq!(build_outbound(&node).protocol(), "naive(invalid-config)");
+
+        node.params.insert("insecure".into(), "true".into());
+        assert_eq!(
+            build_outbound(&node).protocol(),
+            "naive(insecure-tls-unsupported)"
+        );
+    }
+
+    #[cfg(feature = "naive")]
+    #[test]
+    fn naive_registry_decodes_ech_config_formats() {
+        assert_eq!(decode_config_blob("000102ff"), Some(vec![0, 1, 2, 255]));
+        assert_eq!(decode_config_blob("AAEC/w=="), Some(vec![0, 1, 2, 255]));
+        assert_eq!(decode_config_blob("%%%"), None);
+    }
 
     #[test]
     fn ss2022_registry_preserves_udp_flag_and_eih_chain() {

@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# NaiveProxy depends on the separately distributed SagerNet Cronet native
+# library. Keep it opt-in so ordinary MIT builds do not silently acquire a
+# GPL-3.0 runtime dependency.
+naive = ["dep:cronet", "dep:hickory-proto"]
+
 [dependencies]
 core-config = { workspace = true }
 core-reality = { workspace = true }
@@ -20,6 +27,8 @@ hex         = { workspace = true }
 futures     = { workspace = true }
 pin-project-lite = { workspace = true }
 if-addrs    = "0.15"
+cronet      = { workspace = true, optional = true }
+hickory-proto = { workspace = true, optional = true }
 
 # 协议层依赖
 aes-gcm           = { workspace = true }
@@ -85,3 +94,8 @@ windows-sys = { version = "0.59", features = [
 # IP_BOUND_IF / IPV6_BOUND_IF setsockopt —— 同 Windows 思路，darwin 平台
 # 出站 socket 必须按 ifindex 绑定。
 libc = "0.2"
+
+[dev-dependencies]
+h2 = "0.4"
+rcgen = "0.14"
+time = "0.3"

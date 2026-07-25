@@ -71,6 +71,8 @@ groups:
 
 策略组可以从订阅和其他路径聚合节点，并通过 `prefer`、`avoid`、健康检查和粘性配置影响选择。修改后用 API 的 Smart 解释端点确认实际决策。
 
+Naive 节点需要 `naive` Cargo feature 和匹配的 Cronet 动态库，支持 H2/H3、UoT v2、ECH 与自定义证书。字段、构建和许可说明见 [Naive 出站](NAIVE.md)。
+
 ## 路由
 
 ```yaml

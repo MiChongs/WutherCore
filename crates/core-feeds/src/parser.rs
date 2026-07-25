@@ -135,13 +135,17 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
 
     let proto = NodeProtocol::from_scheme(&kind);
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
+    node.user = str_g("username").or_else(|| str_g("user"));
     node.password = str_g("password");
     node.uuid = str_g("uuid");
     node.method = str_g("cipher").or_else(|| str_g("method"));
     node.tls = g("tls").and_then(|v| v.as_bool()).unwrap_or(false)
         || matches!(
             proto,
-            NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+            NodeProtocol::Trojan
+                | NodeProtocol::Naive
+                | NodeProtocol::Hysteria2
+                | NodeProtocol::Tuic
         );
     node.sni = str_g("sni").or_else(|| str_g("servername"));
     if let Some(net) = str_g("network") {
@@ -169,6 +173,8 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
                 | "type"
                 | "server"
                 | "port"
+                | "username"
+                | "user"
                 | "password"
                 | "uuid"
                 | "cipher"
@@ -260,6 +266,18 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
             .and_then(|v| v.as_str())
         {
             node.params.insert("serviceName".into(), svc.to_string());
+        }
+    }
+
+    // Naive's extra headers are a map rather than scalars. Preserve them with
+    // an unambiguous prefix for core-outbound.
+    for key in ["extra-headers", "extra_headers"] {
+        if let Some(headers) = g(key).and_then(|v| v.as_mapping().cloned()) {
+            for (name, value) in headers {
+                if let (Some(name), Some(value)) = (name.as_str(), scalar_to_string(&value)) {
+                    node.params.insert(format!("extra-header.{name}"), value);
+                }
+            }
         }
     }
 
@@ -428,6 +446,40 @@ proxies:
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].protocol, NodeProtocol::Trojan);
         assert_eq!(nodes[1].method.as_deref(), Some("aes-256-gcm"));
+    }
+
+    #[test]
+    fn parse_naive_clash_headers_and_transport_options() {
+        let yaml = r#"
+proxies:
+  - name: Naive-H3
+    type: naive
+    server: proxy.example.com
+    port: 443
+    username: alice
+    password: secret
+    udp: true
+    udp-over-tcp: true
+    quic: true
+    extra-headers:
+      X-Client: WutherCore
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].protocol, NodeProtocol::Naive);
+        assert_eq!(nodes[0].user.as_deref(), Some("alice"));
+        assert_eq!(
+            nodes[0]
+                .params
+                .get("extra-header.X-Client")
+                .map(String::as_str),
+            Some("WutherCore")
+        );
+        assert_eq!(
+            nodes[0].params.get("udp-over-tcp").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(nodes[0].params.get("quic").map(String::as_str), Some("1"));
     }
 
     #[test]
