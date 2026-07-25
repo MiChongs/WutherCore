@@ -20,7 +20,7 @@
 //! * shutdown 时 [`Resolver::flush_to_store`] 整体快照 + 等待 writer 落盘。
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -31,7 +31,8 @@ use std::{
 
 use core_config::model::{
     FakeMode, Resolver as ResolverCfg, ResolverFallbackFilter as ResolverFallbackFilterCfg,
-    ResolverMode,
+    ResolverGroup as ResolverGroupCfg, ResolverMode, ResolverServer as ResolverServerCfg,
+    ResolverStrategy,
 };
 use core_store::{AsyncWriter, Store, store::BatchOp};
 use hickory_resolver::proto::rr::{Record, RecordType};
@@ -322,13 +323,12 @@ impl Resolver {
         groups.insert("system".into(), system_group.clone());
 
         for (name, spec) in &cfg.servers {
-            let group = configured_group(name, spec).map_err(|e| {
-                ResolverConfigError::invalid(format!(
-                    "resolver server `{name}` invalid: {spec}: {e}"
-                ))
+            let group = configured_server(name, spec).map_err(|e| {
+                ResolverConfigError::invalid(format!("resolver server `{name}` invalid: {e}"))
             })?;
             groups.insert(name.clone(), group);
         }
+        register_configured_groups(&cfg.groups, &mut groups)?;
 
         if matches!(cfg.mode, ResolverMode::Fake) && matches!(cfg.fake, FakeMode::Off) {
             return Err(ResolverConfigError::invalid(
@@ -341,7 +341,7 @@ impl Resolver {
                 &mut groups,
                 "default",
                 &cfg.nameserver,
-                GroupStrategy::Fastest,
+                GroupStrategy::Parallel,
             )?
         } else if matches!(cfg.mode, ResolverMode::System) {
             system_group.clone()
@@ -360,7 +360,7 @@ impl Resolver {
                 &mut groups,
                 "fallback",
                 &cfg.fallback,
-                GroupStrategy::Fastest,
+                GroupStrategy::Parallel,
             )?;
             Some("fallback".to_string())
         };
@@ -370,7 +370,7 @@ impl Resolver {
                 &mut groups,
                 "direct-nameserver",
                 &cfg.direct_nameserver,
-                GroupStrategy::Fastest,
+                GroupStrategy::Parallel,
             )?;
         }
 
@@ -379,7 +379,7 @@ impl Resolver {
                 &mut groups,
                 "default-nameserver",
                 &cfg.default_nameserver,
-                GroupStrategy::Fastest,
+                GroupStrategy::Parallel,
             )?;
         }
         if !cfg.proxy_server_nameserver.is_empty() {
@@ -387,7 +387,7 @@ impl Resolver {
                 &mut groups,
                 "proxy-server-nameserver",
                 &cfg.proxy_server_nameserver,
-                GroupStrategy::Fastest,
+                GroupStrategy::Parallel,
             )?;
         }
         let bootstrap_group_name = if groups.contains_key("proxy-server-nameserver") {
@@ -1259,7 +1259,7 @@ impl Resolver {
             .singleflight
             .do_once(sf_key, move || async move {
                 if group_owned == "default" {
-                    this.resolve_default_qtype_uncached(&host_owned, qtype)
+                    this.resolve_default_qtype_uncached(&host_owned, qtype, opts.strategy)
                         .await
                         .map_err(|e| match e {
                             ResolveError::Failed(s) => crate::upstream::DnsError::Failed(s),
@@ -1273,7 +1273,8 @@ impl Resolver {
                             "unknown resolver server/group: {group_owned}"
                         ))
                     })?;
-                    resolve_group_qtype(group, &host_owned, qtype).await
+                    resolve_group_qtype_with_strategy(group, &host_owned, qtype, opts.strategy)
+                        .await
                 }
             })
             .await;
@@ -1312,6 +1313,7 @@ impl Resolver {
         &self,
         host: &str,
         qtype: QType,
+        strategy: Option<GroupStrategy>,
     ) -> Result<Vec<IpAddr>, ResolveError> {
         resolve_default_qtype_uncached_parts(
             self.groups.clone(),
@@ -1320,6 +1322,7 @@ impl Resolver {
             self.fallback_filter.clone(),
             host,
             qtype,
+            strategy,
         )
         .await
     }
@@ -1339,7 +1342,7 @@ impl Resolver {
             ResolveError::Failed(format!("unknown resolver server/group: {group_name}"))
         })?;
         group
-            .resolve_records(host, record_type)
+            .resolve_records_with_strategy(host, record_type, opts.strategy)
             .await
             .map_err(Into::into)
     }
@@ -1371,6 +1374,7 @@ impl Resolver {
                         fallback_filter,
                         &host,
                         qtype,
+                        opts.strategy,
                     )
                     .await
                     .map_err(|e| DnsError::Failed(e.to_string()));
@@ -1380,7 +1384,7 @@ impl Resolver {
                         "unknown resolver group: {group_name}"
                     )));
                 };
-                resolve_group_qtype(group, &host, qtype).await
+                resolve_group_qtype_with_strategy(group, &host, qtype, opts.strategy).await
             }
             .await;
 
@@ -1475,13 +1479,14 @@ async fn resolve_default_qtype_uncached_parts(
     fallback_filter: RuntimeFallbackFilter,
     host: &str,
     qtype: QType,
+    strategy: Option<GroupStrategy>,
 ) -> Result<Vec<IpAddr>, ResolveError> {
     let main = groups
         .get("default")
         .cloned()
         .ok_or_else(|| ResolveError::Failed("unknown resolver server/group: default".into()))?;
     let Some(fallback_name) = fallback_group else {
-        return resolve_group_qtype(main, host, qtype)
+        return resolve_group_qtype_with_strategy(main, host, qtype, strategy)
             .await
             .map_err(Into::into);
     };
@@ -1498,12 +1503,12 @@ async fn resolve_default_qtype_uncached_parts(
             reason = "domain-filter",
             "query fallback nameserver only"
         );
-        return resolve_group_qtype(fallback, host, qtype)
+        return resolve_group_qtype_with_strategy(fallback, host, qtype, strategy)
             .await
             .map_err(Into::into);
     }
 
-    match resolve_group_qtype(main.clone(), host, qtype).await {
+    match resolve_group_qtype_with_strategy(main.clone(), host, qtype, strategy).await {
         Ok(ips) if !ips.is_empty() => {
             let should_fallback = ips
                 .iter()
@@ -1529,7 +1534,7 @@ async fn resolve_default_qtype_uncached_parts(
                 main_ips = ?ips,
                 "main nameserver result matched fallback-filter; querying fallback"
             );
-            resolve_group_qtype(fallback, host, qtype)
+            resolve_group_qtype_with_strategy(fallback, host, qtype, strategy)
                 .await
                 .map_err(Into::into)
         }
@@ -1542,7 +1547,7 @@ async fn resolve_default_qtype_uncached_parts(
                 qtype = ?qtype,
                 "main nameserver returned empty; querying fallback"
             );
-            resolve_group_qtype(fallback, host, qtype)
+            resolve_group_qtype_with_strategy(fallback, host, qtype, strategy)
                 .await
                 .map_err(Into::into)
         }
@@ -1556,29 +1561,30 @@ async fn resolve_default_qtype_uncached_parts(
                 error = %e,
                 "main nameserver failed; querying fallback"
             );
-            resolve_group_qtype(fallback, host, qtype)
+            resolve_group_qtype_with_strategy(fallback, host, qtype, strategy)
                 .await
                 .map_err(Into::into)
         }
     }
 }
 
-async fn resolve_group_qtype(
+async fn resolve_group_qtype_with_strategy(
     group: Arc<DnsGroup>,
     host: &str,
     qtype: QType,
+    strategy: Option<GroupStrategy>,
 ) -> Result<Vec<IpAddr>, DnsError> {
     match qtype {
-        QType::A => group.resolve(host, false).await,
-        QType::AAAA => group.resolve(host, true).await,
+        QType::A => group.resolve_with_strategy(host, false, strategy).await,
+        QType::AAAA => group.resolve_with_strategy(host, true, strategy).await,
         QType::Both => {
             let mut out = Vec::new();
             let mut last_err = None;
-            match group.resolve(host, false).await {
+            match group.resolve_with_strategy(host, false, strategy).await {
                 Ok(v) => out.extend(v),
                 Err(e) => last_err = Some(e),
             }
-            match group.resolve(host, true).await {
+            match group.resolve_with_strategy(host, true, strategy).await {
                 Ok(v) => out.extend(v),
                 Err(e) => last_err = Some(e),
             }
@@ -1595,7 +1601,7 @@ fn system_group() -> Arc<DnsGroup> {
     let system_up = Arc::new(crate::upstream::system::SystemUpstream::new("system"));
     Arc::new(DnsGroup::new(
         "system",
-        GroupStrategy::Fallback,
+        GroupStrategy::Sequential,
         vec![system_up as _],
     ))
 }
@@ -1613,7 +1619,8 @@ fn register_composite_group(
             continue;
         }
         if let Some(group) = groups.get(spec) {
-            members.extend(group.members.iter().cloned());
+            // 保留 group 层级，避免服务级并发与出口级并发被拍平成无界 fan-out。
+            members.push(group.clone() as Arc<dyn crate::upstream::DnsUpstream>);
             continue;
         }
         let upstream_name = format!("{name}#{idx}");
@@ -1629,7 +1636,7 @@ fn register_composite_group(
             "resolver group `{name}` has no usable nameserver"
         )));
     }
-    let group = Arc::new(DnsGroup::new(name, strategy, members));
+    let group = Arc::new(DnsGroup::new(name, strategy, members).with_max_parallel(2));
     groups.insert(name.to_string(), group.clone());
     Ok(group)
 }
@@ -1865,13 +1872,125 @@ fn validate_action(
     Ok(())
 }
 
-fn configured_group(name: &str, spec: &str) -> Result<Arc<DnsGroup>, String> {
-    let upstream = configured_upstream(name, spec)?;
-    Ok(Arc::new(DnsGroup::new(
-        name,
-        GroupStrategy::Fallback,
-        vec![upstream],
-    )))
+fn runtime_strategy(strategy: ResolverStrategy) -> GroupStrategy {
+    match strategy {
+        ResolverStrategy::RoundRobin => GroupStrategy::RoundRobin,
+        ResolverStrategy::Random => GroupStrategy::Random,
+        ResolverStrategy::Parallel => GroupStrategy::Parallel,
+        ResolverStrategy::Adaptive => GroupStrategy::Adaptive,
+        ResolverStrategy::Sequential => GroupStrategy::Sequential,
+        ResolverStrategy::All => GroupStrategy::All,
+    }
+}
+
+fn configured_server(name: &str, spec: &ResolverServerCfg) -> Result<Arc<DnsGroup>, String> {
+    let endpoint = spec.endpoint().trim();
+    if endpoint.is_empty() {
+        return Err("endpoint must not be empty".into());
+    }
+    let params = extract_upstream_params(endpoint);
+    let members = if spec.exits().is_empty() {
+        vec![configured_upstream(&format!("{name}@direct"), endpoint)?]
+    } else {
+        spec.exits()
+            .iter()
+            .map(|outbound| {
+                let outbound = outbound.trim();
+                if outbound.is_empty() {
+                    return Err(format!("resolver server `{name}` contains an empty exit"));
+                }
+                let upstream: Arc<dyn crate::upstream::DnsUpstream> = Arc::new(
+                    crate::upstream::outbound::OutboundDnsUpstream::new(
+                        format!("{name}@{outbound}"),
+                        endpoint,
+                        outbound,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+                Ok(crate::upstream::FilteredUpstream::wrap_if_needed(
+                    upstream, &params,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    Ok(Arc::new(
+        DnsGroup::new(name, runtime_strategy(spec.strategy()), members)
+            .with_timeout(spec.timeout())
+            .with_max_parallel(spec.max_parallel()),
+    ))
+}
+
+fn register_configured_groups(
+    configs: &std::collections::BTreeMap<String, ResolverGroupCfg>,
+    groups: &mut HashMap<String, Arc<DnsGroup>>,
+) -> Result<(), ResolverConfigError> {
+    if let Some(name) = configs.keys().find(|name| groups.contains_key(*name)) {
+        return Err(ResolverConfigError::invalid(format!(
+            "resolver group `{name}` conflicts with a server of the same name"
+        )));
+    }
+    let names = configs.keys().cloned().collect::<Vec<_>>();
+    let mut visiting = HashSet::new();
+    for name in names {
+        build_configured_group(&name, configs, groups, &mut visiting)?;
+    }
+    Ok(())
+}
+
+fn build_configured_group(
+    name: &str,
+    configs: &std::collections::BTreeMap<String, ResolverGroupCfg>,
+    groups: &mut HashMap<String, Arc<DnsGroup>>,
+    visiting: &mut HashSet<String>,
+) -> Result<Arc<DnsGroup>, ResolverConfigError> {
+    if let Some(existing) = groups.get(name) {
+        return Ok(existing.clone());
+    }
+    let config = configs
+        .get(name)
+        .ok_or_else(|| ResolverConfigError::invalid(format!("unknown resolver group `{name}`")))?;
+    if !visiting.insert(name.to_string()) {
+        return Err(ResolverConfigError::invalid(format!(
+            "resolver group cycle detected at `{name}`"
+        )));
+    }
+
+    let result = (|| {
+        let mut members = Vec::<Arc<dyn crate::upstream::DnsUpstream>>::new();
+        for (index, member) in config.members().iter().enumerate() {
+            let member = member.trim();
+            if member.is_empty() {
+                continue;
+            }
+            if let Some(existing) = groups.get(member) {
+                members.push(existing.clone());
+            } else if configs.contains_key(member) {
+                members.push(build_configured_group(member, configs, groups, visiting)?);
+            } else {
+                let upstream =
+                    configured_upstream(&format!("{name}#{index}"), member).map_err(|error| {
+                        ResolverConfigError::invalid(format!(
+                            "resolver group `{name}` member[{index}] invalid `{member}`: {error}"
+                        ))
+                    })?;
+                members.push(upstream);
+            }
+        }
+        if members.is_empty() {
+            return Err(ResolverConfigError::invalid(format!(
+                "resolver group `{name}` has no usable members"
+            )));
+        }
+        let group = Arc::new(
+            DnsGroup::new(name, runtime_strategy(config.strategy()), members)
+                .with_timeout(config.timeout())
+                .with_max_parallel(config.max_parallel()),
+        );
+        groups.insert(name.to_string(), group.clone());
+        Ok(group)
+    })();
+    visiting.remove(name);
+    result
 }
 
 fn configured_upstream(
@@ -2840,11 +2959,8 @@ mod tests {
     #[test]
     fn resolver_new_honors_configured_secure_servers() {
         let mut servers = std::collections::BTreeMap::new();
-        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".to_string());
-        servers.insert(
-            "cloudflare".to_string(),
-            "https://1.1.1.1/dns-query".to_string(),
-        );
+        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".into());
+        servers.insert("cloudflare".to_string(), "https://1.1.1.1/dns-query".into());
         let r = Resolver::new(ResolverCfg {
             mode: ResolverMode::Normal,
             nameserver: vec!["cloudflare".into()],
@@ -2857,7 +2973,8 @@ mod tests {
         assert!(groups.contains_key("ali"));
         assert!(groups.contains_key("cloudflare"));
         assert_eq!(groups["cloudflare"].members[0].kind(), "doh");
-        assert_eq!(groups["default"].members[0].kind(), "doh");
+        assert_eq!(groups["default"].members[0].kind(), "group");
+        assert_eq!(groups["default"].members[0].name(), "cloudflare");
         assert_eq!(r.bootstrap.name, "default");
     }
 
@@ -2865,7 +2982,7 @@ mod tests {
     fn resolver_new_rejects_invalid_configured_servers() {
         // 域名 host 现在被接受（mihomo bootstrap 风格）；改用未知 scheme 触发拒收。
         let mut servers = std::collections::BTreeMap::new();
-        servers.insert("bad".to_string(), "gopher://1.2.3.4/dns-query".to_string());
+        servers.insert("bad".to_string(), "gopher://1.2.3.4/dns-query".into());
 
         let err = Resolver::try_new(ResolverCfg {
             mode: ResolverMode::Normal,
@@ -2883,11 +3000,8 @@ mod tests {
     #[test]
     fn resolver_new_preserves_user_rules_without_legacy_aliases() {
         let mut servers = std::collections::BTreeMap::new();
-        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".to_string());
-        servers.insert(
-            "cloudflare".to_string(),
-            "https://1.1.1.1/dns-query".to_string(),
-        );
+        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".into());
+        servers.insert("cloudflare".to_string(), "https://1.1.1.1/dns-query".into());
 
         let r = Resolver::try_new(ResolverCfg {
             mode: ResolverMode::Normal,
@@ -2971,7 +3085,7 @@ nameserver-policy:
     #[test]
     fn resolver_new_rejects_rules_referencing_unknown_groups() {
         let mut servers = std::collections::BTreeMap::new();
-        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".to_string());
+        servers.insert("ali".to_string(), "https://223.5.5.5/dns-query".into());
 
         let err = Resolver::try_new(ResolverCfg {
             mode: ResolverMode::Normal,
@@ -2984,5 +3098,74 @@ nameserver-policy:
         .unwrap_err();
 
         assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn advanced_nested_groups_keep_their_boundaries_and_rule_override() {
+        let cfg: ResolverCfg = serde_yaml::from_str(
+            r#"
+mode: smart
+fake: off
+servers:
+  cf:
+    endpoint: "https://1.1.1.1/dns-query"
+    exits: [node-a, node-b]
+    strategy: adaptive
+    max-parallel: 1
+  google:
+    endpoint: "tls://8.8.8.8"
+    exits: [node-a, node-b]
+    strategy: random
+groups:
+  public:
+    members: [cf, google]
+    strategy: parallel
+    max-parallel: 2
+nameserver: [public]
+fallback: []
+rules:
+  - { suffix: example.com, route: public, strategy: round-robin }
+"#,
+        )
+        .unwrap();
+
+        let resolver = Resolver::try_new(cfg).unwrap();
+        let groups = resolver.groups();
+        assert_eq!(groups["cf"].members.len(), 2);
+        assert_eq!(groups["public"].members.len(), 2);
+        assert!(
+            groups["public"]
+                .members
+                .iter()
+                .all(|member| member.kind() == "group")
+        );
+        assert_eq!(groups["public"].strategy, GroupStrategy::Parallel);
+
+        let DnsAction::Route { server, opts } = resolver.policy().decide("www.example.com") else {
+            panic!("expected route action");
+        };
+        assert_eq!(server, "public");
+        assert_eq!(opts.strategy, Some(GroupStrategy::RoundRobin));
+    }
+
+    #[test]
+    fn advanced_groups_reject_cycles() {
+        let cfg: ResolverCfg = serde_yaml::from_str(
+            r#"
+mode: smart
+fake: off
+servers:
+  local: "udp://223.5.5.5"
+groups:
+  a: [b]
+  b: [a]
+nameserver: [a]
+fallback: []
+"#,
+        )
+        .unwrap();
+
+        let error = Resolver::try_new(cfg).unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 }

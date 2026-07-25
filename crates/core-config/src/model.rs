@@ -1226,8 +1226,13 @@ pub struct Resolver {
     pub direct_nameserver: Vec<String>,
     #[serde(default, rename = "direct-nameserver-follow-policy")]
     pub direct_nameserver_follow_policy: bool,
+    /// 命名 DNS server。字符串是兼容/简洁写法；对象写法可让同一个 endpoint
+    /// 通过多个代理出口查询。
     #[serde(default = "default_resolver_servers")]
-    pub servers: BTreeMap<String, String>,
+    pub servers: BTreeMap<String, ResolverServer>,
+    /// 可嵌套 DNS group。列表是简洁写法；对象写法可覆盖策略、超时和并发上限。
+    #[serde(default)]
+    pub groups: BTreeMap<String, ResolverGroup>,
     #[serde(default)]
     pub rules: Vec<serde_yaml::Value>,
     /// 标准 DNS 监听地址，对标 mihomo `dns.listen`。
@@ -1262,10 +1267,220 @@ impl Default for Resolver {
             direct_nameserver: Vec::new(),
             direct_nameserver_follow_policy: false,
             servers: default_resolver_servers(),
+            groups: BTreeMap::new(),
             rules: Vec::new(),
             listen: None,
         }
     }
+}
+
+/// DNS 成员选择策略。
+///
+/// `random` 是均匀随机；`adaptive` 使用查询过程中学习到的平均 RTT 做加权随机，
+/// 与 AdGuard dnsproxy 的 load-balance 算法一致：平均 RTT 越小，权重越大。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolverStrategy {
+    RoundRobin,
+    Random,
+    Parallel,
+    #[default]
+    Adaptive,
+    /// 兼容旧的顺序故障转移语义。
+    #[serde(alias = "fallback")]
+    Sequential,
+    /// 并发收集所有成功答案。
+    All,
+}
+
+fn default_dns_group_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_dns_max_parallel() -> usize {
+    2
+}
+
+/// 命名 server 的兼容字符串写法或高级多出口写法。
+#[derive(Debug, Clone, Serialize)]
+pub enum ResolverServer {
+    Simple(String),
+    Advanced(ResolverServerAdvanced),
+}
+
+impl<'de> Deserialize<'de> for ResolverServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(endpoint) => Ok(Self::Simple(endpoint)),
+            serde_yaml::Value::Mapping(_) => {
+                serde_yaml::from_value::<ResolverServerAdvanced>(value)
+                    .map(Self::Advanced)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom(
+                "DNS server 必须是 endpoint 字符串，或包含 endpoint/exits 的对象",
+            )),
+        }
+    }
+}
+
+impl ResolverServer {
+    pub fn endpoint(&self) -> &str {
+        match self {
+            Self::Simple(endpoint) => endpoint,
+            Self::Advanced(config) => &config.endpoint,
+        }
+    }
+
+    pub fn exits(&self) -> &[String] {
+        match self {
+            Self::Simple(_) => &[],
+            Self::Advanced(config) => &config.exits,
+        }
+    }
+
+    pub fn strategy(&self) -> ResolverStrategy {
+        match self {
+            Self::Simple(_) => ResolverStrategy::Sequential,
+            Self::Advanced(config) => config.strategy,
+        }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Self::Simple(_) => default_dns_group_timeout(),
+            Self::Advanced(config) => config.timeout,
+        }
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        match self {
+            Self::Simple(_) => 1,
+            Self::Advanced(config) => config.max_parallel.max(1),
+        }
+    }
+}
+
+impl From<String> for ResolverServer {
+    fn from(value: String) -> Self {
+        Self::Simple(value)
+    }
+}
+
+impl From<&str> for ResolverServer {
+    fn from(value: &str) -> Self {
+        Self::Simple(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverServerAdvanced {
+    /// 唯一 DNS 服务 endpoint。服务级冗余应由 `resolver.groups` 表达。
+    #[serde(alias = "address", alias = "upstream")]
+    pub endpoint: String,
+    /// 访问该 endpoint 的代理节点数组；空数组表示沿用默认直连 DNS socket。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_vec",
+        alias = "outbound",
+        alias = "outbounds",
+        alias = "nodes"
+    )]
+    pub exits: Vec<String>,
+    #[serde(default)]
+    pub strategy: ResolverStrategy,
+    #[serde(default = "default_dns_group_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    #[serde(
+        default = "default_dns_max_parallel",
+        rename = "max-parallel",
+        alias = "max_parallel"
+    )]
+    pub max_parallel: usize,
+}
+
+/// DNS group 的简洁列表写法或高级对象写法。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResolverGroup {
+    Simple(Vec<String>),
+    Advanced(ResolverGroupAdvanced),
+}
+
+impl ResolverGroup {
+    pub fn members(&self) -> &[String] {
+        match self {
+            Self::Simple(members) => members,
+            Self::Advanced(config) => &config.members,
+        }
+    }
+
+    pub fn strategy(&self) -> ResolverStrategy {
+        match self {
+            Self::Simple(_) => ResolverStrategy::Adaptive,
+            Self::Advanced(config) => config.strategy,
+        }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Self::Simple(_) => default_dns_group_timeout(),
+            Self::Advanced(config) => config.timeout,
+        }
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        match self {
+            Self::Simple(_) => default_dns_max_parallel(),
+            Self::Advanced(config) => config.max_parallel.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverGroupAdvanced {
+    /// 成员可以引用命名 server、其它 group，或直接写 endpoint。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_vec",
+        alias = "member",
+        alias = "servers",
+        alias = "upstreams"
+    )]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub strategy: ResolverStrategy,
+    #[serde(default = "default_dns_group_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    #[serde(
+        default = "default_dns_max_parallel",
+        rename = "max-parallel",
+        alias = "max_parallel"
+    )]
+    pub max_parallel: usize,
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(value) => vec![value],
+        OneOrMany::Many(values) => values,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1950,12 +2165,18 @@ fn default_cache() -> Duration {
 fn default_ipv6_timeout() -> Duration {
     Duration::from_millis(100)
 }
-fn default_resolver_servers() -> BTreeMap<String, String> {
+fn default_resolver_servers() -> BTreeMap<String, ResolverServer> {
     // 与 mihomo 一致：IP host 直连，SNI 默认 = host（rustls IpAddress + IP-SAN cert
     // 验证）；也支持写域名（构造时 system DNS bootstrap 一次）。
     BTreeMap::from([
-        ("ali".into(), "https://223.5.5.5/dns-query".into()),
-        ("cloudflare".into(), "https://1.1.1.1/dns-query".into()),
+        (
+            "ali".into(),
+            ResolverServer::from("https://223.5.5.5/dns-query"),
+        ),
+        (
+            "cloudflare".into(),
+            ResolverServer::from("https://1.1.1.1/dns-query"),
+        ),
     ])
 }
 fn default_transport() -> String {

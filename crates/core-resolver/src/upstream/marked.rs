@@ -69,7 +69,7 @@ fn create_marked_tcp(peer: SocketAddr) -> std::io::Result<tokio::net::TcpStream>
     tokio::net::TcpStream::from_std(std_sock)
 }
 
-fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsError> {
+pub(super) fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsError> {
     let name = Name::from_ascii(host.trim_end_matches('.'))
         .map_err(|e| DnsError::Failed(format!("invalid DNS name: {e}")))?;
     let mut msg = Message::new();
@@ -82,7 +82,7 @@ fn build_query(host: &str, qtype: RecordType) -> Result<Vec<u8>, DnsError> {
         .map_err(|e| DnsError::Failed(format!("DNS encode: {e}")))
 }
 
-fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError> {
+pub(super) fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError> {
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
     let mut ips = Vec::new();
     for answer in msg.answers() {
@@ -99,7 +99,7 @@ fn parse_response(buf: &[u8], qtype: RecordType) -> Result<Vec<IpAddr>, DnsError
     }
 }
 
-fn parse_records(buf: &[u8]) -> Result<Vec<Record>, DnsError> {
+pub(super) fn parse_records(buf: &[u8]) -> Result<Vec<Record>, DnsError> {
     let msg = Message::from_bytes(buf).map_err(|e| DnsError::Failed(format!("DNS decode: {e}")))?;
     let records = msg.answers().to_vec();
     if records.is_empty() {
