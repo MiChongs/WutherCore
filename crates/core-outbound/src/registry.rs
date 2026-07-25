@@ -155,7 +155,7 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Trojan => Arc::new(build_trojan(node)?),
         NodeProtocol::Snell => build_snell(node)?,
         NodeProtocol::AnyTls => build_anytls(node),
-        NodeProtocol::Ssh => build_ssh(node),
+        NodeProtocol::Ssh => build_ssh(node)?,
         NodeProtocol::Hysteria => build_hysteria_v1(node),
         NodeProtocol::Hysteria2 => build_hysteria2(node),
         NodeProtocol::Tuic => build_tuic(node)?,
@@ -1460,20 +1460,62 @@ fn build_anytls(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
-fn build_ssh(node: &ParsedNode) -> SharedOutbound {
+fn build_ssh(node: &ParsedNode) -> Result<SharedOutbound, String> {
     let user = node.user.clone().unwrap_or_default();
+    if user.trim().is_empty() {
+        return Err("SSH username is required".into());
+    }
     let mut ob = SshOutbound::new(&node.name, &node.host, node.port, user);
-    if let Some(pwd) = &node.password {
-        ob = ob.with_password(pwd);
-    } else if let Some(key_path) = node.params.get("private-key") {
-        let pp = node.params.get("private-key-passphrase").cloned();
-        ob = ob.with_private_key_path(key_path, pp);
+    if let Some(private_key) = node.params.get("private-key") {
+        let passphrase = node
+            .params
+            .get("private-key-passphrase")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        ob = if private_key.contains("PRIVATE KEY") {
+            ob.with_private_key_content(private_key, passphrase)?
+        } else {
+            ob.with_private_key_path(private_key, passphrase)?
+        };
     }
-    if let Some(known) = node.params.get("known-hosts") {
-        let lines: Vec<String> = known.lines().map(|s| s.to_string()).collect();
-        ob = ob.with_known_hosts(lines);
+    if let Some(password) = node.password.as_ref().filter(|value| !value.is_empty()) {
+        // Match mihomo: public-key authentication is attempted before password
+        // when both fields are configured.
+        ob = ob.with_password(password);
     }
-    Arc::new(ob)
+    if let Some(host_keys) = node
+        .params
+        .get("host-key")
+        .or_else(|| node.params.get("known-hosts"))
+    {
+        let keys = host_keys
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(crate::proto::ssh::parse_host_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !keys.is_empty() {
+            ob = ob.with_host_keys(keys);
+        }
+    }
+    if let Some(algorithms) = node.params.get("host-key-algorithms") {
+        let algorithms = algorithms
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|algorithm| !algorithm.is_empty())
+            .map(str::to_string)
+            .collect();
+        ob = ob.with_host_key_algorithms(algorithms)?;
+    }
+    if let Some(version) = node.params.get("client-version") {
+        ob = ob.with_client_version(version)?;
+    }
+    if let Some(value) = node.params.get("keepalive-interval") {
+        ob.keepalive_interval_secs = value
+            .parse()
+            .map_err(|_| format!("invalid SSH keepalive-interval `{value}`"))?;
+    }
+    Ok(Arc::new(ob))
 }
 
 fn build_hysteria_v1(node: &ParsedNode) -> SharedOutbound {
@@ -1916,6 +1958,36 @@ mod tests {
             .params
             .insert("padding-max".into(), "not-a-number".into());
         assert!(build_error(&sudoku).contains("invalid Sudoku padding-max"));
+    }
+
+    #[test]
+    fn ssh_registry_validates_every_security_field_before_network_io() {
+        let missing_user = node(NodeProtocol::Ssh);
+        assert!(build_error(&missing_user).contains("SSH username is required"));
+
+        let mut ssh = node(NodeProtocol::Ssh);
+        ssh.user = Some("alice".into());
+        ssh.password = Some("secret".into());
+        assert!(build_outbound(&ssh).is_ok());
+
+        ssh.params
+            .insert("host-key".into(), "ssh-ed25519 not-base64".into());
+        assert!(build_error(&ssh).contains("invalid SSH host-key"));
+        ssh.params.remove("host-key");
+
+        ssh.params
+            .insert("host-key-algorithms".into(), "not-an-algorithm".into());
+        assert!(build_error(&ssh).contains("unsupported SSH host-key algorithm"));
+        ssh.params.remove("host-key-algorithms");
+
+        ssh.params
+            .insert("client-version".into(), "SSH-2.0-good\r\ninjected".into());
+        assert!(build_error(&ssh).contains("SSH client version"));
+        ssh.params.remove("client-version");
+
+        ssh.params
+            .insert("keepalive-interval".into(), "not-a-number".into());
+        assert!(build_error(&ssh).contains("invalid SSH keepalive-interval"));
     }
 
     #[test]
