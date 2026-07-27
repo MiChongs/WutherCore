@@ -138,7 +138,7 @@ h3                = { git = "https://github.com/hyperium/h3", rev = "c38a1af632a
 h3-quinn          = { git = "https://github.com/hyperium/h3", rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3" }
 
 # SSH 客户端
-russh             = "0.46"
+russh             = "0.62"
 russh-keys        = "0.46"
 
 # WireGuard 用户态
