@@ -47,9 +47,12 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
             host_owner("wuther.wireguard"),
             SocketTransport::Udp,
             listener.bind,
+<<<<<<< HEAD
         ));
     }
 
+=======
+>>>>>>> origin/main
     for young in &plan.listen.young {
         let address = young
             .socket_addr()
