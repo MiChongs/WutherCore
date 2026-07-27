@@ -8,11 +8,7 @@
 //! 共同消费的 *已展开* 数据，而非 YAML 原貌。
 
 use std::{
-<<<<<<< HEAD
     collections::{BTreeMap, HashSet},
-=======
-    collections::BTreeMap,
->>>>>>> origin/main
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -50,17 +46,13 @@ pub struct ListenPlan {
     #[serde(default)]
     pub reality: Vec<RealityListen>,
     #[serde(default)]
-<<<<<<< HEAD
     pub wireguard: Vec<WireGuardListenPlan>,
-=======
     pub young: Vec<YoungListen>,
->>>>>>> origin/main
     pub panel: Option<PanelListen>,
     pub share: Share,
     pub auth: Vec<UserPass>,
 }
 
-<<<<<<< HEAD
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WireGuardListenPlan {
     pub bind: SocketAddr,
@@ -107,7 +99,9 @@ impl std::fmt::Debug for WireGuardListenPeerPlan {
             .field("reserved", &self.reserved)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .finish()
-=======
+    }
+}
+
 impl YoungListen {
     pub fn socket_addr(&self) -> ConfigResult<SocketAddr> {
         let host = self.host.trim();
@@ -119,7 +113,6 @@ impl YoungListen {
             .parse::<IpAddr>()
             .map_err(|_| ConfigError::invalid(format!("非法 Young 监听 IP: {}", self.host)))?;
         Ok(SocketAddr::new(ip, self.port))
->>>>>>> origin/main
     }
 }
 
@@ -283,11 +276,8 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         share: None,
         auth: vec![],
         reality: vec![],
-<<<<<<< HEAD
         wireguard: vec![],
-=======
         young: vec![],
->>>>>>> origin/main
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -362,27 +352,20 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         .collect();
 
     let reality = compile_reality_listeners(&listen.reality)?;
-<<<<<<< HEAD
     let wireguard = compile_wireguard_listeners(&listen.wireguard)?;
-=======
     let young = compile_young_listeners(&listen.young)?;
->>>>>>> origin/main
 
     Ok(ListenPlan {
         mixed,
         reality,
-<<<<<<< HEAD
         wireguard,
-=======
         young,
->>>>>>> origin/main
         panel,
         share,
         auth,
     })
 }
 
-<<<<<<< HEAD
 fn compile_wireguard_listeners(
     listeners: &[WireGuardListen],
 ) -> ConfigResult<Vec<WireGuardListenPlan>> {
@@ -519,7 +502,7 @@ fn decode_wireguard_key(value: &str, location: &str) -> ConfigResult<[u8; 32]> {
     decoded
         .try_into()
         .map_err(|_| ConfigError::invalid("WireGuard 密钥必须解码为 32 字节").at(location))
-=======
+}
 fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungListen>> {
     let mut output = Vec::with_capacity(listeners.len());
     let mut bound = std::collections::HashSet::new();
@@ -606,7 +589,6 @@ fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungL
         output.push(listener.clone());
     }
     Ok(output)
->>>>>>> origin/main
 }
 
 fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {

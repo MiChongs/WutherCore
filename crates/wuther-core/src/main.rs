@@ -939,7 +939,6 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     let mut handles = Vec::new();
-<<<<<<< HEAD
     let mut wireguard_inbounds: Vec<(
         Arc<WireGuardServer>,
         core_capture::NetstackDispatcherHandles,
@@ -1037,9 +1036,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         );
         wireguard_inbounds.push((server, dispatcher_handles));
     }
-=======
     let mut young_server_handles = Vec::new();
->>>>>>> origin/main
 
     // Standalone DNS server —— mihomo `dns.listen` 等价。
     // 与 mihomo `dns/server.go::ReCreateServer` 行为一致：空地址 / port=0 → disabled。

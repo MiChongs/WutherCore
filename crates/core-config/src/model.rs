@@ -211,21 +211,17 @@ pub struct Listen {
     /// `protocol` 指定的内层代理协议。
     #[serde(default, alias = "reality-inbounds", alias = "reality_inbounds")]
     pub reality: Vec<RealityListen>,
-<<<<<<< HEAD
     /// WireGuard 服务端入站。每个条目绑定一个 UDP 端口，并把已认证对端的
     /// IPv4/IPv6 包交给 WutherCore 的 TCP/UDP 路由运行时。
     #[serde(default, alias = "wireguard-inbounds", alias = "wireguard_inbounds")]
     pub wireguard: Vec<WireGuardListen>,
-=======
     /// Young 原生入站。传输层是 Firefox 使用的 Mozilla Neqo HTTP/3/WebTransport。
     #[serde(default, alias = "young-inbounds", alias = "young_inbounds")]
     pub young: Vec<YoungListen>,
->>>>>>> origin/main
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-<<<<<<< HEAD
 pub struct WireGuardListen {
     #[serde(default = "default_wireguard_listen_host")]
     pub host: String,
@@ -303,7 +299,12 @@ impl std::fmt::Debug for WireGuardListenPeer {
             .field("allowed_ips", &self.allowed_ips)
             .field("reserved", &self.reserved)
             .field("persistent_keepalive", &self.persistent_keepalive)
-=======
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct YoungListen {
     #[serde(default = "default_young_listen_host")]
     pub host: String,
@@ -398,7 +399,6 @@ impl std::fmt::Debug for YoungListen {
             .field("max_flows_per_session", &self.max_flows_per_session)
             .field("decoy_status", &self.decoy_status)
             .field("decoy_body_bytes", &self.decoy_body.len())
->>>>>>> origin/main
             .finish()
     }
 }
@@ -2154,7 +2154,6 @@ fn default_localhost() -> String {
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()
 }
-<<<<<<< HEAD
 
 fn default_wireguard_listen_host() -> String {
     "0.0.0.0".into()
@@ -2170,7 +2169,7 @@ fn default_wireguard_packet_queue() -> usize {
 
 fn default_wireguard_handshake_rate_limit() -> u64 {
     100
-=======
+}
 fn default_young_listen_host() -> String {
     "0.0.0.0".into()
 }
@@ -2197,7 +2196,6 @@ fn default_young_decoy_status() -> u16 {
 }
 fn default_young_decoy_body() -> String {
     "<!doctype html><html><head><title>Not Found</title></head><body><h1>Not Found</h1></body></html>".into()
->>>>>>> origin/main
 }
 fn default_reality_inner_protocol() -> String {
     "vless".into()
