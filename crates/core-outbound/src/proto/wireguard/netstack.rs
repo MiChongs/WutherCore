@@ -782,15 +782,15 @@ fn test_dns_response(request: &[u8]) -> std::io::Result<Vec<u8>> {
     };
     let request = Message::from_bytes(request)
         .map_err(|error| io_err(format!("test DNS request decode failed: {error}")))?;
-    let mut response = Message::new();
-    response
-        .set_id(request.id())
-        .set_message_type(MessageType::Response)
-        .set_op_code(request.op_code())
-        .set_recursion_desired(request.recursion_desired())
-        .set_recursion_available(true)
-        .set_response_code(ResponseCode::NoError);
-    for query in request.queries() {
+    let mut response = Message::new(
+        request.metadata.id,
+        MessageType::Response,
+        request.metadata.op_code,
+    );
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.response_code = ResponseCode::NoError;
+    for query in &request.queries {
         response.add_query(query.clone());
         let data = match query.query_type() {
             RecordType::A => Some(RData::A(A::new(10, 99, 0, 1))),

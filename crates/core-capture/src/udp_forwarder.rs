@@ -123,8 +123,12 @@ pub async fn run_return_loop(
 /// 把 (src, dst, payload) 编成完整 IP+UDP 包字节 —— 公开给 dns_hijack 等同源模块复用。
 pub fn build_udp_ip_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
     match (src.ip(), dst.ip()) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => Some(build_v4(s, src.port(), d, dst.port(), payload)),
-        (IpAddr::V6(s), IpAddr::V6(d)) => Some(build_v6(s, src.port(), d, dst.port(), payload)),
+        (IpAddr::V4(s), IpAddr::V4(d)) if payload.len() <= 65_507 => {
+            Some(build_v4(s, src.port(), d, dst.port(), payload))
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) if payload.len() <= 65_527 => {
+            Some(build_v6(s, src.port(), d, dst.port(), payload))
+        }
         _ => None,
     }
 }
@@ -242,5 +246,25 @@ mod tests {
             }
             _ => panic!("expected udp"),
         }
+    }
+
+    #[test]
+    fn oversized_udp_datagrams_fail_without_length_wraparound() {
+        assert!(
+            build_udp_ip_packet(
+                "192.0.2.1:53".parse().unwrap(),
+                "198.51.100.1:5000".parse().unwrap(),
+                &vec![0u8; 65_508],
+            )
+            .is_none()
+        );
+        assert!(
+            build_udp_ip_packet(
+                "[2001:db8::1]:53".parse().unwrap(),
+                "[2001:db8::2]:5000".parse().unwrap(),
+                &vec![0u8; 65_528],
+            )
+            .is_none()
+        );
     }
 }

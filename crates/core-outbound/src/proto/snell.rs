@@ -58,7 +58,7 @@ use tokio::{
 
 use crate::{
     adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
-    proto::addr::encode_socks_addr,
+    proto::addr::{decode_socks_addr, encode_socks_addr},
     transport::{Transport, tcp::TcpTransport},
 };
 
@@ -274,6 +274,13 @@ impl UdpSocketLike for SnellUdp {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.recv_from_endpoint(buf).await.map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<std::net::SocketAddr>)> {
         let mut read = self.read.lock().await;
         let mut len = [0u8; 2];
         read.read_exact(&mut len).await?;
@@ -284,16 +291,25 @@ impl UdpSocketLike for SnellUdp {
         if body_len > 0 {
             read.read_exact(&mut packet[2..]).await?;
         }
-        let (_, _, payload) = decode_udp_packet(&packet)?;
+        let (_, address, payload) = decode_udp_packet(&packet)?;
+        let (host, port, _) = decode_socks_addr(address)?;
         let copy_len = payload.len().min(buf.len());
         buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        Ok(copy_len)
+        let endpoint = host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|address| std::net::SocketAddr::new(address, port));
+        Ok((copy_len, endpoint))
     }
 
     async fn close(&self) -> std::io::Result<()> {
         let mut write = self.write.lock().await;
         let _ = write.shutdown().await;
         Ok(())
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
     }
 }
 

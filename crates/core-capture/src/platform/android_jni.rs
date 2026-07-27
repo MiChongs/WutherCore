@@ -206,6 +206,9 @@ pub extern "system" fn Java_org_wuthercore_VpnBridge_nativeStop(
     _class: *mut core::ffi::c_void,
 ) {
     STARTED.store(false, Ordering::SeqCst);
+    // If establish() succeeded but native startup did not consume the fd,
+    // stopping/restarting the service must not leak the detached descriptor.
+    crate::platform::android_tun_io::clear_vpn_fd();
 }
 
 /// `void notifyNetworkChanged(String interfaceName)` —— 物理网卡/连接变更通知。

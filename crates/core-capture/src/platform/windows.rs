@@ -1,14 +1,18 @@
 //! Windows 后端：Wintun + 系统路由表。
 //!
-//! Startup is transactional: a real tun-rs device must exist, every netsh
-//! mutation must succeed, and partial DNS/route state is rolled back before an
-//! error reaches the supervisor.
+//! Startup is transactional: a real tun-rs device must exist, native IP Helper
+//! route mutations and DNS changes are recorded, and partial state is rolled
+//! back before an error reaches the supervisor.
 
 use std::{collections::HashSet, net::IpAddr, process::Command, sync::Arc};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
+    time::{Duration, sleep},
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -56,6 +60,8 @@ struct TunState {
     device: Option<Arc<dyn TunIo>>,
     /// Original per-interface DNS source and ordered server list.
     saved_dns: Vec<DnsInterfaceState>,
+    network_watch_stop: Option<oneshot::Sender<()>>,
+    network_watch_task: Option<JoinHandle<()>>,
 }
 
 impl WindowsTun {
@@ -64,6 +70,53 @@ impl WindowsTun {
             plan,
             state: Mutex::new(TunState::default()),
             routes: RouteTable::new(),
+        }
+    }
+
+    async fn reconcile_after_network_change(&self) {
+        if let Err(error) = self.routes.reconcile_all() {
+            warn!(target: "capture::windows", %error, "failed to reconcile TUN routes");
+        }
+        if !self.plan.hijack_dns {
+            return;
+        }
+
+        let snapshot = match snapshot_system_dns() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "capture::windows", %error, "failed to snapshot DNS after network change");
+                return;
+            }
+        };
+        let mut g = self.state.lock().await;
+        if !g.started {
+            return;
+        }
+        let known = g
+            .saved_dns
+            .iter()
+            .map(|state| (state.interface_index, state.address_family))
+            .collect::<HashSet<_>>();
+        let added = snapshot
+            .into_iter()
+            .filter(|state| {
+                !known.contains(&(state.interface_index, state.address_family))
+                    && state.interface_alias != self.plan.interface_name
+            })
+            .collect::<Vec<_>>();
+        let mut targets = g.saved_dns.clone();
+        targets.extend(added.iter().cloned());
+        if let Err(error) = apply_dns_to_all_interfaces(&targets) {
+            warn!(target: "capture::windows", %error, "failed to re-assert DNS hijack after network change");
+            return;
+        }
+        if !added.is_empty() {
+            info!(
+                target: "capture::windows",
+                count = added.len(),
+                "DNS hijack extended to newly available interfaces"
+            );
+            g.saved_dns.extend(added);
         }
     }
 }
@@ -149,7 +202,7 @@ impl CaptureEngine for WindowsTun {
                         dest,
                         gateway: None,
                         interface: self.plan.interface_name.clone(),
-                        metric: 0,
+                        metric: 1,
                         table: None,
                     })
                     .map_err(CaptureError::Route)?;
@@ -190,6 +243,26 @@ impl CaptureEngine for WindowsTun {
         g.device = Some(device);
         g.saved_dns = saved_dns;
         g.started = true;
+        let (watch_stop_tx, mut watch_stop_rx) = oneshot::channel();
+        let mut changes = crate::net_monitor::subscribe();
+        let watcher = self.clone();
+        g.network_watch_stop = Some(watch_stop_tx);
+        g.network_watch_task = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut watch_stop_rx => break,
+                    event = changes.recv() => {
+                        if event.is_err() {
+                            break;
+                        }
+                        // Coalesce DHCP/VPN bursts before reading route/DNS state.
+                        sleep(Duration::from_millis(250)).await;
+                        while changes.try_recv().is_ok() {}
+                        watcher.reconcile_after_network_change().await;
+                    }
+                }
+            }
+        }));
         info!(
             target: "capture",
             iface = %self.plan.interface_name,
@@ -198,6 +271,15 @@ impl CaptureEngine for WindowsTun {
         Ok(())
     }
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
+        let mut g = self.state.lock().await;
+        if let Some(stop) = g.network_watch_stop.take() {
+            let _ = stop.send(());
+        }
+        let watch_task = g.network_watch_task.take();
+        drop(g);
+        if let Some(task) = watch_task {
+            let _ = task.await;
+        }
         let mut g = self.state.lock().await;
         let mut cleanup_errors = Vec::new();
         if let Err(error) = self.routes.revert_all_checked() {
@@ -612,8 +694,10 @@ mod tests {
         assert_eq!(
             crate::resource_claims::windows_tun_route_nets(&route_plan(true, true)),
             [
-                "0.0.0.0/0".parse::<ipnet::IpNet>().unwrap(),
-                "::/0".parse::<ipnet::IpNet>().unwrap(),
+                "0.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "128.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "::/1".parse::<ipnet::IpNet>().unwrap(),
+                "8000::/1".parse::<ipnet::IpNet>().unwrap(),
             ]
         );
 
@@ -621,7 +705,10 @@ mod tests {
         ipv4_only.ipv6_enabled = false;
         assert_eq!(
             crate::resource_claims::windows_tun_route_nets(&ipv4_only),
-            ["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()]
+            [
+                "0.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "128.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+            ]
         );
 
         let mut explicit = route_plan(true, true);

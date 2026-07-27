@@ -1,9 +1,7 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
 
 use crate::{
@@ -67,11 +65,11 @@ impl OutboundAdapter for DirectOutbound {
                         local = %sock.local_addr().map(|v| v.to_string()).unwrap_or_else(|_| "-".into()),
                         "direct udp connected",
                     );
+                    let resolved = DashMap::new();
+                    resolved.insert(cache_key(&ctx.host, ctx.port), addr);
                     return Ok(Box::new(DirectUdp {
                         sock: Arc::new(sock),
-                        peer: addr,
-                        target_host: ctx.host.clone(),
-                        target_port: ctx.port,
+                        resolved,
                         loopback_guard,
                     }));
                 }
@@ -103,64 +101,127 @@ impl OutboundAdapter for DirectOutbound {
 
 struct DirectUdp {
     sock: Arc<UdpSocket>,
-    peer: SocketAddr,
-    target_host: String,
-    target_port: u16,
+    resolved: DashMap<(String, u16), SocketAddr>,
     loopback_guard: crate::loopback::LoopbackUdpGuard,
 }
 
 fn open_direct_udp_socket(
     peer: SocketAddr,
 ) -> std::io::Result<(UdpSocket, crate::loopback::LoopbackUdpGuard)> {
-    let (std_sock, guard) = crate::adapter::create_outbound_udp_socket(peer)?;
+    let (std_sock, guard) = crate::adapter::create_outbound_udp_association(peer)?;
     Ok((UdpSocket::from_std(std_sock)?, guard))
 }
 
 #[async_trait]
 impl UdpSocketLike for DirectUdp {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
-        if !self.matches_target(target, port) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "direct UDP association is connected to {}:{} ({}) and cannot send to \
-                     {target}:{port}; endpoint-aware UDP receive is required before one \
-                     association can safely serve multiple destinations",
-                    self.target_host, self.target_port, self.peer
-                ),
-            ));
+        let family_is_v4 = self.sock.local_addr()?.is_ipv4();
+        let key = cache_key(target, port);
+        if let Some(address) = self.resolved.get(&key).map(|entry| *entry)
+            && address.is_ipv4() == family_is_v4
+        {
+            match self.sock.send_to(buf, address).await {
+                Ok(length) => return Ok(length),
+                Err(_) => {
+                    self.resolved.remove(&key);
+                }
+            }
         }
-        self.sock.send(buf).await
+        let addresses = resolve_host_for_direct(target, port).await?;
+        let mut last_error = None;
+        for address in addresses
+            .into_iter()
+            .filter(|address| address.is_ipv4() == family_is_v4)
+        {
+            match self.sock.send_to(buf, address).await {
+                Ok(length) => {
+                    self.resolved.insert(key, address);
+                    return Ok(length);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no usable UDP address for {target}:{port}"),
+            )
+        }))
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let _ = &self.loopback_guard;
-        self.sock.recv(buf).await
+        self.sock.recv_from(buf).await.map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<SocketAddr>)> {
+        let (length, source) = self.sock.recv_from(buf).await?;
+        Ok((length, Some(source)))
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+        self.sock.local_addr().map(Some)
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
     }
 }
 
-impl DirectUdp {
-    fn matches_target(&self, target: &str, port: u16) -> bool {
-        if port != self.target_port {
-            return false;
-        }
+fn cache_key(host: &str, port: u16) -> (String, u16) {
+    (
+        host.trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        port,
+    )
+}
 
-        if normalize_host(target).eq_ignore_ascii_case(normalize_host(&self.target_host)) {
-            return true;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        parse_ip_literal(target) == Some(self.peer.ip())
+    #[tokio::test]
+    async fn direct_udp_association_keeps_one_local_endpoint_for_multiple_targets() {
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let outbound = DirectOutbound
+            .dial_udp(DialContext::udp("127.0.0.1", first_addr.port()))
+            .await
+            .unwrap();
+        let local = outbound.local_addr().unwrap().unwrap();
+
+        outbound
+            .send_to(b"one", "127.0.0.1", first_addr.port())
+            .await
+            .unwrap();
+        outbound
+            .send_to(b"two", "127.0.0.1", second_addr.port())
+            .await
+            .unwrap();
+
+        let mut buffer = [0u8; 8];
+        let (first_len, first_peer) = first.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..first_len], b"one");
+        assert_eq!(first_peer.port(), local.port());
+        let (second_len, second_peer) = second.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..second_len], b"two");
+        assert_eq!(second_peer.port(), local.port());
+        first.send_to(b"r1", first_peer).await.unwrap();
+        second.send_to(b"r2", second_peer).await.unwrap();
+
+        let mut sources = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let (_, source) = outbound.recv_from_endpoint(&mut buffer).await.unwrap();
+            sources.insert(source.unwrap());
+        }
+        assert_eq!(sources, [first_addr, second_addr].into_iter().collect());
     }
-}
-
-fn normalize_host(host: &str) -> &str {
-    host.trim()
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or_else(|| host.trim())
-        .trim_end_matches('.')
-}
-
-fn parse_ip_literal(host: &str) -> Option<IpAddr> {
-    normalize_host(host).parse().ok()
 }

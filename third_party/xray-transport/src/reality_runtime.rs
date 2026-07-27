@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use xray_routing::{Target, TargetAddr};
 
 use crate::{
-    connect_tcp_stream,
+    boxed_transport_stream, connect_tcp_stream,
     reality_connector::{
         RealityClientHelloRequest, RealityConnector, RealityHandshakeContext,
         RealityTlsSessionProvider,
@@ -120,7 +120,11 @@ impl RealityTlsEngine for RealityRuntimeEngine {
         let stream = connect_tcp_stream(addr, self.socket_protector.as_deref()).await?;
 
         session
-            .complete(stream, prepared, config.mldsa65_verify.clone())
+            .complete(
+                boxed_transport_stream(stream),
+                prepared,
+                config.mldsa65_verify.clone(),
+            )
             .await
     }
 }

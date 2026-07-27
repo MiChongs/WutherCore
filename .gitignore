@@ -1,5 +1,6 @@
 # Rust
 /target
+third_party/**/target/
 **/*.rs.bk
 
 # IDE

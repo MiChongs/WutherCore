@@ -213,6 +213,7 @@ fn prepare_outbound_udp_socket_with(
     if let Err(e) = bind_result {
         tracing::debug!(target: "dial::udp", error = %e, "outbound interface bind failed (non-fatal)");
     }
+    crate::transport::tcp::apply_current_udp_socket_config(&sock, peer)?;
     let local = socket.local_addr()?;
     Ok(crate::loopback::register_udp(local))
 }
@@ -226,6 +227,19 @@ fn prepare_outbound_udp_socket_with(
 pub fn create_outbound_udp_socket(
     peer: std::net::SocketAddr,
 ) -> std::io::Result<(std::net::UdpSocket, crate::loopback::LoopbackUdpGuard)> {
+    let (sock, guard) = create_outbound_udp_association(peer)?;
+    sock.connect(peer)?;
+    if let Ok(local) = sock.local_addr() {
+        guard.observe_local_addr(local);
+    }
+    Ok((sock, guard))
+}
+
+/// Create an unconnected UDP association whose local endpoint is stable across
+/// destinations. Used by endpoint-independent TUN NAT.
+pub fn create_outbound_udp_association(
+    peer: std::net::SocketAddr,
+) -> std::io::Result<(std::net::UdpSocket, crate::loopback::LoopbackUdpGuard)> {
     let bind_addr: std::net::SocketAddr = if peer.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -233,7 +247,6 @@ pub fn create_outbound_udp_socket(
     };
     let sock = std::net::UdpSocket::bind(bind_addr)?;
     let guard = prepare_outbound_udp_socket_for_addr(&sock, peer)?;
-    sock.connect(peer)?;
     if let Ok(local) = sock.local_addr() {
         guard.observe_local_addr(local);
     }
@@ -554,13 +567,32 @@ pub type BoxedStream = Pin<Box<dyn ProxyStream>>;
 ///
 /// `target` 是远端目标地址（域名或 IP）。
 ///
-/// 当前 `recv_from` ABI 只返回 payload 长度，无法把响应源地址交还给调用方。
-/// 因此基于 connected UDP socket 的实现必须对非初始目标 fail closed；在 ABI
-/// 扩展为返回 endpoint 之前，不能伪装支持一个 association 上的多目标转发。
+/// Multi-destination associations should override `recv_from_endpoint`; TUN
+/// EIM uses the returned source to restore the logical UDP peer and applies
+/// endpoint-dependent filtering when EIM is disabled.
 #[async_trait]
 pub trait UdpSocketLike: Send + Sync {
     async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize>;
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    /// Receive a datagram together with its transport source when the carrier
+    /// can expose one. Connected/proxied associations may return `None`; raw
+    /// carriers override this for finalmask stages such as realm, UDP hopping,
+    /// xdns and server-side demultiplexing.
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<std::net::SocketAddr>)> {
+        self.recv_from(buf).await.map(|length| (length, None))
+    }
+    /// Local transport endpoint when the carrier exposes it.
+    fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        Ok(None)
+    }
+    /// Whether one association can safely address more than its dial target
+    /// and identify response sources.
+    fn supports_multi_target(&self) -> bool {
+        false
+    }
     /// 关闭通道；某些协议需要发协议级断开。
     async fn close(&self) -> std::io::Result<()> {
         Ok(())

@@ -40,7 +40,15 @@ IGNORED_SCHEMES = {"http", "https", "mailto", "data", "javascript"}
 
 
 def markdown_files() -> list[Path]:
-    excluded_parts = {".git", "target", "dist", ".codebase-memory"}
+    # Vendored projects keep their upstream documentation, but intentionally do
+    # not always vendor the examples and contributor files linked from it.
+    excluded_parts = {
+        ".git",
+        "target",
+        "dist",
+        "third_party",
+        ".codebase-memory",
+    }
     return sorted(
         path
         for path in ROOT.rglob("*.md")

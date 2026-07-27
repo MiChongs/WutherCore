@@ -125,11 +125,12 @@ async fn http_connect_through_mixed() {
 
     let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime.clone()));
 
@@ -192,11 +193,12 @@ async fn http_absolute_post_preserves_body_and_rewrites_hop_headers() {
     drop(listener);
     let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -240,11 +242,12 @@ async fn http_absolute_chunked_post_stops_at_message_boundary() {
     drop(listener);
     let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -287,11 +290,12 @@ async fn socks5_connect_through_mixed() {
 
     let yaml = CONFIG.replace("local: 0", &format!("local: {mixed_port}"));
     let plan = core_config::loader::load_from_str(&yaml).unwrap();
-    let runtime = Arc::new(Runtime::build(plan));
+    let runtime = Arc::new(Runtime::build(plan).unwrap());
     let listener = MixedListener {
         listen: format!("127.0.0.1:{mixed_port}").parse().unwrap(),
         auth: None,
         udp: true,
+        stream_settings: None,
     };
     tokio::spawn(run_mixed(listener, runtime));
     tokio::time::sleep(Duration::from_millis(150)).await;

@@ -30,8 +30,16 @@ const IPTABLES_CHAINS: [(&str, &str, &str); 5] = [
     ("mangle", "PREROUTING", "WUTHERCORE_PREROUTING"),
     ("mangle", "OUTPUT", "WUTHERCORE_OUTPUT"),
 ];
-const TPROXY_TABLE: &str = "0x2d0";
-const TPROXY_MARK: &str = "0x2d0";
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryMode {
+    #[default]
+    /// Version-1 journals did not record the engine kind and owned the union.
+    Legacy,
+    Tun,
+    Tproxy,
+    Redirect,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RecoveryRecord {
@@ -44,10 +52,12 @@ struct RecoveryRecord {
     auto_redirect: bool,
     strict_route: bool,
     bypass_tables: Vec<String>,
+    #[serde(default)]
+    mode: RecoveryMode,
 }
 
 impl RecoveryRecord {
-    fn from_plan(plan: &CapturePlan) -> Self {
+    fn from_plan(plan: &CapturePlan, mode: RecoveryMode) -> Self {
         Self {
             version: JOURNAL_VERSION,
             pid: std::process::id(),
@@ -62,6 +72,7 @@ impl RecoveryRecord {
             } else {
                 Vec::new()
             },
+            mode,
         }
     }
 
@@ -93,7 +104,7 @@ pub(crate) struct LinuxCaptureGuard {
 }
 
 impl LinuxCaptureGuard {
-    pub(crate) fn acquire(plan: &CapturePlan) -> Result<Self, CaptureError> {
+    pub(crate) fn acquire(plan: &CapturePlan, mode: RecoveryMode) -> Result<Self, CaptureError> {
         let path = journal_path()?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -121,7 +132,7 @@ impl LinuxCaptureGuard {
             );
         }
 
-        let record = RecoveryRecord::from_plan(plan);
+        let record = RecoveryRecord::from_plan(plan, mode);
         write_record(&mut file, &record, &path)?;
         Ok(Self {
             file,
@@ -257,13 +268,16 @@ fn recover(record: &RecoveryRecord) -> Result<(), CaptureError> {
         flush_table(record.table);
     }
 
-    // Standalone TPROXY has fixed ownership selectors, independent of tun
-    // table configuration.
-    for family in ["inet", "inet6"] {
-        delete_exact_ip_rule(family, TPROXY_MARK, TPROXY_TABLE);
-        flush_named_table(family, TPROXY_TABLE);
+    if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tproxy) {
+        crate::linux_netlink::remove_tproxy_policy(
+            true,
+            crate::tproxy_rules::TPROXY_FWMARK,
+            crate::tproxy_rules::TPROXY_ROUTE_TABLE,
+        );
     }
-    delete_tun(&record.interface_name);
+    if matches!(record.mode, RecoveryMode::Legacy | RecoveryMode::Tun) {
+        delete_tun(&record.interface_name);
+    }
     Ok(())
 }
 
@@ -292,7 +306,7 @@ fn delete_all_matching_rules(
             args.extend(["blackhole", "default"]);
         }
         let output = command_output("ip", &args)?;
-        if output.status.success() {
+        if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
             continue;
         }
         if is_absent(&output) {
@@ -338,14 +352,17 @@ fn flush_table(table: u32) {
 }
 
 fn delete_exact_ip_rule(family: &str, mark: &str, table: &str) {
-    loop {
+    // Some iproute2 environments (notably WSL) report a netlink permission
+    // error on stderr while still returning exit status 0. Treat diagnostics
+    // as failure and cap retries so crash recovery can never spin forever.
+    for _ in 0..MAX_PRIORITY_DELETES {
         let Ok(output) = command_output(
             "ip",
             &["-f", family, "rule", "del", "fwmark", mark, "lookup", table],
         ) else {
             break;
         };
-        if !output.status.success() {
+        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
             break;
         }
     }
@@ -445,6 +462,7 @@ mod tests {
             auto_redirect: false,
             strict_route: true,
             bypass_tables: vec!["main".into()],
+            mode: RecoveryMode::Tun,
         };
         assert_eq!(record.priorities(), [8997, 8998, 8999, 9000, 9001]);
     }
@@ -461,11 +479,23 @@ mod tests {
             auto_redirect: true,
             strict_route: false,
             bypass_tables: vec!["main".into(), "97".into()],
+            mode: RecoveryMode::Tproxy,
         };
         let bytes = serde_json::to_vec(&record).unwrap();
         assert_eq!(
             serde_json::from_slice::<RecoveryRecord>(&bytes).unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn version_one_journal_without_mode_uses_legacy_union_cleanup() {
+        let json = r#"{
+            "version":1,"pid":42,"interface_name":"wuther0",
+            "table":2022,"rule_priority":9000,"auto_route":false,
+            "auto_redirect":false,"strict_route":false,"bypass_tables":[]
+        }"#;
+        let record: RecoveryRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.mode, RecoveryMode::Legacy);
     }
 }

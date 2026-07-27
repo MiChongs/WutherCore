@@ -53,8 +53,8 @@ pub struct TunDispatcher {
     /// DNS hijack 的统一处理链。它内部对接 resolver policy/cache/fake-ip。
     pub dns_service: Arc<core_resolver::DnsService>,
     pub inbound: Arc<TunInbound>,
-    /// 5-tuple → outbound socket 复用表 —— 同一 QUIC/STUN session 的所有包
-    /// 走同一个 outbound socket，与 mihomo `endpoint_independent_nat` 行为对齐。
+    /// UDP NAT association table. Symmetric mode uses `(src,dst)`; EIM mode
+    /// uses only the internal source endpoint.
     pub udp_sessions: Arc<crate::udp_session::UdpSessionTable>,
     frame_formats: Arc<TunFrameFormatCache>,
 }
@@ -422,6 +422,7 @@ impl TunDispatcher {
             inbound: self.inbound.clone(),
             dns_service: self.dns_service.clone(),
             frame_formats: self.frame_formats.clone(),
+            endpoint_independent_nat: self.plan.endpoint_independent_nat,
         };
         crate::udp_handle::handle_udp_packet(&ctx, device, handler, inner_src, outer_dst, payload)
             .await;

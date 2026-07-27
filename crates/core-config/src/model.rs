@@ -3,8 +3,9 @@
 //! 所有 field 默认值通过 `Profile::apply_defaults` 注入，
 //! 模型本身只负责"原样反序列化 + 短写法/长写法兼容"。
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// 顶层配置 —— 用户实际写的 YAML。
@@ -203,6 +204,17 @@ pub struct Listen {
     pub local: Option<ListenLocal>,
     #[serde(default)]
     pub panel: Option<PanelBind>,
+    /// XHTTP/SplitHTTP 服务端监听。既接受单个对象，也接受对象数组。
+    #[serde(
+        default,
+        alias = "split-http",
+        alias = "split_http",
+        alias = "splithttp"
+    )]
+    pub xhttp: Option<XhttpListenSet>,
+    /// Shadowsocks SIP003/SIP004/SIP022 服务端监听。
+    #[serde(default, alias = "ss")]
+    pub shadowsocks: Option<ShadowsocksListenSet>,
     #[serde(default)]
     pub share: Option<Share>,
     #[serde(default)]
@@ -218,6 +230,135 @@ pub struct Listen {
     /// Young 原生入站。传输层是 Firefox 使用的 Mozilla Neqo HTTP/3/WebTransport。
     #[serde(default, alias = "young-inbounds", alias = "young_inbounds")]
     pub young: Vec<YoungListen>,
+    /// Xray gRPC (`gun`) 入站。每个条目独立监听，并把 Tun/TunMulti
+    /// 双向流交给 `protocol` 指定的内层代理协议。
+    #[serde(default, alias = "grpc-inbounds", alias = "grpc_inbounds")]
+    pub grpc: Vec<GrpcListen>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShadowsocksListenSet {
+    One(ShadowsocksListen),
+    Many(Vec<ShadowsocksListen>),
+}
+
+impl ShadowsocksListenSet {
+    pub fn into_vec(self) -> Vec<ShadowsocksListen> {
+        match self {
+            Self::One(listener) => vec![listener],
+            Self::Many(listeners) => listeners,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksListen {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_shadowsocks_listen_address", alias = "host")]
+    pub address: String,
+    pub port: u16,
+    pub method: String,
+    pub password: String,
+    #[serde(default = "default_shadowsocks_mode")]
+    pub mode: String,
+    /// SIP003 服务端插件可执行文件。插件监听公开地址，Shadowsocks
+    /// 服务端本身只监听插件分配的回环地址。
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default, rename = "plugin-opts", alias = "plugin_opts")]
+    pub plugin_opts: Option<String>,
+    #[serde(default, rename = "plugin-args", alias = "plugin_args")]
+    pub plugin_args: Vec<String>,
+    #[serde(default, rename = "plugin-mode", alias = "plugin_mode")]
+    pub plugin_mode: Option<String>,
+    #[serde(
+        default = "default_shadowsocks_plugin_startup_timeout",
+        rename = "plugin-startup-timeout",
+        alias = "plugin_startup_timeout",
+        with = "humantime_serde"
+    )]
+    pub plugin_startup_timeout: Duration,
+    #[serde(default)]
+    pub users: Vec<ShadowsocksUser>,
+    #[serde(
+        default = "default_shadowsocks_handshake_timeout",
+        rename = "handshake-timeout",
+        alias = "handshake_timeout",
+        with = "humantime_serde"
+    )]
+    pub handshake_timeout: Duration,
+    #[serde(
+        default = "default_shadowsocks_udp_timeout",
+        rename = "udp-timeout",
+        alias = "udp_timeout",
+        with = "humantime_serde"
+    )]
+    pub udp_timeout: Duration,
+    #[serde(
+        default = "default_shadowsocks_max_connections",
+        rename = "max-connections",
+        alias = "max_connections"
+    )]
+    pub max_connections: usize,
+    #[serde(
+        default = "default_shadowsocks_max_udp_associations",
+        rename = "max-udp-associations",
+        alias = "max_udp_associations"
+    )]
+    pub max_udp_associations: usize,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowsocksUser {
+    pub name: String,
+    pub key: String,
+}
+
+fn default_shadowsocks_listen_address() -> String {
+    "0.0.0.0".into()
+}
+
+fn default_shadowsocks_mode() -> String {
+    "tcp_and_udp".into()
+}
+
+fn default_shadowsocks_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_shadowsocks_udp_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_shadowsocks_plugin_startup_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_shadowsocks_max_connections() -> usize {
+    1024
+}
+
+fn default_shadowsocks_max_udp_associations() -> usize {
+    4096
+}
+
+/// 完整的 Xray gRPC 服务端监听配置。
+///
+/// `grpcSettings` 沿用 Xray 字段名；本地资源上限单独注册，所有未知字段
+/// 均拒绝，避免拼写错误导致无界队列或静默使用默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GrpcListenSecurity {
+    #[default]
+    None,
+    Tls,
+    Reality,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -403,6 +544,126 @@ impl std::fmt::Debug for YoungListen {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcListen {
+    #[serde(default = "default_grpc_listen_host")]
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_grpc_inner_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+    #[serde(
+        default,
+        rename = "grpcSettings",
+        alias = "grpc",
+        alias = "grpc_settings",
+        alias = "grpc-settings"
+    )]
+    pub grpc_settings: GrpcTransportSettings,
+    /// 底层安全载波。省略时是明文 h2c；TLS 与 REALITY 必须显式选择，
+    /// 防止密钥配置存在但因拼写或遗漏而静默降级。
+    #[serde(default)]
+    pub security: GrpcListenSecurity,
+    /// 与 Xray `tlsSettings` 同构的完整 TLS 对象。gRPC 会强制协商 h2，
+    /// 其余证书、ECH、mTLS、版本、密码套件与曲线字段不做裁剪。
+    #[serde(
+        default,
+        rename = "tlsSettings",
+        alias = "tls_settings",
+        alias = "tls-settings"
+    )]
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    #[serde(
+        default,
+        rename = "requireClientCertificate",
+        alias = "require_client_certificate",
+        alias = "require-client-certificate"
+    )]
+    pub require_client_certificate: bool,
+    /// REALITY 服务端设置复用完整的监听模型。嵌套对象的 host、port、
+    /// protocol 与 users 由外层 gRPC 监听统一覆盖，避免重复配置冲突。
+    #[serde(
+        default,
+        rename = "realitySettings",
+        alias = "reality_settings",
+        alias = "reality-settings"
+    )]
+    pub reality_settings: Option<Box<RealityListen>>,
+    #[serde(
+        default = "default_grpc_vless_handshake_timeout",
+        with = "humantime_serde",
+        rename = "handshakeTimeout",
+        alias = "handshake_timeout",
+        alias = "handshake-timeout"
+    )]
+    pub handshake_timeout: Duration,
+    #[serde(
+        default = "default_grpc_max_mux_sessions",
+        rename = "maxMuxSessions",
+        alias = "max_mux_sessions",
+        alias = "max-mux-sessions"
+    )]
+    pub max_mux_sessions: usize,
+    #[serde(
+        default = "default_grpc_max_connections",
+        rename = "maxConnections",
+        alias = "max_connections",
+        alias = "max-connections"
+    )]
+    pub max_connections: usize,
+    #[serde(
+        default = "default_grpc_max_concurrent_streams",
+        rename = "maxConcurrentStreams",
+        alias = "max_concurrent_streams",
+        alias = "max-concurrent-streams"
+    )]
+    pub max_concurrent_streams: u32,
+    #[serde(
+        default = "default_grpc_max_header_list_size",
+        rename = "maxHeaderListSize",
+        alias = "max_header_list_size",
+        alias = "max-header-list-size"
+    )]
+    pub max_header_list_size: u32,
+    /// 与 Xray 一致：这里存放“信任标记请求头”的名称；仅当请求中至少
+    /// 存在一个标记头时，才采用 X-Forwarded-For 的第一个地址。
+    #[serde(
+        default,
+        rename = "trustedXForwardedFor",
+        alias = "trusted_x_forwarded_for",
+        alias = "trusted-x-forwarded-for"
+    )]
+    pub trusted_x_forwarded_for: Vec<String>,
+}
+
+impl std::fmt::Debug for GrpcListen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrpcListen")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("user_count", &self.users.len())
+            .field("grpc_settings", &self.grpc_settings)
+            .field("security", &self.security)
+            .field("has_tls_settings", &self.tls_settings.is_some())
+            .field(
+                "require_client_certificate",
+                &self.require_client_certificate,
+            )
+            .field("reality_settings", &self.reality_settings)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("max_mux_sessions", &self.max_mux_sessions)
+            .field("max_connections", &self.max_connections)
+            .field("max_concurrent_streams", &self.max_concurrent_streams)
+            .field("max_header_list_size", &self.max_header_list_size)
+            .field("trusted_x_forwarded_for", &self.trusted_x_forwarded_for)
+            .finish()
+    }
+}
+
 /// Xray REALITY 服务端监听配置。
 ///
 /// 字段名同时接受 Xray 的 camelCase 与本项目常用的 snake/kebab 写法；
@@ -412,6 +673,7 @@ impl std::fmt::Debug for YoungListen {
 pub struct RealityListen {
     #[serde(default = "default_reality_listen_host")]
     pub host: String,
+    #[serde(default)]
     pub port: u16,
     #[serde(default = "default_reality_inner_protocol")]
     pub protocol: String,
@@ -495,6 +757,9 @@ pub struct RealityListen {
     pub limit_fallback_download: RealityFallbackLimit,
     #[serde(default)]
     pub limits: RealityResourceLimits,
+    /// Socket policy and TCP FinalMask applied before the REALITY ClientHello.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
 }
 
 impl std::fmt::Debug for RealityListen {
@@ -524,6 +789,7 @@ impl std::fmt::Debug for RealityListen {
             .field("limit_fallback_upload", &self.limit_fallback_upload)
             .field("limit_fallback_download", &self.limit_fallback_download)
             .field("limits", &self.limits)
+            .field("has_stream_settings", &self.stream_settings.is_some())
             .finish()
     }
 }
@@ -680,6 +946,220 @@ pub struct ListenLocalDetail {
     pub auth: Vec<String>,
     #[serde(default = "default_true")]
     pub udp: bool,
+    /// Xray-compatible listener socket policy and server-side final masks.
+    /// Both spellings are accepted so native YAML and imported Xray objects
+    /// share one typed configuration path.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
+}
+
+/// `listen.xhttp` 的单项/数组兼容表示。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpListenSet {
+    One(XhttpListener),
+    Many(Vec<XhttpListener>),
+}
+
+impl XhttpListenSet {
+    pub fn into_vec(self) -> Vec<XhttpListener> {
+        match self {
+            Self::One(listener) => vec![listener],
+            Self::Many(listeners) => listeners,
+        }
+    }
+}
+
+/// 配置层允许的单监听 accept 队列上限，低于 Tokio mpsc 在所有支持平台的上限。
+pub const XHTTP_MAX_ACCEPT_QUEUE: usize = 1_000_000;
+/// 配置层允许的 packet-up 缓冲 POST 数量上限。
+pub const XHTTP_MAX_BUFFERED_POSTS: i64 = 1_000_000;
+/// 单次 XHTTP padding 的业务上限，避免可信配置错误触发超大连续字符串分配。
+pub const XHTTP_MAX_PADDING_BYTES: u32 = 1_048_576;
+/// 配置层允许的单监听底层连接上限，低于 Tokio semaphore 在所有支持平台的上限。
+pub const XHTTP_MAX_ACTIVE_CONNECTIONS: usize = 1_000_000;
+/// 配置层允许的单连接 H2/H3 并发流上限。
+pub const XHTTP_MAX_CONCURRENT_STREAMS: u32 = 1_000_000;
+/// 配置层允许的单监听全局活动 HTTP 流上限。
+pub const XHTTP_MAX_ACTIVE_HTTP_STREAMS: usize = 1_000_000;
+
+/// XHTTP 服务端监听配置。
+///
+/// `settings` 直接复用出站使用的完整 [`XhttpConfig`]，不会把字段降级为
+/// `serde_json::Value` 或字符串 map。TLS 的 `cert` / `key` 都是文件路径；
+/// 文件读取留给运行时，配置编译阶段负责要求路径非空且成对出现。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpListener {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_localhost", alias = "host", alias = "bind")]
+    pub address: String,
+    pub port: u16,
+    /// 明确允许无 TLS 的 HTTP/1.1 或 h2c。默认 false，避免静默降级。
+    #[serde(default)]
+    pub cleartext: bool,
+    /// Raw 服务端尚未提供协议级认证；监听非回环地址时必须显式确认风险。
+    #[serde(
+        default,
+        rename = "allow-unauthenticated-non-loopback",
+        alias = "allow_unauthenticated_non_loopback",
+        alias = "allowUnauthenticatedNonLoopback"
+    )]
+    pub allow_unauthenticated_non_loopback: bool,
+    #[serde(default)]
+    pub tls: Option<XhttpListenTls>,
+    #[serde(default = "default_xhttp_listen_alpn")]
+    pub alpn: Vec<XhttpListenAlpn>,
+    /// XHTTP 传输解封后的固定 TCP 目标。
+    ///
+    /// VLESS、VMess、Trojan 等代理协议拥有各自的认证、编解码和 UDP
+    /// 语义，必须在各协议监听中显式选择 XHTTP 传输；这里不会注册一个
+    /// 没有真实服务端实现的 `inner-protocol` 枚举。
+    #[serde(default)]
+    pub target: Option<XhttpListenTarget>,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(
+        default = "default_xhttp_accept_queue",
+        rename = "accept-queue",
+        alias = "accept_queue",
+        alias = "backlog"
+    )]
+    pub accept_queue: usize,
+    /// 单个监听允许同时保持的活动 relay 上限。
+    #[serde(
+        default = "default_xhttp_max_active_relays",
+        rename = "max-active-relays",
+        alias = "max_active_relays",
+        alias = "maxActiveRelays"
+    )]
+    pub max_active_relays: usize,
+    /// 单个监听允许同时保持的底层 TCP/TLS/QUIC 连接上限。
+    #[serde(
+        default = "default_xhttp_max_active_connections",
+        rename = "max-active-connections",
+        alias = "max_active_connections",
+        alias = "maxActiveConnections"
+    )]
+    pub max_active_connections: usize,
+    /// 单个 H2/H3 底层连接允许同时处理的 HTTP 流上限。
+    #[serde(
+        default = "default_xhttp_max_concurrent_streams",
+        rename = "max-concurrent-streams",
+        alias = "max_concurrent_streams",
+        alias = "maxConcurrentStreams"
+    )]
+    pub max_concurrent_streams: u32,
+    /// 单个监听跨全部底层连接允许同时处理的 HTTP 流上限。
+    #[serde(
+        default = "default_xhttp_max_active_http_streams",
+        rename = "max-active-http-streams",
+        alias = "max_active_http_streams",
+        alias = "maxActiveHttpStreams"
+    )]
+    pub max_active_http_streams: usize,
+    /// 已无活动 HTTP 请求/流时，底层连接可保持空闲的最长时间。
+    #[serde(
+        default = "default_xhttp_http_idle_timeout",
+        rename = "http-idle-timeout",
+        alias = "http_idle_timeout",
+        alias = "httpIdleTimeout",
+        with = "humantime_serde"
+    )]
+    pub http_idle_timeout: Duration,
+    /// 浏览器 CORS 策略。缺省时使用 XrayCompatible；显式空数组禁用 CORS；
+    /// 非空数组为 allowlist，`*` 必须独占。
+    #[serde(
+        default,
+        rename = "cors-origins",
+        alias = "cors_origins",
+        alias = "corsOrigins",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cors_origins: Option<Vec<String>>,
+    /// Xray-compatible listener socket policy and final masks.  TCP masks are
+    /// applied before TLS; UDP masks and QUIC parameters are applied below H3.
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::NodeStreamSettings>,
+    #[serde(
+        default,
+        rename = "settings",
+        alias = "config",
+        alias = "xhttpSettings",
+        alias = "xhttp-settings",
+        alias = "splithttpSettings",
+        alias = "splithttp-settings"
+    )]
+    pub settings: XhttpConfig,
+}
+
+/// XHTTP Raw 内层透明字节隧道的固定目标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpListenTarget {
+    #[serde(alias = "address")]
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpListenTls {
+    /// 旧版单证书 PEM 路径；与 `certificates` 中的 encipherment 条目互斥。
+    #[serde(
+        default,
+        rename = "cert",
+        alias = "certificate",
+        alias = "cert-path",
+        alias = "cert_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cert_path: Option<String>,
+    /// 旧版单私钥 PEM 路径。
+    #[serde(
+        default,
+        rename = "key",
+        alias = "private-key",
+        alias = "private_key",
+        alias = "key-path",
+        alias = "key_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub key_path: Option<String>,
+    /// Xray TLS 全量字段（证书、版本、套件、曲线、ECH、key log 等）。
+    #[serde(default, flatten)]
+    pub settings: XhttpDownloadTlsSettings,
+    /// 使用 `usage=verify` 证书作为客户端 CA 并强制双向 TLS。
+    #[serde(
+        default,
+        rename = "requireClientCertificate",
+        alias = "require-client-certificate",
+        alias = "require_client_certificate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub require_client_certificate: Option<bool>,
+}
+
+/// 规范序列化值与 TLS ALPN wire name 保持一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum XhttpListenAlpn {
+    #[serde(rename = "http/1.1", alias = "h1", alias = "http1")]
+    Http1,
+    #[serde(rename = "h2", alias = "http/2")]
+    H2,
+    #[serde(rename = "h3", alias = "http/3")]
+    H3,
+}
+
+impl XhttpListenAlpn {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http/1.1",
+            Self::H2 => "h2",
+            Self::H3 => "h3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -778,9 +1258,11 @@ pub struct NodeDetail {
     /// 对应协议注册器做严格校验；用于 WireGuard peers/allowed-ips 等结构。
     #[serde(default, alias = "protocol-options", alias = "protocol_options")]
     pub params: BTreeMap<String, serde_json::Value>,
+    #[serde(default, rename = "streamSettings", alias = "stream_settings")]
+    pub stream_settings: Option<crate::stream_settings::NodeStreamSettings>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLogin {
     #[serde(default)]
@@ -793,11 +1275,11 @@ pub struct NodeLogin {
     pub private_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSecure {
     #[serde(default)]
-    pub tls: bool,
+    pub tls: Option<bool>,
     #[serde(default)]
     pub sni: Option<String>,
     #[serde(default)]
@@ -815,11 +1297,22 @@ pub struct NodeSecure {
     pub reality_settings: Option<RealityClientSettings>,
     #[serde(default)]
     pub ech: Option<bool>,
+    /// Xray-compatible TLS client settings. The legacy flat `sni`,
+    /// `fingerprint`, and `utls` fields above remain accepted and are merged
+    /// into this strongly typed object during runtime-plan compilation.
+    #[serde(
+        default,
+        rename = "tls-settings",
+        alias = "tls_settings",
+        alias = "tlsSettings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
 }
 
 /// Xray REALITY 客户端字段。`password` 是 Xray 新名称，`publicKey` 为兼容旧名称；
 /// 编译阶段会做冲突检测与统一解码。
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealityClientSettings {
     #[serde(default = "default_reality_fingerprint", alias = "fp")]
@@ -915,28 +1408,2523 @@ impl std::fmt::Debug for RealityClientSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NodeTransport {
-    #[serde(default = "default_transport")]
-    pub kind: String,
+    #[serde(default)]
+    pub kind: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub service: Option<String>,
+    /// XHTTP/SplitHTTP 的一等强类型配置。`xhttpSettings` 与
+    /// `splithttpSettings` 用于直接接收 Xray 风格配置。
+    #[serde(
+        default,
+        rename = "xhttp",
+        alias = "xhttpSettings",
+        alias = "xhttp-settings",
+        alias = "splithttpSettings",
+        alias = "splithttp-settings"
+    )]
+    pub xhttp: Option<XhttpConfig>,
+    /// Xray-compatible gRPC transport settings. Keeping these settings typed
+    /// prevents misspelled fields from being silently discarded before the
+    /// runtime plan is built.
+    #[serde(
+        default,
+        rename = "grpcSettings",
+        alias = "grpc",
+        alias = "grpc_settings",
+        alias = "grpc-settings"
+    )]
+    pub grpc_settings: Option<GrpcTransportSettings>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Complete Xray gRPC (`gun`) stream settings plus bounded local resources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcTransportSettings {
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(
+        default,
+        rename = "serviceName",
+        alias = "service_name",
+        alias = "service-name"
+    )]
+    pub service_name: Option<String>,
+    #[serde(
+        default,
+        rename = "multiMode",
+        alias = "multi_mode",
+        alias = "multi-mode"
+    )]
+    pub multi_mode: Option<bool>,
+    #[serde(
+        default,
+        rename = "idle_timeout",
+        alias = "idleTimeout",
+        alias = "idle-timeout"
+    )]
+    pub idle_timeout: Option<CompatDuration>,
+    #[serde(
+        default,
+        rename = "health_check_timeout",
+        alias = "healthCheckTimeout",
+        alias = "health-check-timeout"
+    )]
+    pub health_check_timeout: Option<CompatDuration>,
+    #[serde(
+        default,
+        rename = "permit_without_stream",
+        alias = "permitWithoutStream",
+        alias = "permit-without-stream"
+    )]
+    pub permit_without_stream: Option<bool>,
+    #[serde(
+        default,
+        rename = "initial_windows_size",
+        alias = "initialWindowSize",
+        alias = "initial_window_size",
+        alias = "initial-window-size",
+        alias = "initial-windows-size"
+    )]
+    pub initial_window_size: Option<u32>,
+    #[serde(
+        default,
+        rename = "user_agent",
+        alias = "userAgent",
+        alias = "user-agent"
+    )]
+    pub user_agent: Option<String>,
+    /// Local defensive limit for the encoded protobuf message;
+    /// Xray/grpc-go defaults to four MiB.
+    #[serde(
+        default,
+        rename = "max_message_size",
+        alias = "maxMessageSize",
+        alias = "max-message-size"
+    )]
+    pub max_message_size: Option<usize>,
+    /// Number of protobuf messages allowed to wait for transport backpressure.
+    #[serde(
+        default,
+        rename = "queue_capacity",
+        alias = "queueCapacity",
+        alias = "queue-capacity"
+    )]
+    pub queue_capacity: Option<usize>,
+}
+
+/// Xray `Int32Range` 的无损配置表示。
+///
+/// 接受 JSON/YAML 整数（`64`）或范围字符串（`"64-128"`），序列化时使用
+/// 同样的规范形式。XHTTP 的范围均为非负 int32；反向范围和溢出值直接报错，
+/// 不做静默交换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XhttpRange {
+    pub from: u32,
+    pub to: u32,
+}
+
+impl XhttpRange {
+    pub const fn new(from: u32, to: u32) -> Self {
+        Self { from, to }
+    }
+
+    fn parse_str(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("范围不能为空".into());
+        }
+        let parse_bound = |raw: &str| -> Result<u32, String> {
+            let parsed = raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("非法非负整数 `{raw}`"))?;
+            if parsed > i32::MAX as u64 {
+                return Err(format!("范围值 {parsed} 超出 int32 上限"));
+            }
+            Ok(parsed as u32)
+        };
+
+        let (from, to) = if let Some((left, right)) = value.split_once('-') {
+            if right.contains('-') {
+                return Err(format!("非法范围 `{value}`"));
+            }
+            (parse_bound(left)?, parse_bound(right)?)
+        } else {
+            let value = parse_bound(value)?;
+            (value, value)
+        };
+        if from > to {
+            return Err(format!("范围下界 {from} 不能大于上界 {to}"));
+        }
+        Ok(Self { from, to })
+    }
+}
+
+impl fmt::Display for XhttpRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.from == self.to {
+            write!(f, "{}", self.from)
+        } else {
+            write!(f, "{}-{}", self.from, self.to)
+        }
+    }
+}
+
+impl Serialize for XhttpRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.from == self.to {
+            serializer.serialize_u32(self.from)
+        } else {
+            serializer.serialize_str(&self.to_string())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for XhttpRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RangeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RangeVisitor {
+            type Value = XhttpRange;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("非负 int32 整数或 `from-to` 范围字符串")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value > i32::MAX as u64 {
+                    return Err(E::custom(format!("范围值 {value} 超出 int32 上限")));
+                }
+                Ok(XhttpRange::new(value as u32, value as u32))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("XHTTP 范围不接受负数"));
+                }
+                self.visit_u64(value as u64)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                XhttpRange::parse_str(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_any(RangeVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpXmuxConfig {
+    #[serde(
+        default,
+        rename = "maxConcurrency",
+        alias = "max-concurrency",
+        alias = "max_concurrency",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrency: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "maxConnections",
+        alias = "max-connections",
+        alias = "max_connections",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connections: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "cMaxReuseTimes",
+        alias = "c-max-reuse-times",
+        alias = "c_max_reuse_times",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub c_max_reuse_times: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "hMaxRequestTimes",
+        alias = "h-max-request-times",
+        alias = "h_max_request_times",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub h_max_request_times: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "hMaxReusableSecs",
+        alias = "h-max-reusable-secs",
+        alias = "h_max_reusable_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub h_max_reusable_secs: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "hKeepAlivePeriod",
+        alias = "h-keep-alive-period",
+        alias = "h_keep_alive_period",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub h_keep_alive_period: Option<i64>,
+}
+
+/// Xray finalmask 使用的有符号范围。接受整数或 `"from-to"` 字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct XhttpSignedRange {
+    pub left: i32,
+    pub right: i32,
+}
+
+impl XhttpSignedRange {
+    pub const fn new(left: i32, right: i32) -> Self {
+        Self { left, right }
+    }
+
+    pub const fn normalized(self) -> (i32, i32) {
+        if self.left <= self.right {
+            (self.left, self.right)
+        } else {
+            (self.right, self.left)
+        }
+    }
+}
+
+impl Serialize for XhttpSignedRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.left == self.right {
+            serializer.serialize_i32(self.left)
+        } else {
+            serializer.serialize_str(&format!("{}-{}", self.left, self.right))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for XhttpSignedRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Integer(i32),
+            Text(String),
+        }
+
+        match Input::deserialize(deserializer)? {
+            Input::Integer(value) => Ok(Self::new(value, value)),
+            Input::Text(value) => {
+                let value = value.trim();
+                if let Ok(single) = value.parse::<i32>() {
+                    return Ok(Self::new(single, single));
+                }
+                for (index, character) in value.char_indices().skip(1) {
+                    if character != '-' {
+                        continue;
+                    }
+                    let left = value[..index].parse::<i32>();
+                    let right = value[index + 1..].parse::<i32>();
+                    if let (Ok(left), Ok(right)) = (left, right) {
+                        return Ok(Self::new(left, right));
+                    }
+                }
+                Err(serde::de::Error::custom(format!(
+                    "invalid signed integer range `{value}`"
+                )))
+            }
+        }
+    }
+}
+
+fn deserialize_optional_xray_string_list<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Input {
+        Many(Vec<String>),
+        CommaSeparated(String),
+    }
+
+    Ok(
+        Option::<Input>::deserialize(deserializer)?.map(|input| match input {
+            Input::Many(values) => values,
+            // Pinned Xray `StringList.UnmarshalJSON` intentionally does not trim.
+            Input::CommaSeparated(value) => value.split(',').map(str::to_owned).collect(),
+        }),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpRealityTarget {
+    Port(u16),
+    Address(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpTcpFastOpen {
+    Enabled(bool),
+    QueueLength(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XhttpTlsCertificateUsage {
+    #[serde(rename = "encipherment")]
+    Encipherment,
+    #[serde(rename = "verify")]
+    Verify,
+    #[serde(rename = "issue")]
+    Issue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadTlsCertificate {
+    #[serde(
+        default,
+        rename = "certificateFile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub certificate_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Vec<String>>,
+    #[serde(default, rename = "keyFile", skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<XhttpTlsCertificateUsage>,
+    #[serde(
+        default,
+        rename = "ocspStapling",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ocsp_stapling: Option<u64>,
+    #[serde(
+        default,
+        rename = "oneTimeLoading",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub one_time_loading: Option<bool>,
+    #[serde(
+        default,
+        rename = "buildChain",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub build_chain: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadCustomSockopt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadHappyEyeballs {
+    #[serde(
+        default,
+        rename = "prioritizeIPv6",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prioritize_ipv6: Option<bool>,
+    #[serde(
+        default,
+        rename = "tryDelayMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub try_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interleave: Option<u32>,
+    #[serde(
+        default,
+        rename = "maxConcurrentTry",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent_try: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XhttpTproxyMode {
+    #[serde(rename = "off", alias = "")]
+    Off,
+    #[serde(rename = "tproxy")]
+    Tproxy,
+    #[serde(rename = "redirect")]
+    Redirect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XhttpDomainStrategy {
+    #[serde(rename = "AsIs", alias = "asis")]
+    AsIs,
+    #[serde(rename = "UseIP", alias = "useip")]
+    UseIp,
+    #[serde(rename = "UseIPv4", alias = "useipv4")]
+    UseIpv4,
+    #[serde(rename = "UseIPv6", alias = "useipv6")]
+    UseIpv6,
+    #[serde(rename = "UseIPv4v6", alias = "useipv4v6")]
+    UseIpv4v6,
+    #[serde(rename = "UseIPv6v4", alias = "useipv6v4")]
+    UseIpv6v4,
+    #[serde(rename = "ForceIP", alias = "forceip")]
+    ForceIp,
+    #[serde(rename = "ForceIPv4", alias = "forceipv4")]
+    ForceIpv4,
+    #[serde(rename = "ForceIPv6", alias = "forceipv6")]
+    ForceIpv6,
+    #[serde(rename = "ForceIPv4v6", alias = "forceipv4v6")]
+    ForceIpv4v6,
+    #[serde(rename = "ForceIPv6v4", alias = "forceipv6v4")]
+    ForceIpv6v4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XhttpAddressPortStrategy {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "srvPortOnly", alias = "srvportonly")]
+    SrvPortOnly,
+    #[serde(rename = "srvAddressOnly", alias = "srvaddressonly")]
+    SrvAddressOnly,
+    #[serde(rename = "srvPortAndAddress", alias = "srvportandaddress")]
+    SrvPortAndAddress,
+    #[serde(rename = "txtPortOnly", alias = "txtportonly")]
+    TxtPortOnly,
+    #[serde(rename = "txtAddressOnly", alias = "txtaddressonly")]
+    TxtAddressOnly,
+    #[serde(rename = "txtPortAndAddress", alias = "txtportandaddress")]
+    TxtPortAndAddress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XhttpMaskPacketEncoding {
+    #[serde(rename = "array")]
+    Array,
+    #[serde(rename = "str")]
+    String,
+    #[serde(rename = "hex")]
+    Hex,
+    #[serde(rename = "base64")]
+    Base64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpMaskPacket {
+    Bytes(Vec<u8>),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpMaskDomain {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum XhttpPortList {
+    One(u16),
+    List(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpMaskTransformArg {
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<XhttpMaskPacketEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<XhttpMaskPacket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub u64: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Box<XhttpMaskTransform>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpMaskTransform {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<XhttpMaskTransformArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpMaskTcpItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rand: Option<i32>,
+    #[serde(default, rename = "randRange", skip_serializing_if = "Option::is_none")]
+    pub rand_range: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<XhttpMaskPacketEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<XhttpMaskTransform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet: Option<XhttpMaskPacket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpHeaderCustomTcp {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clients: Vec<Vec<XhttpMaskTcpItem>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<Vec<XhttpMaskTcpItem>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<Vec<XhttpMaskTcpItem>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpFragmentMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packets: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lengths: Vec<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delays: Vec<XhttpSignedRange>,
+    #[serde(default, rename = "maxSplit", skip_serializing_if = "Option::is_none")]
+    pub max_split: Option<XhttpSignedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpSudokuMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii: Option<String>,
+    #[serde(
+        default,
+        rename = "customTable",
+        alias = "custom_table",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub custom_table: Option<String>,
+    #[serde(
+        default,
+        rename = "customTables",
+        alias = "custom_tables",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub custom_tables: Vec<String>,
+    #[serde(
+        default,
+        rename = "paddingMin",
+        alias = "padding_min",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub padding_min: Option<u32>,
+    #[serde(
+        default,
+        rename = "paddingMax",
+        alias = "padding_max",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub padding_max: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpXmcMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usernames: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum XhttpTcpMask {
+    #[serde(rename = "header-custom")]
+    HeaderCustom {
+        #[serde(default)]
+        settings: XhttpHeaderCustomTcp,
+    },
+    #[serde(rename = "fragment")]
+    Fragment {
+        #[serde(default)]
+        settings: XhttpFragmentMask,
+    },
+    #[serde(rename = "sudoku")]
+    Sudoku {
+        #[serde(default)]
+        settings: XhttpSudokuMask,
+    },
+    #[serde(rename = "xmc")]
+    Xmc {
+        #[serde(default)]
+        settings: XhttpXmcMask,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpMaskUdpItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rand: Option<i32>,
+    #[serde(default, rename = "randRange", skip_serializing_if = "Option::is_none")]
+    pub rand_range: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<XhttpMaskPacketEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<XhttpMaskTransform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet: Option<XhttpMaskPacket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpHeaderCustomUdp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client: Vec<XhttpMaskUdpItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server: Vec<XhttpMaskUdpItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpMkcpLegacyMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpNoiseItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rand: Option<XhttpSignedRange>,
+    #[serde(default, rename = "randRange", skip_serializing_if = "Option::is_none")]
+    pub rand_range: Option<XhttpSignedRange>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<XhttpMaskPacketEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet: Option<XhttpMaskPacket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<XhttpSignedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpNoiseMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<XhttpSignedRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noise: Vec<XhttpNoiseItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpSalamanderMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(
+        default,
+        rename = "packetSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub packet_size: Option<XhttpSignedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpXdnsMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<XhttpMaskDomain>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpXicmpMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dgram: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpRealmMask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, rename = "stunServers", skip_serializing_if = "Vec::is_empty")]
+    pub stun_servers: Vec<String>,
+    #[serde(default, rename = "tlsConfig", skip_serializing_if = "Option::is_none")]
+    pub tls_config: Option<Box<XhttpDownloadTlsSettings>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum XhttpUdpMask {
+    #[serde(rename = "header-custom")]
+    HeaderCustom {
+        #[serde(default)]
+        settings: XhttpHeaderCustomUdp,
+    },
+    #[serde(rename = "mkcp-legacy")]
+    MkcpLegacy {
+        #[serde(default)]
+        settings: XhttpMkcpLegacyMask,
+    },
+    #[serde(rename = "noise")]
+    Noise {
+        #[serde(default)]
+        settings: XhttpNoiseMask,
+    },
+    #[serde(rename = "salamander")]
+    Salamander {
+        #[serde(default)]
+        settings: XhttpSalamanderMask,
+    },
+    #[serde(rename = "sudoku")]
+    Sudoku {
+        #[serde(default)]
+        settings: XhttpSudokuMask,
+    },
+    #[serde(rename = "xdns")]
+    Xdns {
+        #[serde(default)]
+        settings: XhttpXdnsMask,
+    },
+    #[serde(rename = "xicmp")]
+    Xicmp {
+        #[serde(default)]
+        settings: XhttpXicmpMask,
+    },
+    #[serde(rename = "realm")]
+    Realm {
+        #[serde(default)]
+        settings: XhttpRealmMask,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpUdpHop {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<XhttpPortList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<XhttpSignedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpQuicParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub congestion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<bool>,
+    #[serde(
+        default,
+        rename = "bbrProfile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bbr_profile: Option<String>,
+    #[serde(default, rename = "brutalUp", skip_serializing_if = "Option::is_none")]
+    pub brutal_up: Option<String>,
+    #[serde(
+        default,
+        rename = "brutalDown",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub brutal_down: Option<String>,
+    #[serde(default, rename = "udpHop", skip_serializing_if = "Option::is_none")]
+    pub udp_hop: Option<XhttpUdpHop>,
+    #[serde(
+        default,
+        rename = "initStreamReceiveWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub init_stream_receive_window: Option<u64>,
+    #[serde(
+        default,
+        rename = "maxStreamReceiveWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_stream_receive_window: Option<u64>,
+    #[serde(
+        default,
+        rename = "initConnectionReceiveWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub init_connection_receive_window: Option<u64>,
+    #[serde(
+        default,
+        rename = "maxConnectionReceiveWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connection_receive_window: Option<u64>,
+    #[serde(
+        default,
+        rename = "maxIdleTimeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_idle_timeout: Option<i64>,
+    #[serde(
+        default,
+        rename = "keepAlivePeriod",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keep_alive_period: Option<i64>,
+    #[serde(
+        default,
+        rename = "disablePathMTUDiscovery",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disable_path_mtu_discovery: Option<bool>,
+    #[serde(
+        default,
+        rename = "maxIncomingStreams",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_incoming_streams: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpFinalMask {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp: Vec<XhttpTcpMask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<XhttpUdpMask>,
+    #[serde(
+        default,
+        rename = "quicParams",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub quic_params: Option<XhttpQuicParams>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadTlsSettings {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<XhttpDownloadTlsCertificate>,
+    #[serde(
+        default,
+        rename = "serverName",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_name: Option<String>,
+    #[serde(
+        default,
+        rename = "allowInsecure",
+        alias = "allow-insecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        alias = "skip-cert-verify",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_insecure: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_xray_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alpn: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "enableSessionResumption",
+        alias = "enable-session-resumption",
+        alias = "enable_session_resumption",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_session_resumption: Option<bool>,
+    #[serde(
+        default,
+        rename = "disableSystemRoot",
+        alias = "disable-system-root",
+        alias = "disable_system_root",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disable_system_root: Option<bool>,
+    #[serde(
+        default,
+        rename = "minVersion",
+        alias = "min-version",
+        alias = "min_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_version: Option<String>,
+    #[serde(
+        default,
+        rename = "maxVersion",
+        alias = "max-version",
+        alias = "max_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_version: Option<String>,
+    #[serde(
+        default,
+        rename = "cipherSuites",
+        alias = "cipher-suites",
+        alias = "cipher_suites",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cipher_suites: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(
+        default,
+        rename = "rejectUnknownSni",
+        alias = "rejectUnknownSNI",
+        alias = "reject-unknown-sni",
+        alias = "reject_unknown_sni",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reject_unknown_sni: Option<bool>,
+    #[serde(
+        default,
+        rename = "curvePreferences",
+        alias = "curve-preferences",
+        alias = "curve_preferences",
+        deserialize_with = "deserialize_optional_xray_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub curve_preferences: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "masterKeyLog",
+        alias = "master-key-log",
+        alias = "master_key_log",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub master_key_log: Option<String>,
+    #[serde(
+        default,
+        rename = "pinnedPeerCertSha256",
+        alias = "pinned-peer-cert-sha256",
+        alias = "pinned_peer_cert_sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pinned_peer_cert_sha256: Option<String>,
+    #[serde(
+        default,
+        rename = "verifyPeerCertByName",
+        alias = "verify-peer-cert-by-name",
+        alias = "verify_peer_cert_by_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verify_peer_cert_by_name: Option<String>,
+    #[serde(
+        default,
+        rename = "echServerKeys",
+        alias = "ech-server-keys",
+        alias = "ech_server_keys",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ech_server_keys: Option<String>,
+    #[serde(
+        default,
+        rename = "echConfigList",
+        alias = "ech-config-list",
+        alias = "ech_config_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ech_config_list: Option<String>,
+    #[serde(
+        default,
+        rename = "echSockopt",
+        alias = "ech-sockopt",
+        alias = "ech_sockopt",
+        alias = "echSocketSettings",
+        alias = "ech-socket-settings",
+        alias = "ech_socket_settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ech_socket_settings: Option<Box<XhttpDownloadSocketSettings>>,
+}
+
+impl XhttpDownloadTlsSettings {
+    /// Validate the complete Xray TLS object before it crosses into a transport
+    /// backend.  This deliberately rejects values that Xray's Go builder would
+    /// silently skip: accepting a misspelled cipher or curve is much more
+    /// dangerous than failing the configuration at startup.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_at("tlsSettings")
+    }
+
+    /// Validate the subset consumed by Xray's outbound/client TLS path.
+    ///
+    /// `rejectUnknownSni` and `echServerKeys` are server-only fields carried by
+    /// the shared TLS object. Xray leaves them inert for clients, so an
+    /// outbound must not parse or reject their values. Client-side
+    /// `echSockopt` remains active and is validated with `echConfigList`.
+    pub fn validate_client(&self) -> Result<(), String> {
+        self.validate_client_at("tlsSettings")
+    }
+
+    fn validate_client_at(&self, path: &str) -> Result<(), String> {
+        let mut client = self.clone();
+        client.reject_unknown_sni = None;
+        client.ech_server_keys = None;
+        client.validate_at(path)
+    }
+
+    pub(crate) fn validate_at(&self, path: &str) -> Result<(), String> {
+        if self.allow_insecure.unwrap_or(false) {
+            return Err(format!(
+                "{path}.allowInsecure=true 已被 Xray 移除；请使用 pinnedPeerCertSha256 或 verifyPeerCertByName"
+            ));
+        }
+
+        if let Some(alpn) = &self.alpn {
+            let mut seen = std::collections::HashSet::with_capacity(alpn.len());
+            for value in alpn {
+                if value.is_empty() || value.len() > usize::from(u8::MAX) {
+                    return Err(format!("{path}.alpn 每项必须包含 1..=255 字节"));
+                }
+                if !seen.insert(value) {
+                    return Err(format!("{path}.alpn 包含重复值 `{value}`"));
+                }
+            }
+        }
+
+        let min = parse_xhttp_tls_version(self.min_version.as_deref(), "minVersion", path)?;
+        let max = parse_xhttp_tls_version(self.max_version.as_deref(), "maxVersion", path)?;
+        if min.zip(max).is_some_and(|(min, max)| min > max) {
+            return Err(format!("{path}.minVersion 不能高于 maxVersion"));
+        }
+
+        if let Some(cipher_suites) = self.cipher_suites.as_deref() {
+            if cipher_suites.trim().is_empty() {
+                return Err(format!("{path}.cipherSuites 不能是空字符串"));
+            }
+            for cipher in cipher_suites.split(':').map(str::trim) {
+                if cipher.is_empty() || !is_xray_tls_cipher(cipher) {
+                    return Err(format!(
+                        "{path}.cipherSuites 包含未知或空的密码套件 `{cipher}`"
+                    ));
+                }
+            }
+        }
+
+        if let Some(curves) = &self.curve_preferences {
+            if curves.is_empty() {
+                return Err(format!("{path}.curvePreferences 不能是空列表"));
+            }
+            let mut seen = std::collections::HashSet::with_capacity(curves.len());
+            for curve in curves {
+                let normalized = curve.to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "curvep256"
+                        | "curvep384"
+                        | "curvep521"
+                        | "x25519"
+                        | "x25519mlkem768"
+                        | "secp256r1mlkem768"
+                        | "secp384r1mlkem1024"
+                ) {
+                    return Err(format!("{path}.curvePreferences 包含未知曲线 `{curve}`"));
+                }
+                if !seen.insert(normalized) {
+                    return Err(format!("{path}.curvePreferences 包含重复曲线 `{curve}`"));
+                }
+            }
+        }
+
+        if self
+            .master_key_log
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(format!("{path}.masterKeyLog 不能是空路径"));
+        }
+
+        for (index, certificate) in self.certificates.iter().enumerate() {
+            validate_xhttp_tls_certificate(certificate, &format!("{path}.certificates[{index}]"))?;
+        }
+
+        if let Some(value) = self.ech_config_list.as_deref() {
+            validate_ech_config_source(value, &format!("{path}.echConfigList"))?;
+            if self.ech_socket_settings.is_some() && !value.contains("://") {
+                return Err(format!(
+                    "{path}.echSockopt 只能与 echConfigList 的 DNS URL 来源一起使用"
+                ));
+            }
+        } else if self.ech_socket_settings.is_some() {
+            return Err(format!(
+                "{path}.echSockopt 只能与 echConfigList 的 DNS URL 来源一起使用"
+            ));
+        }
+        if let Some(value) = self.ech_server_keys.as_deref() {
+            let decoded = decode_xray_base64(value)
+                .map_err(|error| format!("{path}.echServerKeys 不是合法 base64: {error}"))?;
+            if decoded.is_empty() {
+                return Err(format!("{path}.echServerKeys 解码后不能为空"));
+            }
+            validate_ech_server_key_list(&decoded, &format!("{path}.echServerKeys"))?;
+        }
+
+        if self.disable_system_root.unwrap_or(false)
+            && !self
+                .certificates
+                .iter()
+                .any(|certificate| certificate.usage == Some(XhttpTlsCertificateUsage::Verify))
+            && self
+                .pinned_peer_cert_sha256
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "{path}.disableSystemRoot=true 时必须提供 usage=verify 的证书或 pinnedPeerCertSha256"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_xhttp_tls_version(
+    value: Option<&str>,
+    field: &str,
+    path: &str,
+) -> Result<Option<u8>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let rank = match value.trim() {
+        "1.0" => 10,
+        "1.1" => 11,
+        "1.2" => 12,
+        "1.3" => 13,
+        _ => return Err(format!("{path}.{field} 仅支持 1.0、1.1、1.2、1.3")),
+    };
+    Ok(Some(rank))
+}
+
+fn is_xray_tls_cipher(value: &str) -> bool {
+    matches!(
+        value,
+        "TLS_RSA_WITH_RC4_128_SHA"
+            | "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+            | "TLS_RSA_WITH_AES_128_CBC_SHA"
+            | "TLS_RSA_WITH_AES_256_CBC_SHA"
+            | "TLS_RSA_WITH_AES_128_CBC_SHA256"
+            | "TLS_RSA_WITH_AES_128_GCM_SHA256"
+            | "TLS_RSA_WITH_AES_256_GCM_SHA384"
+            | "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA"
+            | "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA"
+            | "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA"
+            | "TLS_ECDHE_RSA_WITH_RC4_128_SHA"
+            | "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA"
+            | "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA"
+            | "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA"
+            | "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256"
+            | "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256"
+            | "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+            | "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+            | "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+            | "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+            | "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+            | "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+            | "TLS_AES_128_GCM_SHA256"
+            | "TLS_AES_256_GCM_SHA384"
+            | "TLS_CHACHA20_POLY1305_SHA256"
+    )
+}
+
+fn validate_xhttp_tls_certificate(
+    certificate: &XhttpDownloadTlsCertificate,
+    path: &str,
+) -> Result<(), String> {
+    if certificate.certificate_file.is_some() && certificate.certificate.is_some() {
+        return Err(format!(
+            "{path}.certificateFile 与 certificate 不能同时设置"
+        ));
+    }
+    if certificate.key_file.is_some() && certificate.key.is_some() {
+        return Err(format!("{path}.keyFile 与 key 不能同时设置"));
+    }
+    if certificate
+        .certificate_file
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+        || certificate.certificate.as_ref().is_some_and(|value| {
+            value.is_empty() || value.iter().all(|line| line.trim().is_empty())
+        })
+    {
+        return Err(format!("{path} 的证书内容不能为空"));
+    }
+    if certificate
+        .key_file
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+        || certificate.key.as_ref().is_some_and(|value| {
+            value.is_empty() || value.iter().all(|line| line.trim().is_empty())
+        })
+    {
+        return Err(format!("{path} 的私钥内容不能为空"));
+    }
+    let has_certificate =
+        certificate.certificate_file.is_some() || certificate.certificate.is_some();
+    let has_key = certificate.key_file.is_some() || certificate.key.is_some();
+    match certificate
+        .usage
+        .unwrap_or(XhttpTlsCertificateUsage::Encipherment)
+    {
+        XhttpTlsCertificateUsage::Verify => {
+            if !has_certificate {
+                return Err(format!("{path} usage=verify 时必须提供证书"));
+            }
+            if has_key {
+                return Err(format!("{path} usage=verify 不能携带私钥"));
+            }
+        }
+        XhttpTlsCertificateUsage::Encipherment | XhttpTlsCertificateUsage::Issue => {
+            if !has_certificate || !has_key {
+                return Err(format!("{path} 必须同时提供证书链与私钥"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ech_config_source(value: &str, path: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{path} 不能为空"));
+    }
+    if !value.contains("://") {
+        let decoded = decode_xray_base64(value)
+            .map_err(|error| format!("{path} 不是合法 base64: {error}"))?;
+        if decoded.is_empty() {
+            return Err(format!("{path} 解码后不能为空"));
+        }
+        validate_ech_config_list(&decoded, path)?;
+        return Ok(());
+    }
+
+    let source = value.rsplit_once('+').map_or(value, |(_, source)| source);
+    let url = url::Url::parse(source).map_err(|error| format!("{path} URL 非法: {error}"))?;
+    if !matches!(url.scheme(), "https" | "h2c" | "udp") {
+        return Err(format!("{path} DNS 来源只支持 https://、h2c:// 或 udp://"));
+    }
+    if url.host_str().is_none() {
+        return Err(format!("{path} DNS URL 缺少主机"));
+    }
+    Ok(())
+}
+
+fn validate_ech_config_list(bytes: &[u8], path: &str) -> Result<(), String> {
+    let declared = bytes
+        .get(..2)
+        .map(|length| usize::from(u16::from_be_bytes([length[0], length[1]])))
+        .ok_or_else(|| format!("{path} 缺少 ECHConfigList 长度"))?;
+    if declared == 0 || declared != bytes.len().saturating_sub(2) {
+        return Err(format!("{path} 的 ECHConfigList 外层长度不匹配"));
+    }
+    let mut cursor = 2_usize;
+    let mut count = 0_usize;
+    while cursor < bytes.len() {
+        let header = bytes
+            .get(cursor..cursor + 4)
+            .ok_or_else(|| format!("{path} 包含截断的 ECHConfig"))?;
+        let version = u16::from_be_bytes([header[0], header[1]]);
+        if version != 0xfe0d {
+            return Err(format!(
+                "{path} 包含不支持的 ECHConfig 版本 0x{version:04x}"
+            ));
+        }
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        cursor = cursor
+            .checked_add(4)
+            .and_then(|cursor| cursor.checked_add(length))
+            .filter(|cursor| *cursor <= bytes.len())
+            .ok_or_else(|| format!("{path} 包含截断的 ECHConfig 内容"))?;
+        count += 1;
+    }
+    if count == 0 || cursor != bytes.len() {
+        return Err(format!("{path} 不包含完整的 ECHConfig"));
+    }
+    Ok(())
+}
+
+fn validate_ech_server_key_list(bytes: &[u8], path: &str) -> Result<(), String> {
+    let mut cursor = 0_usize;
+    let mut count = 0_usize;
+    while cursor < bytes.len() {
+        let key_length = read_ech_u16(bytes, &mut cursor, path, "私钥")?;
+        if key_length == 0 {
+            return Err(format!("{path} 包含空的 ECH 私钥"));
+        }
+        cursor = cursor
+            .checked_add(key_length)
+            .filter(|cursor| *cursor <= bytes.len())
+            .ok_or_else(|| format!("{path} 包含截断的 ECH 私钥"))?;
+        let config_length = read_ech_u16(bytes, &mut cursor, path, "配置")?;
+        if config_length < 4 {
+            return Err(format!("{path} 包含过短的 ECH 配置"));
+        }
+        let end = cursor
+            .checked_add(config_length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| format!("{path} 包含截断的 ECH 配置"))?;
+        let version = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
+        if version != 0xfe0d {
+            return Err(format!(
+                "{path} 包含不支持的 ECHConfig 版本 0x{version:04x}"
+            ));
+        }
+        let inner_length = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+        if inner_length + 4 != config_length {
+            return Err(format!("{path} 的 ECH 配置内层长度不匹配"));
+        }
+        cursor = end;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(format!("{path} 不包含 ECH 密钥"));
+    }
+    Ok(())
+}
+
+fn read_ech_u16(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &str,
+    label: &str,
+) -> Result<usize, String> {
+    let length = bytes
+        .get(*cursor..*cursor + 2)
+        .map(|value| usize::from(u16::from_be_bytes([value[0], value[1]])))
+        .ok_or_else(|| format!("{path} 缺少 ECH {label}长度"))?;
+    *cursor += 2;
+    Ok(length)
+}
+
+fn decode_xray_base64(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    STANDARD
+        .decode(value)
+        .or_else(|_| STANDARD_NO_PAD.decode(value))
+        .or_else(|_| URL_SAFE.decode(value))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(value))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpRealityLimitFallback {
+    #[serde(
+        default,
+        rename = "afterBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_bytes: Option<u64>,
+    #[serde(
+        default,
+        rename = "bytesPerSec",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bytes_per_sec: Option<u64>,
+    #[serde(
+        default,
+        rename = "burstBytesPerSec",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub burst_bytes_per_sec: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadRealitySettings {
+    #[serde(
+        default,
+        rename = "masterKeyLog",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub master_key_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<XhttpRealityTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<XhttpRealityTarget>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub transport_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xver: Option<u64>,
+    #[serde(default, rename = "serverNames", skip_serializing_if = "Vec::is_empty")]
+    pub server_names: Vec<String>,
+    #[serde(
+        default,
+        rename = "privateKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub private_key: Option<String>,
+    #[serde(
+        default,
+        rename = "minClientVer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_client_ver: Option<String>,
+    #[serde(
+        default,
+        rename = "maxClientVer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_client_ver: Option<String>,
+    #[serde(
+        default,
+        rename = "maxTimeDiff",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_time_diff: Option<u64>,
+    #[serde(default, rename = "shortIds", skip_serializing_if = "Vec::is_empty")]
+    pub short_ids: Vec<String>,
+    #[serde(
+        default,
+        rename = "mldsa65Seed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mldsa65_seed: Option<String>,
+    #[serde(
+        default,
+        rename = "limitFallbackUpload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit_fallback_upload: Option<XhttpRealityLimitFallback>,
+    #[serde(
+        default,
+        rename = "limitFallbackDownload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub limit_fallback_download: Option<XhttpRealityLimitFallback>,
+    #[serde(
+        default,
+        rename = "serverName",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(
+        default,
+        rename = "publicKey",
+        alias = "public-key",
+        alias = "public_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub public_key: Option<String>,
+    #[serde(
+        default,
+        rename = "shortId",
+        alias = "short-id",
+        alias = "short_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub short_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(
+        default,
+        rename = "mldsa65Verify",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mldsa65_verify: Option<String>,
+    #[serde(
+        default,
+        rename = "spiderX",
+        alias = "spider-x",
+        alias = "spider_x",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub spider_x: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadSocketSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpFastOpen",
+        alias = "tfo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_fast_open: Option<XhttpTcpFastOpen>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tproxy: Option<XhttpTproxyMode>,
+    #[serde(
+        default,
+        rename = "acceptProxyProtocol",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub accept_proxy_protocol: Option<bool>,
+    #[serde(
+        default,
+        rename = "tcpMptcp",
+        alias = "tcp-mptcp",
+        alias = "tcp_mptcp",
+        alias = "mptcp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_mptcp: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v6only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    #[serde(
+        default,
+        rename = "domainStrategy",
+        alias = "domain-strategy",
+        alias = "domain_strategy",
+        alias = "ip-family",
+        alias = "ip_family",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub domain_strategy: Option<XhttpDomainStrategy>,
+    #[serde(
+        default,
+        rename = "dialerProxy",
+        alias = "dialer-proxy",
+        alias = "dialer_proxy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dialer_proxy: Option<String>,
+    #[serde(
+        default,
+        rename = "tcpKeepAliveInterval",
+        alias = "tcp-keep-alive-interval",
+        alias = "tcp_keep_alive_interval",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_keep_alive_interval: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpKeepAliveIdle",
+        alias = "tcp-keep-alive-idle",
+        alias = "tcp_keep_alive_idle",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_keep_alive_idle: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpWindowClamp",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_window_clamp: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpUserTimeout",
+        alias = "tcp-user-timeout",
+        alias = "tcp_user_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_user_timeout: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpMaxSeg",
+        alias = "tcp-max-seg",
+        alias = "tcp_max_seg",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_max_seg: Option<i32>,
+    #[serde(
+        default,
+        rename = "tcpCongestion",
+        alias = "tcp-congestion",
+        alias = "tcp_congestion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcp_congestion: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub penetrate: Option<bool>,
+    #[serde(
+        default,
+        rename = "customSockopt",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub custom_sockopt: Vec<XhttpDownloadCustomSockopt>,
+    #[serde(
+        default,
+        rename = "addressPortStrategy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub address_port_strategy: Option<XhttpAddressPortStrategy>,
+    #[serde(
+        default,
+        rename = "happyEyeballs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub happy_eyeballs: Option<XhttpDownloadHappyEyeballs>,
+    #[serde(
+        default,
+        rename = "trustedXForwardedFor",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub trusted_x_forwarded_for: Vec<String>,
+}
+
+/// Xray `internet.StreamConfig` 在 XHTTP `downloadSettings` 中可执行的强类型子集。
+///
+/// 下载方向可指定独立目标、传输和安全参数；`xhttpSettings` 与
+/// `transport.xhttp` 都是强类型 XHTTP 配置。兼容输入可同时提供两种别名，
+/// 但解析 `extra` 后的有效配置必须等价。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpDownloadSettings {
+    #[serde(default, alias = "server", skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(
+        default,
+        alias = "protocolName",
+        alias = "protocol-name",
+        alias = "protocol_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub network: Option<String>,
+    #[serde(
+        default,
+        alias = "transportSettings",
+        alias = "transport-settings",
+        alias = "transport_settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport: Option<Box<NodeTransport>>,
+    #[serde(
+        default,
+        rename = "xhttpSettings",
+        alias = "xhttp-settings",
+        alias = "splithttpSettings",
+        alias = "splithttp-settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub xhttp_settings: Option<Box<XhttpConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<String>,
+    #[serde(
+        default,
+        rename = "tlsSettings",
+        alias = "tls-settings",
+        alias = "tls_settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    #[serde(
+        default,
+        rename = "realitySettings",
+        alias = "reality-settings",
+        alias = "reality_settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reality_settings: Option<XhttpDownloadRealitySettings>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_xray_string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alpn: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "sockopt",
+        alias = "socketSettings",
+        alias = "socket-settings",
+        alias = "socket_settings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub socket_settings: Option<XhttpDownloadSocketSettings>,
+    #[serde(
+        default,
+        rename = "finalmask",
+        alias = "finalMask",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub final_mask: Option<XhttpFinalMask>,
+}
+
+/// Xray XHTTP/SplitHTTP 完整配置。
+///
+/// 字段规范名使用 Xray JSON camelCase；同时接受 Friendly YAML 使用过的
+/// kebab-case 与早期 snake_case 名称。没有 `Value`/任意 map 逃生字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(
+        default,
+        rename = "xPaddingBytes",
+        alias = "x-padding-bytes",
+        alias = "x_padding_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_bytes: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "xPaddingObfsMode",
+        alias = "x-padding-obfs-mode",
+        alias = "x_padding_obfs_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_obfs_mode: Option<bool>,
+    #[serde(
+        default,
+        rename = "xPaddingKey",
+        alias = "x-padding-key",
+        alias = "x_padding_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_key: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingHeader",
+        alias = "x-padding-header",
+        alias = "x_padding_header",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_header: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingPlacement",
+        alias = "x-padding-placement",
+        alias = "x_padding_placement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_placement: Option<String>,
+    #[serde(
+        default,
+        rename = "xPaddingMethod",
+        alias = "x-padding-method",
+        alias = "x_padding_method",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub x_padding_method: Option<String>,
+    #[serde(
+        default,
+        rename = "uplinkHTTPMethod",
+        alias = "uplinkHttpMethod",
+        alias = "uplink-http-method",
+        alias = "uplink_http_method",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uplink_http_method: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionIDPlacement",
+        alias = "sessionIdPlacement",
+        alias = "session-placement",
+        alias = "session-id-placement",
+        alias = "session_id_placement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_placement: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionIDKey",
+        alias = "sessionIdKey",
+        alias = "session-key",
+        alias = "session-id-key",
+        alias = "session_id_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_key: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionIDTable",
+        alias = "sessionIdTable",
+        alias = "session-table",
+        alias = "session-id-table",
+        alias = "session_id_table",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_table: Option<String>,
+    #[serde(
+        default,
+        rename = "sessionIDLength",
+        alias = "sessionIdLength",
+        alias = "session-length",
+        alias = "session-id-length",
+        alias = "session_id_length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id_length: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "seqPlacement",
+        alias = "seq-placement",
+        alias = "seq_placement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub seq_placement: Option<String>,
+    #[serde(
+        default,
+        rename = "seqKey",
+        alias = "seq-key",
+        alias = "seq_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub seq_key: Option<String>,
+    #[serde(
+        default,
+        rename = "uplinkDataPlacement",
+        alias = "uplink-data-placement",
+        alias = "uplink_data_placement",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uplink_data_placement: Option<String>,
+    #[serde(
+        default,
+        rename = "uplinkDataKey",
+        alias = "uplink-data-key",
+        alias = "uplink_data_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uplink_data_key: Option<String>,
+    #[serde(
+        default,
+        rename = "uplinkChunkSize",
+        alias = "uplink-chunk-size",
+        alias = "uplink_chunk_size",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uplink_chunk_size: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "noGRPCHeader",
+        alias = "noGrpcHeader",
+        alias = "no-grpc-header",
+        alias = "no_grpc_header",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub no_grpc_header: Option<bool>,
+    #[serde(
+        default,
+        rename = "noSSEHeader",
+        alias = "noSseHeader",
+        alias = "no-sse-header",
+        alias = "no_sse_header",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub no_sse_header: Option<bool>,
+    #[serde(
+        default,
+        rename = "scMaxEachPostBytes",
+        alias = "sc-max-each-post-bytes",
+        alias = "sc_max_each_post_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sc_max_each_post_bytes: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "scMinPostsIntervalMs",
+        alias = "sc-min-posts-interval-ms",
+        alias = "sc_min_posts_interval_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sc_min_posts_interval_ms: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "scMaxBufferedPosts",
+        alias = "sc-max-buffered-posts",
+        alias = "sc_max_buffered_posts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sc_max_buffered_posts: Option<i64>,
+    #[serde(
+        default,
+        rename = "scStreamUpServerSecs",
+        alias = "sc-stream-up-server-secs",
+        alias = "sc_stream_up_server_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sc_stream_up_server_secs: Option<XhttpRange>,
+    #[serde(
+        default,
+        rename = "serverMaxHeaderBytes",
+        alias = "server-max-header-bytes",
+        alias = "server_max_header_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_max_header_bytes: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmux: Option<XhttpXmuxConfig>,
+    #[serde(
+        default,
+        rename = "downloadSettings",
+        alias = "download-settings",
+        alias = "downloadConfig",
+        alias = "download-config",
+        alias = "download_config",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub download_settings: Option<Box<XhttpDownloadSettings>>,
+    /// Xray 的兼容覆盖块。它仍是强类型 SplitHTTPConfig，不是任意 JSON。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Box<XhttpConfig>>,
+}
+
+impl XhttpConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let effective = self.resolve_extra_at("xhttp")?;
+        effective.validate_effective_at("xhttp", 0)
+    }
+
+    pub fn resolved(&self) -> Result<Self, String> {
+        self.resolve_extra_at("xhttp")
+    }
+
+    fn resolve_extra_at(&self, _path: &str) -> Result<Self, String> {
+        let Some(extra) = &self.extra else {
+            return Ok(self.clone());
+        };
+        // 固定 Xray Build 只反序列化一层 extra；extra 内再嵌套的 extra 不会
+        // 被递归 Build。主体来自第一层，外层仅覆盖 host/path/mode。
+        let mut effective = (**extra).clone();
+        effective.host = self.host.clone();
+        effective.path = self.path.clone();
+        effective.mode = self.mode.clone();
+        effective.extra = None;
+        Ok(effective)
+    }
+
+    fn validate_effective_at(&self, path: &str, depth: usize) -> Result<(), String> {
+        if depth > 8 {
+            return Err(format!("{path}.downloadSettings 递归层数不能超过 8"));
+        }
+
+        let mode = self.mode.as_deref().unwrap_or("auto");
+        if !matches!(mode, "auto" | "packet-up" | "stream-up" | "stream-one") {
+            return Err(format!("{path}.mode 不支持 `{mode}`"));
+        }
+        if let Some(headers) = &self.headers {
+            for (name, value) in headers {
+                if is_managed_xhttp_header(name) {
+                    return Err(format!(
+                        "{path}.headers 不能包含托管的 Host/framing/hop-by-hop 请求头 `{name}`"
+                    ));
+                }
+                if !is_valid_http_header_name(name) {
+                    return Err(format!("{path}.headers 包含非法请求头名称 `{name}`"));
+                }
+                if !is_valid_http_header_value(value) {
+                    return Err(format!("{path}.headers.{name} 包含非法请求头值"));
+                }
+            }
+        }
+        if self
+            .x_padding_bytes
+            .is_some_and(|range| range.to > 0 && range.from == 0)
+        {
+            return Err(format!(
+                "{path}.xPaddingBytes 显式非零范围的上下界都必须大于 0"
+            ));
+        }
+        if self
+            .x_padding_bytes
+            .is_some_and(|range| range.to > XHTTP_MAX_PADDING_BYTES)
+        {
+            return Err(format!(
+                "{path}.xPaddingBytes 不能大于 {XHTTP_MAX_PADDING_BYTES}"
+            ));
+        }
+        validate_choice(
+            path,
+            "xPaddingPlacement",
+            self.x_padding_placement.as_deref(),
+            &["cookie", "header", "query", "queryInHeader"],
+        )?;
+        validate_choice(
+            path,
+            "xPaddingMethod",
+            self.x_padding_method.as_deref(),
+            &["repeat-x", "tokenish"],
+        )?;
+        validate_choice(
+            path,
+            "sessionIDPlacement",
+            self.session_id_placement.as_deref(),
+            &["path", "cookie", "header", "query"],
+        )?;
+        validate_choice(
+            path,
+            "seqPlacement",
+            self.seq_placement.as_deref(),
+            &["path", "cookie", "header", "query"],
+        )?;
+        validate_choice(
+            path,
+            "uplinkDataPlacement",
+            self.uplink_data_placement.as_deref(),
+            &["auto", "body", "cookie", "header"],
+        )?;
+
+        if matches!(
+            self.uplink_data_placement.as_deref(),
+            Some("cookie" | "header")
+        ) && mode != "packet-up"
+        {
+            return Err(format!(
+                "{path}.uplinkDataPlacement 仅能在 packet-up 模式使用"
+            ));
+        }
+        if self
+            .uplink_http_method
+            .as_deref()
+            .is_some_and(|method| method.eq_ignore_ascii_case("GET"))
+            && mode != "packet-up"
+        {
+            return Err(format!(
+                "{path}.uplinkHTTPMethod=GET 仅能在 packet-up 模式使用"
+            ));
+        }
+
+        if let Some(table) = self
+            .session_id_table
+            .as_deref()
+            .filter(|table| !table.is_empty())
+        {
+            let (alphabet, predefined) = expanded_session_id_table(table);
+            if !predefined {
+                if !alphabet.is_ascii() {
+                    return Err(format!(
+                        "{path}.sessionIDTable 自定义字符表只能包含 ASCII 字符"
+                    ));
+                }
+            }
+            let length = self
+                .session_id_length
+                .ok_or_else(|| format!("{path}.sessionIDTable 非空时必须设置 sessionIDLength"))?;
+            if length.from == 0 {
+                return Err(format!("{path}.sessionIDLength 下界必须大于 0"));
+            }
+            if !session_id_room_is_sufficient(alphabet, length.from, length.to) {
+                return Err(format!(
+                    "{path}.sessionIDTable 与 sessionIDLength 的可选 ID 空间小于 31-bit"
+                ));
+            }
+        }
+
+        if self.server_max_header_bytes.is_some_and(|value| value < 0) {
+            return Err(format!("{path}.serverMaxHeaderBytes 不能为负数"));
+        }
+        if self.sc_max_buffered_posts.is_some_and(|value| value < 0) {
+            return Err(format!("{path}.scMaxBufferedPosts 不能为负数"));
+        }
+        if self
+            .sc_max_buffered_posts
+            .is_some_and(|value| value > XHTTP_MAX_BUFFERED_POSTS)
+        {
+            return Err(format!(
+                "{path}.scMaxBufferedPosts 不能大于 {XHTTP_MAX_BUFFERED_POSTS}"
+            ));
+        }
+        if let Some(xmux) = &self.xmux {
+            if xmux.max_connections.is_some_and(|range| range.to > 0)
+                && xmux.max_concurrency.is_some_and(|range| range.to > 0)
+            {
+                return Err(format!(
+                    "{path}.xmux.maxConnections 与 maxConcurrency 不能同时启用"
+                ));
+            }
+        }
+        if let Some(download) = &self.download_settings {
+            if mode == "stream-one" {
+                return Err(format!("{path}.downloadSettings 不能用于 stream-one 模式"));
+            }
+            download.validate_at(&format!("{path}.downloadSettings"), depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl XhttpDownloadSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_at("xhttp.downloadSettings", 0)
+    }
+
+    fn validate_at(&self, path: &str, depth: usize) -> Result<(), String> {
+        if self
+            .address
+            .as_deref()
+            .or(self.host.as_deref())
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!("{path} 必须设置非空 address 或 host"));
+        }
+        if self.port.is_none_or(|port| port == 0) {
+            return Err(format!("{path}.port 必须设置且不能为 0"));
+        }
+        if let Some(security) = self.security.as_deref() {
+            if !security.is_empty()
+                && !["none", "tls", "reality"]
+                    .iter()
+                    .any(|allowed| security.eq_ignore_ascii_case(allowed))
+            {
+                return Err(format!("{path}.security 不支持 `{security}`"));
+            }
+        }
+        if self
+            .security
+            .as_deref()
+            .is_some_and(|security| security.eq_ignore_ascii_case("tls"))
+        {
+            if let Some(tls) = &self.tls_settings {
+                tls.validate_client_at(&format!("{path}.tlsSettings"))?;
+            }
+        }
+        let effective_network = self
+            .method
+            .as_deref()
+            .or(self.network.as_deref())
+            .map(str::trim);
+        if let Some(network) = effective_network {
+            if network.is_empty()
+                || (!network.eq_ignore_ascii_case("xhttp")
+                    && !network.eq_ignore_ascii_case("splithttp"))
+            {
+                return Err(format!(
+                    "{path}.method/network 必须为 xhttp 或 splithttp，实际为 `{network}`"
+                ));
+            }
+        }
+        if self
+            .alpn
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|value| value.trim().is_empty()))
+        {
+            return Err(format!("{path}.alpn 不能包含空值"));
+        }
+        if self
+            .tls_settings
+            .as_ref()
+            .and_then(|settings| settings.alpn.as_ref())
+            .is_some_and(|values| values.iter().any(|value| value.trim().is_empty()))
+        {
+            return Err(format!("{path}.tlsSettings.alpn 不能包含空值"));
+        }
+        if let (Some(alpn), Some(tls_alpn)) = (
+            self.alpn.as_ref().filter(|values| !values.is_empty()),
+            self.tls_settings
+                .as_ref()
+                .and_then(|settings| settings.alpn.as_ref())
+                .filter(|values| !values.is_empty()),
+        ) {
+            if alpn != tls_alpn {
+                return Err(format!(
+                    "{path}.alpn 与 tlsSettings.alpn 同时非空时必须等价"
+                ));
+            }
+        }
+
+        let transport = self.transport.as_deref();
+        if let Some(kind) = transport
+            .and_then(|transport| transport.kind.as_deref())
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+        {
+            if !kind.eq_ignore_ascii_case("xhttp") && !kind.eq_ignore_ascii_case("splithttp") {
+                return Err(format!(
+                    "{path}.transport.kind 必须为 xhttp 或 splithttp，实际为 `{kind}`"
+                ));
+            }
+        }
+        if transport
+            .and_then(|transport| transport.service.as_deref())
+            .is_some_and(|service| !service.trim().is_empty())
+        {
+            return Err(format!(
+                "{path}.transport.service 仅适用于 gRPC，XHTTP downloadSettings 不支持该字段"
+            ));
+        }
+
+        let transport_xhttp = transport.and_then(|transport| transport.xhttp.as_ref());
+        let mut direct_effective = self
+            .xhttp_settings
+            .as_deref()
+            .map(|config| config.resolve_extra_at(&format!("{path}.xhttpSettings")))
+            .transpose()?;
+        let mut transport_effective = transport_xhttp
+            .map(|config| config.resolve_extra_at(&format!("{path}.transport.xhttp")))
+            .transpose()?;
+        if let Some(transport) = transport {
+            for effective in [&mut direct_effective, &mut transport_effective]
+                .into_iter()
+                .flatten()
+            {
+                if effective
+                    .host
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    effective.host.clone_from(&transport.host);
+                }
+                if effective
+                    .path
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    effective.path.clone_from(&transport.path);
+                }
+            }
+        }
+        if let (Some(direct), Some(nested)) = (&direct_effective, &transport_effective) {
+            if direct != nested {
+                return Err(format!(
+                    "{path}.xhttpSettings 与 transport.xhttp 同时设置时必须语义等价"
+                ));
+            }
+        }
+        let effective = direct_effective
+            .as_ref()
+            .or(transport_effective.as_ref())
+            .ok_or_else(|| format!("{path} 必须设置独立 xhttpSettings"))?;
+
+        if let Some(transport) = transport {
+            for (field, generic, nested) in [
+                ("host", transport.host.as_deref(), effective.host.as_deref()),
+                ("path", transport.path.as_deref(), effective.path.as_deref()),
+            ] {
+                if let (Some(generic), Some(nested)) = (
+                    generic.filter(|value| !value.trim().is_empty()),
+                    nested.filter(|value| !value.trim().is_empty()),
+                ) {
+                    if generic != nested {
+                        return Err(format!(
+                            "{path}.transport.{field} 与独立 XHTTP 配置的 {field} 同时非空时必须等价"
+                        ));
+                    }
+                }
+            }
+        }
+
+        effective.validate_effective_at(&format!("{path}.xhttpSettings"), depth + 1)?;
+        Ok(())
+    }
+}
+
+fn validate_choice(
+    path: &str,
+    field: &str,
+    value: Option<&str>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if !allowed.contains(&value) {
+            return Err(format!("{path}.{field} 不支持 `{value}`"));
+        }
+    }
+    Ok(())
+}
+
+const MANAGED_XHTTP_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "upgrade",
+    "trailer",
+    "te",
+    "http2-settings",
+    "expect",
+];
+
+fn is_managed_xhttp_header(name: &str) -> bool {
+    MANAGED_XHTTP_HEADERS
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+}
+
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_valid_http_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+fn expanded_session_id_table(table: &str) -> (&str, bool) {
+    match table {
+        "ALPHABET" => ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", true),
+        "Alphabet" => ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", true),
+        "BASE36" => ("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", true),
+        "Base62" => (
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            true,
+        ),
+        "HEX" => ("0123456789ABCDEF", true),
+        "alphabet" => ("abcdefghijklmnopqrstuvwxyz", true),
+        "base36" => ("0123456789abcdefghijklmnopqrstuvwxyz", true),
+        "hex" => ("0123456789abcdef", true),
+        "number" => ("0123456789", true),
+        custom => (custom, false),
+    }
+}
+
+fn session_id_room_is_sufficient(table: &str, min_length: u32, max_length: u32) -> bool {
+    const REQUIRED: u128 = 2u128 << 30;
+    if min_length > max_length {
+        return false;
+    }
+
+    let base = table.len() as u128;
+    if base == 0 {
+        return false;
+    }
+    if base == 1 {
+        return u128::from(max_length - min_length) + 1 >= REQUIRED;
+    }
+
+    let mut term = pow_capped(base, min_length, REQUIRED);
+    let mut room = 0u128;
+    for _ in min_length..=max_length {
+        room = room.checked_add(term).unwrap_or(REQUIRED).min(REQUIRED);
+        if room >= REQUIRED {
+            return true;
+        }
+        term = term.checked_mul(base).unwrap_or(REQUIRED).min(REQUIRED);
+    }
+    false
+}
+
+fn pow_capped(mut base: u128, mut exponent: u32, cap: u128) -> u128 {
+    let mut result = 1u128;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.checked_mul(base).unwrap_or(cap).min(cap);
+            if result >= cap {
+                return cap;
+            }
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            base = base.checked_mul(base).unwrap_or(cap).min(cap);
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NodeNetwork {
-    #[serde(default = "default_true")]
-    pub udp: bool,
     #[serde(default)]
-    pub tfo: bool,
+    pub udp: Option<bool>,
     #[serde(default)]
-    pub mptcp: bool,
+    pub tfo: Option<bool>,
+    #[serde(default)]
+    pub mptcp: Option<bool>,
     #[serde(default)]
     pub mark: Option<u32>,
     #[serde(default)]
@@ -1245,7 +4233,7 @@ pub struct MihomoRuleProviderSpec {
 }
 
 /// 上游刷新周期兼容表示：Mihomo 使用整数秒，sing-box 使用 duration 字符串。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompatDuration {
     Seconds(u64),
@@ -1868,10 +4856,14 @@ pub struct TunInboundOptions {
 
     /* ---- NAT / 性能 ---- */
     /// `endpoint_independent_nat` —— 全锥 NAT；UDP 打洞场景需开。
-    #[serde(default)]
+    #[serde(default, alias = "endpoint-independent-nat")]
     pub endpoint_independent_nat: bool,
     /// `udp_timeout` —— UDP NAT 老化（默认 5m）。
-    #[serde(default = "default_udp_timeout", with = "humantime_serde")]
+    #[serde(
+        default = "default_udp_timeout",
+        alias = "udp-timeout",
+        with = "humantime_serde"
+    )]
     pub udp_timeout: Duration,
     /// `exclude_mptcp` —— 透传 MPTCP 不接管。
     #[serde(default)]
@@ -2151,6 +5143,27 @@ pub struct TailscaleUserspaceProxy {
 fn default_localhost() -> String {
     "127.0.0.1".into()
 }
+fn default_grpc_listen_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_grpc_inner_protocol() -> String {
+    "vless".into()
+}
+fn default_grpc_vless_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_grpc_max_mux_sessions() -> usize {
+    1024
+}
+fn default_grpc_max_connections() -> usize {
+    4096
+}
+fn default_grpc_max_concurrent_streams() -> u32 {
+    1024
+}
+fn default_grpc_max_header_list_size() -> u32 {
+    64 * 1024
+}
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()
 }
@@ -2242,6 +5255,30 @@ fn default_reality_max_concurrent_handshakes() -> usize {
 fn default_true() -> bool {
     true
 }
+fn default_xhttp_listen_alpn() -> Vec<XhttpListenAlpn> {
+    // Xray TLS defaults to h2 before http/1.1. rustls follows server
+    // preference, so reversing this order silently downgrades Xray's default
+    // H2 client to H1 and makes its H2 transport fail after negotiation.
+    vec![XhttpListenAlpn::H2, XhttpListenAlpn::Http1]
+}
+fn default_xhttp_accept_queue() -> usize {
+    256
+}
+fn default_xhttp_max_active_relays() -> usize {
+    256
+}
+fn default_xhttp_max_active_connections() -> usize {
+    1024
+}
+fn default_xhttp_max_concurrent_streams() -> u32 {
+    128
+}
+fn default_xhttp_max_active_http_streams() -> usize {
+    1024
+}
+fn default_xhttp_http_idle_timeout() -> Duration {
+    Duration::from_secs(90)
+}
 fn default_log_file_path() -> String {
     "data/logs/wuthercore.log".into()
 }
@@ -2286,9 +5323,6 @@ fn default_resolver_servers() -> BTreeMap<String, ResolverServer> {
         ),
     ])
 }
-fn default_transport() -> String {
-    "tcp".into()
-}
 fn default_capture_method() -> CaptureMethod {
     CaptureMethod::Auto
 }
@@ -2324,4 +5358,1346 @@ fn default_dashboard() -> String {
 }
 fn default_tailscale_mode() -> TailscaleMode {
     TailscaleMode::Auto
+}
+
+#[cfg(test)]
+mod xhttp_config_tests {
+    use super::*;
+
+    #[test]
+    fn tun_accepts_mihomo_kebab_case_nat_fields() {
+        let tun: TunInboundOptions =
+            serde_yaml::from_str("endpoint-independent-nat: true\nudp-timeout: 45s\n").unwrap();
+        assert!(tun.endpoint_independent_nat);
+        assert_eq!(tun.udp_timeout, Duration::from_secs(45));
+    }
+
+    const FULL_XHTTP_YAML: &str = r#"
+host: cdn.example.com
+path: /split
+mode: packet-up
+headers:
+  User-Agent: Wuther
+xPaddingBytes: 100-1000
+xPaddingObfsMode: true
+xPaddingKey: x_padding
+xPaddingHeader: X-Padding
+xPaddingPlacement: queryInHeader
+xPaddingMethod: tokenish
+uplinkHTTPMethod: POST
+sessionIDPlacement: header
+sessionIDKey: X-Session
+sessionIDTable: Base62
+sessionIDLength: 16-24
+seqPlacement: query
+seqKey: x_seq
+uplinkDataPlacement: header
+uplinkDataKey: X-Data
+uplinkChunkSize: 3000-4000
+noGRPCHeader: true
+noSSEHeader: true
+scMaxEachPostBytes: 1000000
+scMinPostsIntervalMs: 30-60
+scMaxBufferedPosts: 30
+scStreamUpServerSecs: 20-80
+serverMaxHeaderBytes: 16384
+xmux:
+  maxConcurrency: 0
+  maxConnections: 4-8
+  cMaxReuseTimes: 16
+  hMaxRequestTimes: 600-900
+  hMaxReusableSecs: 1800-3000
+  hKeepAlivePeriod: -1
+downloadSettings:
+  address: download.example.com
+  host: download-cdn.example.com
+  port: 443
+  network: xhttp
+  security: tls
+  tlsSettings:
+    serverName: download.example.com
+    allowInsecure: false
+    alpn: [h2, h3]
+  alpn: [h2, h3]
+  sockopt:
+    mark: 123
+    tfo: true
+    tcpMptcp: false
+    domainStrategy: UseIP
+  xhttpSettings:
+    path: /download
+    mode: packet-up
+"#;
+
+    #[test]
+    fn xhttp_yaml_and_json_round_trip_all_fields() {
+        let config: XhttpConfig = serde_yaml::from_str(FULL_XHTTP_YAML).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.x_padding_bytes, Some(XhttpRange::new(100, 1000)));
+        assert_eq!(
+            config
+                .xmux
+                .as_ref()
+                .and_then(|xmux| xmux.h_keep_alive_period),
+            Some(-1)
+        );
+        assert_eq!(
+            config
+                .download_settings
+                .as_ref()
+                .and_then(|settings| settings.port),
+            Some(443)
+        );
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let from_yaml: XhttpConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(from_yaml, config);
+
+        let json = serde_json::to_string(&config).unwrap();
+        let from_json: XhttpConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json, config);
+        assert!(json.contains("\"noGRPCHeader\":true"));
+        assert!(json.contains("\"sessionIDLength\":\"16-24\""));
+    }
+
+    #[test]
+    fn xhttp_accepts_kebab_and_legacy_aliases() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+x-padding-bytes: 256
+no-grpc-header: true
+no_sse_header: true
+uplink-http-method: POST
+session-placement: cookie
+session-key: sid
+session-id-table: Base62
+session-id-length: 16
+seq_placement: header
+seq_key: X-Seq
+uplink-data-placement: body
+sc-max-each-post-bytes: 1048576
+server-max-header-bytes: 8192
+xmux:
+  max-connections: 4-6
+  h_keep_alive_period: -1
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.x_padding_bytes, Some(XhttpRange::new(256, 256)));
+        assert_eq!(config.session_id_placement.as_deref(), Some("cookie"));
+        assert_eq!(
+            config.xmux.as_ref().and_then(|xmux| xmux.max_connections),
+            Some(XhttpRange::new(4, 6))
+        );
+    }
+
+    #[test]
+    fn xhttp_rejects_unknown_nested_fields_and_bad_ranges() {
+        let unknown = serde_yaml::from_str::<XhttpConfig>(
+            r#"
+xmux:
+  maxConnections: 4
+  typoLimit: 8
+"#,
+        );
+        assert!(unknown.is_err());
+
+        for value in ["-1", "10-1", "1-2-3", "2147483648"] {
+            let yaml = format!("xPaddingBytes: {value:?}");
+            assert!(
+                serde_yaml::from_str::<XhttpConfig>(&yaml).is_err(),
+                "{value} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_download_stream_config_registers_every_strict_nested_family() {
+        let json = r#"
+        {
+          "address": "download.example.com",
+          "port": 443,
+          "method": "xhttp",
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "certificates": [{
+              "certificateFile": "cert.pem",
+              "certificate": ["CERT"],
+              "keyFile": "key.pem",
+              "key": ["KEY"],
+              "usage": "verify",
+              "ocspStapling": 3600,
+              "oneTimeLoading": true,
+              "buildChain": true
+            }],
+            "serverName": "download.example.com",
+            "allowInsecure": false,
+            "alpn": ["h2"],
+            "enableSessionResumption": true,
+            "disableSystemRoot": true,
+            "minVersion": "1.2",
+            "maxVersion": "1.3",
+            "cipherSuites": "TLS_AES_128_GCM_SHA256",
+            "fingerprint": "chrome",
+            "rejectUnknownSni": true,
+            "curvePreferences": ["X25519"],
+            "masterKeyLog": "keys.log",
+            "pinnedPeerCertSha256": "00",
+            "verifyPeerCertByName": "peer.example.com",
+            "echServerKeys": "AA==",
+            "echConfigList": "AA==",
+            "echSockopt": {"mark": 1}
+          },
+          "realitySettings": {
+            "masterKeyLog": "reality.keys",
+            "show": true,
+            "target": 443,
+            "dest": "origin.example.com:443",
+            "type": "tcp",
+            "xver": 1,
+            "serverNames": ["origin.example.com"],
+            "privateKey": "private",
+            "minClientVer": "1.0.0",
+            "maxClientVer": "2.0.0",
+            "maxTimeDiff": 1000,
+            "shortIds": ["01234567"],
+            "mldsa65Seed": "seed",
+            "limitFallbackUpload": {
+              "afterBytes": 1,
+              "bytesPerSec": 2,
+              "burstBytesPerSec": 3
+            },
+            "limitFallbackDownload": {
+              "afterBytes": 4,
+              "bytesPerSec": 5,
+              "burstBytesPerSec": 6
+            },
+            "fingerprint": "chrome",
+            "serverName": "origin.example.com",
+            "password": "password",
+            "publicKey": "public",
+            "shortId": "01234567",
+            "mldsa65Verify": "verify",
+            "spiderX": "/index"
+          },
+          "sockopt": {
+            "mark": 1,
+            "tcpFastOpen": 256,
+            "tproxy": "redirect",
+            "acceptProxyProtocol": true,
+            "domainStrategy": "ForceIPv6v4",
+            "dialerProxy": "direct",
+            "tcpKeepAliveInterval": 30,
+            "tcpKeepAliveIdle": 60,
+            "tcpCongestion": "bbr",
+            "tcpWindowClamp": 4096,
+            "tcpMaxSeg": 1400,
+            "penetrate": true,
+            "tcpUserTimeout": 1000,
+            "v6only": true,
+            "interface": "eth0",
+            "tcpMptcp": true,
+            "customSockopt": [{
+              "system": "linux",
+              "network": "tcp",
+              "level": "SOL_SOCKET",
+              "opt": "SO_MARK",
+              "value": "1",
+              "type": "int"
+            }],
+            "addressPortStrategy": "srvPortAndAddress",
+            "happyEyeballs": {
+              "prioritizeIPv6": true,
+              "tryDelayMs": 250,
+              "interleave": 2,
+              "maxConcurrentTry": 8
+            },
+            "trustedXForwardedFor": ["127.0.0.1"]
+          },
+          "finalmask": {
+            "tcp": [
+              {
+                "type": "header-custom",
+                "settings": {
+                  "clients": [[{
+                    "delay": "1-2",
+                    "randRange": "0-255",
+                    "capture": "hello",
+                    "type": "str",
+                    "packet": "hello"
+                  }]],
+                  "servers": [[{"rand": 4}]],
+                  "errors": [[{"reuse": "hello"}]]
+                }
+              },
+              {
+                "type": "fragment",
+                "settings": {
+                  "packets": "1-2",
+                  "length": "10-20",
+                  "delay": "1-2",
+                  "lengths": [8, "16-32"],
+                  "delays": [0, "1-2"],
+                  "maxSplit": "2-4"
+                }
+              },
+              {
+                "type": "sudoku",
+                "settings": {
+                  "password": "secret",
+                  "ascii": "abc",
+                  "customTable": "table",
+                  "customTables": ["one", "two"],
+                  "paddingMin": 1,
+                  "paddingMax": 2
+                }
+              },
+              {
+                "type": "xmc",
+                "settings": {
+                  "hostname": "mc.example.com",
+                  "usernames": ["Dream"],
+                  "password": "secret"
+                }
+              }
+            ],
+            "udp": [
+              {
+                "type": "header-custom",
+                "settings": {
+                  "mode": "standalone",
+                  "client": [{"type": "array", "packet": [1, 2]}],
+                  "server": [{
+                    "transform": {
+                      "op": "concat",
+                      "args": [
+                        {"type": "str", "bytes": "prefix"},
+                        {"u64": 1},
+                        {"reuse": "saved"},
+                        {"metadata": "payload"},
+                        {"transform": {"op": "identity", "args": [{"metadata": "x"}]}}
+                      ]
+                    }
+                  }]
+                }
+              },
+              {"type": "mkcp-legacy", "settings": {"header": "dns", "value": "dns.example"}},
+              {
+                "type": "noise",
+                "settings": {
+                  "reset": "1-2",
+                  "noise": [{
+                    "rand": "2-4",
+                    "randRange": "0-255",
+                    "type": "hex",
+                    "packet": "deadbeef",
+                    "delay": "1-3"
+                  }]
+                }
+              },
+              {"type": "salamander", "settings": {"password": "secret", "packetSize": "1200-1400"}},
+              {"type": "sudoku", "settings": {"password": "secret"}},
+              {
+                "type": "xdns",
+                "settings": {
+                  "domain": ["one.example", "two.example"],
+                  "domains": ["dns.example"],
+                  "resolvers": ["8.8.8.8+udp://53"]
+                }
+              },
+              {"type": "xicmp", "settings": {"dgram": true, "ips": ["127.0.0.1"]}},
+              {
+                "type": "realm",
+                "settings": {
+                  "url": "realm://token@realm.example/id",
+                  "stunServers": ["stun.example:3478"],
+                  "tlsConfig": {"serverName": "realm.example"}
+                }
+              }
+            ],
+            "quicParams": {
+              "congestion": "bbr",
+              "debug": true,
+              "bbrProfile": "default",
+              "brutalUp": "100mbps",
+              "brutalDown": "200mbps",
+              "udpHop": {"ports": "20000-30000,443", "interval": "10-20"},
+              "initStreamReceiveWindow": 1,
+              "maxStreamReceiveWindow": 2,
+              "initConnectionReceiveWindow": 3,
+              "maxConnectionReceiveWindow": 4,
+              "maxIdleTimeout": 5,
+              "keepAlivePeriod": 6,
+              "disablePathMTUDiscovery": true,
+              "maxIncomingStreams": 7
+            }
+          },
+          "xhttpSettings": {"path": "/download", "mode": "packet-up"}
+        }"#;
+
+        let settings: XhttpDownloadSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.method.as_deref(), Some("xhttp"));
+        assert_eq!(
+            settings
+                .tls_settings
+                .as_ref()
+                .map(|tls| tls.certificates.len()),
+            Some(1)
+        );
+        assert_eq!(
+            settings
+                .socket_settings
+                .as_ref()
+                .map(|socket| socket.custom_sockopt.len()),
+            Some(1)
+        );
+        let final_mask = settings.final_mask.as_ref().unwrap();
+        assert_eq!(final_mask.tcp.len(), 4);
+        assert_eq!(final_mask.udp.len(), 8);
+        assert!(final_mask.quic_params.is_some());
+
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let round_trip: XhttpDownloadSettings = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_trip, settings);
+    }
+
+    #[test]
+    fn xhttp_download_nested_models_reject_unknown_fields() {
+        for json in [
+            r#"{"tlsSettings":{"serverNmae":"example.com"}}"#,
+            r#"{"tlsSettings":{"certificates":[{"certificateTypo":[]}]}}"#,
+            r#"{"realitySettings":{"publicKye":"value"}}"#,
+            r#"{"realitySettings":{"limitFallbackUpload":{"afterBytez":1}}}"#,
+            r#"{"sockopt":{"tcpFastOepn":true}}"#,
+            r#"{"sockopt":{"happyEyeballs":{"tryDelayMss":1}}}"#,
+            r#"{"sockopt":{"customSockopt":[{"levle":"1"}]}}"#,
+            r#"{"finalmask":{"unknown":[]}}"#,
+            r#"{"finalmask":{"tcp":[{"type":"fragment","settings":{"lenght":1}}]}}"#,
+            r#"{"finalmask":{"udp":[{"type":"noise","settings":{"rest":1}}]}}"#,
+            r#"{"finalmask":{"quicParams":{"maxIdleTimout":1}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<XhttpDownloadSettings>(json).is_err(),
+                "unknown nested field should fail: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_download_method_takes_precedence_over_network() {
+        let accepted: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  method: xhttp
+  network: tcp
+  xhttpSettings:
+    mode: packet-up
+"#,
+        )
+        .unwrap();
+        accepted.validate().unwrap();
+
+        let rejected: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  method: tcp
+  network: xhttp
+  xhttpSettings:
+    mode: packet-up
+"#,
+        )
+        .unwrap();
+        assert!(rejected.validate().unwrap_err().contains("method/network"));
+    }
+
+    #[test]
+    fn xhttp_download_empty_security_is_none_and_removed_allow_insecure_fails_for_tls() {
+        let empty_security: XhttpDownloadSettings = serde_json::from_str(
+            r#"{
+                "address":"download.example",
+                "port":443,
+                "security":"",
+                "tlsSettings":{"allowInsecure":true},
+                "xhttpSettings":{"mode":"packet-up"}
+            }"#,
+        )
+        .unwrap();
+        empty_security.validate().unwrap();
+
+        for allow_insecure in [None, Some(false)] {
+            let mut tls = empty_security.clone();
+            tls.security = Some("tls".into());
+            tls.tls_settings.as_mut().unwrap().allow_insecure = allow_insecure;
+            tls.validate().unwrap();
+        }
+
+        let mut removed = empty_security;
+        removed.security = Some("tls".into());
+        let error = removed.validate().unwrap_err();
+        assert!(error.contains("allowInsecure=true 已被 Xray 移除"));
+    }
+
+    #[test]
+    fn xhttp_download_transport_rejects_non_xhttp_kind_and_grpc_service() {
+        let invalid_kind: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  transport:
+    kind: grpc
+    xhttp:
+      mode: packet-up
+"#,
+        )
+        .unwrap();
+        assert!(
+            invalid_kind
+                .validate()
+                .unwrap_err()
+                .contains("transport.kind")
+        );
+
+        let grpc_service: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  transport:
+    kind: xhttp
+    service: download-service
+    xhttp:
+      mode: packet-up
+"#,
+        )
+        .unwrap();
+        assert!(
+            grpc_service
+                .validate()
+                .unwrap_err()
+                .contains("transport.service")
+        );
+    }
+
+    #[test]
+    fn xhttp_download_accepts_equivalent_compatibility_aliases() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  alpn: [h2]
+  tlsSettings:
+    alpn: [h2]
+  transport:
+    kind: xhttp
+    host: cdn.example.com
+    path: /download
+    xhttp:
+      host: cdn.example.com
+      path: /download
+      mode: packet-up
+  xhttpSettings:
+    mode: packet-up
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn xhttp_download_rejects_conflicting_xhttp_aliases() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  transport:
+    kind: xhttp
+    xhttp:
+      mode: stream-up
+  xhttpSettings:
+    mode: packet-up
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().unwrap_err().contains("必须语义等价"));
+    }
+
+    #[test]
+    fn xhttp_download_rejects_conflicting_generic_host_or_path() {
+        for (generic, nested, expected_field) in [
+            (
+                "host: generic.example.com",
+                "host: nested.example.com",
+                "transport.host",
+            ),
+            ("path: /generic", "path: /nested", "transport.path"),
+        ] {
+            let yaml = format!(
+                r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  transport:
+    kind: xhttp
+    {generic}
+    xhttp:
+      {nested}
+      mode: packet-up
+"#
+            );
+            let config: XhttpConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert!(
+                config.validate().unwrap_err().contains(expected_field),
+                "{expected_field} conflict must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_download_rejects_conflicting_top_level_and_tls_alpn() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: packet-up
+downloadSettings:
+  address: download.example.com
+  port: 443
+  alpn: [h2, http/1.1]
+  tlsSettings:
+    alpn: [h2]
+  xhttpSettings:
+    mode: packet-up
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().unwrap_err().contains("tlsSettings.alpn"));
+    }
+
+    #[test]
+    fn xhttp_session_id_table_matches_xray_ascii_and_room_validation() {
+        for (table, length, expected_error) in [
+            ("HEX", XhttpRange::new(1, 6), "31-bit"),
+            ("字母", XhttpRange::new(8, 12), "ASCII"),
+        ] {
+            let config = XhttpConfig {
+                session_id_table: Some(table.into()),
+                session_id_length: Some(length),
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains(expected_error),
+                "unexpected error for {table}: {error}"
+            );
+        }
+
+        // Xray counts table bytes exactly as configured: duplicate bytes and
+        // URL-reserved ASCII are accepted and participate in roomSize.
+        let xray_compatible_custom = XhttpConfig {
+            session_id_table: Some("aaaaaaaaaaaaaaaa/?#[]@!$&'()*+,;=".into()),
+            session_id_length: Some(XhttpRange::new(8, 12)),
+            ..Default::default()
+        };
+        xray_compatible_custom.validate().unwrap();
+
+        let empty_table_uses_uuid_even_without_length = XhttpConfig {
+            session_id_table: Some(String::new()),
+            ..Default::default()
+        };
+        empty_table_uses_uuid_even_without_length
+            .validate()
+            .unwrap();
+
+        let summed_binary_range = XhttpConfig {
+            session_id_table: Some("ab".into()),
+            session_id_length: Some(XhttpRange::new(30, 32)),
+            ..Default::default()
+        };
+        summed_binary_range.validate().unwrap();
+
+        let insufficient_binary_range = XhttpConfig {
+            session_id_table: Some("ab".into()),
+            session_id_length: Some(XhttpRange::new(29, 30)),
+            ..Default::default()
+        };
+        assert!(
+            insufficient_binary_range
+                .validate()
+                .unwrap_err()
+                .contains("31-bit")
+        );
+
+        for (table, shortest) in [
+            ("ALPHABET", 7),
+            ("Alphabet", 6),
+            ("BASE36", 6),
+            ("Base62", 6),
+            ("HEX", 8),
+            ("alphabet", 7),
+            ("base36", 6),
+            ("hex", 8),
+            ("number", 10),
+        ] {
+            let config = XhttpConfig {
+                session_id_table: Some(table.into()),
+                session_id_length: Some(XhttpRange::new(shortest, shortest + 4)),
+                ..Default::default()
+            };
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{table} should be safe: {error}"));
+        }
+    }
+
+    #[test]
+    fn xhttp_sc_max_buffered_posts_enforces_business_limit() {
+        let at_limit = XhttpConfig {
+            sc_max_buffered_posts: Some(XHTTP_MAX_BUFFERED_POSTS),
+            ..Default::default()
+        };
+        at_limit.validate().unwrap();
+
+        let above_limit = XhttpConfig {
+            sc_max_buffered_posts: Some(XHTTP_MAX_BUFFERED_POSTS + 1),
+            ..Default::default()
+        };
+        assert!(
+            above_limit
+                .validate()
+                .unwrap_err()
+                .contains("scMaxBufferedPosts 不能大于 1000000")
+        );
+    }
+
+    #[test]
+    fn xhttp_padding_enforces_allocation_limit() {
+        let at_limit = XhttpConfig {
+            x_padding_bytes: Some(XhttpRange::new(
+                XHTTP_MAX_PADDING_BYTES,
+                XHTTP_MAX_PADDING_BYTES,
+            )),
+            ..Default::default()
+        };
+        at_limit.validate().unwrap();
+
+        let above_limit = XhttpConfig {
+            x_padding_bytes: Some(XhttpRange::new(
+                XHTTP_MAX_PADDING_BYTES,
+                XHTTP_MAX_PADDING_BYTES + 1,
+            )),
+            ..Default::default()
+        };
+        assert!(
+            above_limit
+                .validate()
+                .unwrap_err()
+                .contains("xPaddingBytes 不能大于 1048576")
+        );
+    }
+
+    #[test]
+    fn xhttp_headers_reject_managed_and_malformed_values_at_config_time() {
+        for name in [
+            "hOsT",
+            "CONTENT-LENGTH",
+            "Transfer-Encoding",
+            "Connection",
+            "Proxy-Connection",
+            "Keep-Alive",
+            "Upgrade",
+            "Trailer",
+            "TE",
+            "HTTP2-Settings",
+            "Expect",
+        ] {
+            let config = XhttpConfig {
+                headers: Some(BTreeMap::from([(name.into(), "value".into())])),
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains("Host/framing/hop-by-hop"),
+                "managed header {name} was not rejected correctly: {error}"
+            );
+        }
+
+        for (name, value) in [
+            ("bad name", "value"),
+            ("X-Test", "ok\r\nInjected: yes"),
+            ("X-Test", "bad\u{7f}value"),
+        ] {
+            let config = XhttpConfig {
+                headers: Some(BTreeMap::from([(name.into(), value.into())])),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "malformed header should fail: {name:?}={value:?}"
+            );
+        }
+
+        let safe = XhttpConfig {
+            headers: Some(BTreeMap::from([(
+                "X-Custom_~".into(),
+                "visible\tvalue".into(),
+            )])),
+            ..Default::default()
+        };
+        safe.validate().unwrap();
+    }
+
+    #[test]
+    fn xhttp_semantic_conflicts_fail_validation() {
+        let both_limits: XhttpConfig = serde_yaml::from_str(
+            r#"
+xmux:
+  maxConcurrency: 2
+  maxConnections: 4
+"#,
+        )
+        .unwrap();
+        assert!(both_limits.validate().unwrap_err().contains("不能同时启用"));
+
+        let bad_download: XhttpConfig = serde_yaml::from_str(
+            r#"
+mode: stream-one
+downloadSettings:
+  xhttpSettings:
+    path: /down
+"#,
+        )
+        .unwrap();
+        assert!(bad_download.validate().unwrap_err().contains("stream-one"));
+
+        let partial_zero_padding: XhttpConfig =
+            serde_yaml::from_str("xPaddingBytes: 0-1000").unwrap();
+        assert!(
+            partial_zero_padding
+                .validate()
+                .unwrap_err()
+                .contains("xPaddingBytes")
+        );
+        let exact_zero_padding: XhttpConfig = serde_yaml::from_str("xPaddingBytes: 0").unwrap();
+        exact_zero_padding.validate().unwrap();
+
+        let sc_zero_lower_bound: XhttpConfig =
+            serde_yaml::from_str("scMaxEachPostBytes: 0-1000000").unwrap();
+        sc_zero_lower_bound.validate().unwrap();
+
+        let mixed_case_host: XhttpConfig =
+            serde_yaml::from_str("headers: {hOsT: forbidden.example}").unwrap();
+        assert!(mixed_case_host.validate().unwrap_err().contains("Host"));
+
+        for yaml in [
+            "mode: stream-up\nuplinkDataPlacement: header",
+            "mode: stream-up\nuplinkHTTPMethod: GET",
+        ] {
+            let config: XhttpConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                config.validate().unwrap_err().contains("packet-up"),
+                "config should be packet-up only: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_extra_is_typed_and_only_outer_routing_fields_override() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+host: outer.example
+path: /outer
+mode: packet-up
+headers:
+  X-Ignored: outer
+extra:
+  host: inner.example
+  path: /inner
+  mode: stream-up
+  headers:
+    X-Source: extra
+  noSSEHeader: true
+"#,
+        )
+        .unwrap();
+        let resolved = config.resolved().unwrap();
+        assert_eq!(resolved.host.as_deref(), Some("outer.example"));
+        assert_eq!(resolved.path.as_deref(), Some("/outer"));
+        assert_eq!(resolved.mode.as_deref(), Some("packet-up"));
+        assert_eq!(
+            resolved
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-Source"))
+                .map(String::as_str),
+            Some("extra")
+        );
+        assert_eq!(resolved.no_sse_header, Some(true));
+        assert!(resolved.extra.is_none());
+    }
+
+    #[test]
+    fn xhttp_nested_extra_stops_after_the_first_level() {
+        let config: XhttpConfig = serde_yaml::from_str(
+            r#"
+host: outer.example
+path: /outer
+mode: packet-up
+extra:
+  headers:
+    X-Level: first
+  extra:
+    headers:
+      X-Level: second
+"#,
+        )
+        .unwrap();
+        let resolved = config.resolved().unwrap();
+        assert_eq!(
+            resolved
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-Level"))
+                .map(String::as_str),
+            Some("first")
+        );
+        assert_eq!(resolved.host.as_deref(), Some("outer.example"));
+        assert_eq!(resolved.path.as_deref(), Some("/outer"));
+        assert_eq!(resolved.mode.as_deref(), Some("packet-up"));
+        assert!(resolved.extra.is_none());
+    }
+
+    #[test]
+    fn xhttp_listener_accepts_single_or_array_and_json_uses_wire_alpn_names() {
+        let single: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8443
+  tls:
+    cert: cert.pem
+    key: key.pem
+  alpn: [h1, h2]
+  tag: edge
+  accept-queue: 512
+  allowUnauthenticatedNonLoopback: true
+  max_active_relays: 1024
+  maxActiveConnections: 2048
+  maxConcurrentStreams: 96
+  max_active_http_streams: 4096
+  http_idle_timeout: 45s
+  corsOrigins:
+    - https://console.example
+  settings:
+    path: /split
+    mode: packet-up
+    xPaddingBytes: 0
+"#,
+        )
+        .unwrap();
+        let XhttpListenSet::One(listener) = single.xhttp.as_ref().unwrap() else {
+            panic!("single listen.xhttp must remain a single object");
+        };
+        assert_eq!(listener.alpn, [XhttpListenAlpn::Http1, XhttpListenAlpn::H2]);
+        assert!(listener.allow_unauthenticated_non_loopback);
+        assert_eq!(listener.max_active_relays, 1024);
+        assert_eq!(listener.max_active_connections, 2048);
+        assert_eq!(listener.max_concurrent_streams, 96);
+        assert_eq!(listener.max_active_http_streams, 4096);
+        assert_eq!(listener.http_idle_timeout, Duration::from_secs(45));
+        assert_eq!(
+            listener.cors_origins,
+            Some(vec!["https://console.example".into()])
+        );
+        assert_eq!(
+            listener.settings.x_padding_bytes,
+            Some(XhttpRange::new(0, 0))
+        );
+
+        let json = serde_json::to_string(&single).unwrap();
+        assert!(json.contains("\"http/1.1\""));
+        assert!(!json.contains("\"h1\""));
+        assert!(json.contains("\"allow-unauthenticated-non-loopback\":true"));
+        assert!(json.contains("\"max-active-relays\":1024"));
+        assert!(json.contains("\"max-active-connections\":2048"));
+        assert!(json.contains("\"max-concurrent-streams\":96"));
+        assert!(json.contains("\"max-active-http-streams\":4096"));
+        assert!(json.contains("\"http-idle-timeout\":\"45s\""));
+        assert!(json.contains("\"cors-origins\":[\"https://console.example\"]"));
+        assert!(!json.contains("\"allowUnauthenticatedNonLoopback\""));
+        assert!(!json.contains("\"max_active_relays\""));
+        assert!(!json.contains("\"maxActiveConnections\""));
+        assert!(!json.contains("\"maxConcurrentStreams\""));
+        assert!(!json.contains("\"max_active_http_streams\""));
+        assert!(!json.contains("\"http_idle_timeout\""));
+        assert!(!json.contains("\"corsOrigins\""));
+        let from_json: Listen = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json.xhttp, single.xhttp);
+
+        let json_aliases: Listen = serde_json::from_str(
+            r#"{
+                "xhttp": {
+                    "address": "127.0.0.1",
+                    "port": 8080,
+                    "cleartext": true,
+                    "max_active_connections": 32,
+                    "max_concurrent_streams": 64,
+                    "maxActiveHttpStreams": 512,
+                    "httpIdleTimeout": "12s"
+                }
+            }"#,
+        )
+        .unwrap();
+        let Some(XhttpListenSet::One(json_aliases)) = json_aliases.xhttp else {
+            panic!("JSON aliases must deserialize to one XHTTP listener");
+        };
+        assert_eq!(json_aliases.max_active_connections, 32);
+        assert_eq!(json_aliases.max_concurrent_streams, 64);
+        assert_eq!(json_aliases.max_active_http_streams, 512);
+        assert_eq!(json_aliases.http_idle_timeout, Duration::from_secs(12));
+
+        let many: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  - {address: 127.0.0.1, port: 8080, cleartext: true}
+  - address: "::"
+    port: 8443
+    tls: {cert: cert.pem, key: key.pem}
+    alpn: [h3]
+"#,
+        )
+        .unwrap();
+        let Some(XhttpListenSet::Many(listeners)) = many.xhttp else {
+            panic!("array listen.xhttp must remain an array");
+        };
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(
+            listeners[0].alpn,
+            [XhttpListenAlpn::H2, XhttpListenAlpn::Http1]
+        );
+        assert_eq!(listeners[0].accept_queue, 256);
+        assert!(!listeners[0].allow_unauthenticated_non_loopback);
+        assert_eq!(listeners[0].max_active_relays, 256);
+        assert_eq!(listeners[0].max_active_connections, 1024);
+        assert_eq!(listeners[0].max_concurrent_streams, 128);
+        assert_eq!(listeners[0].max_active_http_streams, 1024);
+        assert_eq!(listeners[0].http_idle_timeout, Duration::from_secs(90));
+        assert_eq!(listeners[0].cors_origins, None);
+    }
+
+    #[test]
+    fn xhttp_listener_security_fields_roundtrip_through_yaml_aliases() {
+        let listen: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8080
+  cleartext: true
+  allow_unauthenticated_non_loopback: true
+  maxActiveRelays: 64
+  max_active_connections: 128
+  max_concurrent_streams: 32
+  maxActiveHttpStreams: 256
+  httpIdleTimeout: 30s
+  cors_origins:
+    - " https://one.example "
+    - https://two.example:8443
+"#,
+        )
+        .unwrap();
+        let yaml = serde_yaml::to_string(&listen).unwrap();
+        assert!(yaml.contains("allow-unauthenticated-non-loopback: true"));
+        assert!(yaml.contains("max-active-relays: 64"));
+        assert!(yaml.contains("max-active-connections: 128"));
+        assert!(yaml.contains("max-concurrent-streams: 32"));
+        assert!(yaml.contains("max-active-http-streams: 256"));
+        assert!(yaml.contains("http-idle-timeout: 30s"));
+        assert!(yaml.contains("cors-origins:"));
+        assert!(!yaml.contains("allow_unauthenticated_non_loopback"));
+        assert!(!yaml.contains("maxActiveRelays"));
+        assert!(!yaml.contains("max_active_connections"));
+        assert!(!yaml.contains("max_concurrent_streams"));
+        assert!(!yaml.contains("maxActiveHttpStreams"));
+        assert!(!yaml.contains("httpIdleTimeout"));
+        assert!(!yaml.contains("cors_origins"));
+        let roundtrip: Listen = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(roundtrip.xhttp, listen.xhttp);
+    }
+
+    #[test]
+    fn xhttp_listener_distinguishes_default_and_explicitly_disabled_cors() {
+        let omitted: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8080
+  cleartext: true
+"#,
+        )
+        .unwrap();
+        let explicit_empty: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8080
+  cleartext: true
+  cors-origins: []
+"#,
+        )
+        .unwrap();
+
+        let Some(XhttpListenSet::One(omitted)) = omitted.xhttp else {
+            panic!("omitted CORS listener must deserialize");
+        };
+        let Some(XhttpListenSet::One(explicit_empty)) = explicit_empty.xhttp else {
+            panic!("explicitly empty CORS listener must deserialize");
+        };
+        assert_eq!(omitted.cors_origins, None);
+        assert_eq!(explicit_empty.cors_origins, Some(Vec::new()));
+
+        let omitted_json = serde_json::to_value(&omitted).unwrap();
+        assert!(omitted_json.get("cors-origins").is_none());
+        let explicit_json = serde_json::to_value(&explicit_empty).unwrap();
+        assert_eq!(explicit_json["cors-origins"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn xhttp_listener_rejects_unknown_and_unimplemented_protocol_fields() {
+        assert!(
+            serde_yaml::from_str::<Listen>(
+                r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8080
+  cleartext: true
+  typo-field: true
+"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Listen>(
+                r#"{"xhttp":{"address":"127.0.0.1","port":8080,"cleartext":true,"inner-protocol":"vless"}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Listen>(
+                r#"{"xhttp":{"address":"127.0.0.1","port":8080,"cleartext":true,"protocol":"trojan"}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn xhttp_tls_advanced_fields_and_listener_aliases_are_typed() {
+        let listen: Listen = serde_yaml::from_str(
+            r#"
+xhttp:
+  address: 127.0.0.1
+  port: 8443
+  alpn: [h2]
+  tls:
+    certificates:
+      - certificate: [CERT]
+        key: [KEY]
+        usage: encipherment
+      - certificateFile: ca.pem
+        usage: verify
+    require_client_certificate: true
+    server_name: service.example
+    enable-session-resumption: true
+    disable_system_root: true
+    min-version: "1.2"
+    max_version: "1.3"
+    cipher-suites: TLS_AES_128_GCM_SHA256
+    curve_preferences: X25519,curvep256
+    master-key-log: none
+    rejectUnknownSNI: true
+"#,
+        )
+        .unwrap();
+        let Some(XhttpListenSet::One(listener)) = listen.xhttp else {
+            panic!("advanced listener TLS must deserialize");
+        };
+        let tls = listener.tls.expect("listener TLS");
+        assert_eq!(tls.require_client_certificate, Some(true));
+        assert_eq!(tls.settings.server_name.as_deref(), Some("service.example"));
+        assert_eq!(tls.settings.min_version.as_deref(), Some("1.2"));
+        assert_eq!(tls.settings.max_version.as_deref(), Some("1.3"));
+        assert_eq!(
+            tls.settings.curve_preferences.as_deref(),
+            Some(["X25519".to_owned(), "curvep256".to_owned()].as_slice())
+        );
+        tls.settings.validate().unwrap();
+
+        let canonical = serde_json::to_value(&tls).unwrap();
+        assert_eq!(canonical["requireClientCertificate"], true);
+        assert_eq!(canonical["serverName"], "service.example");
+        assert_eq!(canonical["enableSessionResumption"], true);
+        assert_eq!(canonical["disableSystemRoot"], true);
+        assert_eq!(
+            canonical["curvePreferences"],
+            serde_json::json!(["X25519", "curvep256"])
+        );
+    }
+
+    #[test]
+    fn xhttp_tls_validation_rejects_ambiguous_or_unexecutable_values() {
+        fn error(settings: XhttpDownloadTlsSettings) -> String {
+            settings.validate().expect_err("TLS settings must fail")
+        }
+
+        let cases = [
+            (
+                XhttpDownloadTlsSettings {
+                    min_version: Some("1.3".into()),
+                    max_version: Some("1.2".into()),
+                    ..Default::default()
+                },
+                "minVersion 不能高于",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    cipher_suites: Some("TLS_AES_128_GCM_SHA256:TYPO".into()),
+                    ..Default::default()
+                },
+                "未知或空的密码套件",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    curve_preferences: Some(vec!["X25519".into(), "x25519".into()]),
+                    ..Default::default()
+                },
+                "重复曲线",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    certificates: vec![XhttpDownloadTlsCertificate {
+                        certificate_file: Some("cert.pem".into()),
+                        certificate: Some(vec!["CERT".into()]),
+                        key_file: Some("key.pem".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "certificateFile 与 certificate 不能同时设置",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    certificates: vec![XhttpDownloadTlsCertificate {
+                        certificate: Some(vec!["CA".into()]),
+                        key: Some(vec!["KEY".into()]),
+                        usage: Some(XhttpTlsCertificateUsage::Verify),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                "usage=verify 不能携带私钥",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    ech_config_list: Some("AA==".into()),
+                    ..Default::default()
+                },
+                "缺少 ECHConfigList 长度",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    ech_config_list: Some("AAEAAA==".into()),
+                    ..Default::default()
+                },
+                "ECHConfigList 外层长度不匹配",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    ech_config_list: Some(
+                        "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA==".into(),
+                    ),
+                    ech_socket_settings: Some(Box::default()),
+                    ..Default::default()
+                },
+                "echSockopt 只能与",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    ech_config_list: Some("tcp://1.1.1.1".into()),
+                    ..Default::default()
+                },
+                "只支持 https://、h2c:// 或 udp://",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    ech_server_keys: Some("AA==".into()),
+                    ..Default::default()
+                },
+                "缺少 ECH 私钥长度",
+            ),
+            (
+                XhttpDownloadTlsSettings {
+                    disable_system_root: Some(true),
+                    ..Default::default()
+                },
+                "disableSystemRoot=true",
+            ),
+        ];
+        for (settings, expected) in cases {
+            let actual = error(settings);
+            assert!(
+                actual.contains(expected),
+                "expected {expected:?}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn xhttp_tls_accepts_xray_ech_direct_dns_and_server_key_vectors() {
+        const ECH_CONFIG_LIST: &str = "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA==";
+        const ECH_SERVER_KEYS: &str = "ACCfHeuM9VY1sx9pq24z7wCeitcoGS2rEjeUS8d8P6kfggA+/g0AOgAAIAAguy8p4+MFfgQZ1S/F9EEYd2+NthzqT992B5uTYGxaYkgACAABAAEAAQADAAdlY2guY29tAAA=";
+
+        for settings in [
+            XhttpDownloadTlsSettings {
+                ech_config_list: Some(ECH_CONFIG_LIST.into()),
+                ..Default::default()
+            },
+            XhttpDownloadTlsSettings {
+                ech_config_list: Some("hidden.example+https://1.1.1.1/dns-query".into()),
+                ech_socket_settings: Some(Box::default()),
+                ..Default::default()
+            },
+            XhttpDownloadTlsSettings {
+                ech_server_keys: Some(ECH_SERVER_KEYS.into()),
+                ..Default::default()
+            },
+        ] {
+            settings.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn xhttp_tls_client_validation_ignores_server_only_fields() {
+        let settings = XhttpDownloadTlsSettings {
+            reject_unknown_sni: Some(true),
+            ech_server_keys: Some("intentionally-not-a-server-key-list".into()),
+            ..Default::default()
+        };
+        settings.validate_client().unwrap();
+        assert!(settings.validate().unwrap_err().contains("echServerKeys"));
+    }
 }

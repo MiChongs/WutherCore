@@ -11,6 +11,10 @@ readme = "../../README.md"
 keywords = ["proxy", "networking", "tun", "dns", "rust"]
 categories = ["command-line-utilities", "network-programming"]
 
+[features]
+default = []
+naive = ["core-outbound/naive"]
+
 [[bin]]
 name = "wuther-core"
 path = "src/main.rs"

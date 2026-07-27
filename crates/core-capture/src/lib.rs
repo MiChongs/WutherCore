@@ -31,6 +31,8 @@ pub mod fakeip_dns;
 pub mod frame_cache;
 pub mod gc;
 pub mod ipset;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_netlink;
 pub mod nat;
 pub mod net_monitor;
 pub mod net_monitor_event;
@@ -67,8 +69,8 @@ pub use dial_meta::{DialTarget, DnsMode, build_dial_target};
 pub use doctor::{DoctorReport, diagnose};
 pub use eim_nat::{EimEntry, EimKey, EimNatTable};
 pub use engine::{
-    AutoRedirectMarks, CaptureEngine, CaptureError, CaptureEvent, CaptureFilters, CapturePlan,
-    EngineKind,
+    AutoRedirectMarks, CaptureCapabilities, CaptureEngine, CaptureError, CaptureEvent,
+    CaptureFilters, CapturePlan, EngineKind,
 };
 pub use ipset::{
     IpSetPrefixSemantics, IpSetPrefixSet, IpSetPrefixSnapshot, IpSetPrefixStatus, IpSetProvider,
@@ -93,5 +95,5 @@ pub use tun_dispatch::{TunDispatcher, TunDispatcherHandles};
 pub use tun_inbound::{TunDropReason, TunInbound, TunOutboundMeta, TunPacket, TunSession};
 pub use tun_io::{TunIo, TunIoError, open_tun_device};
 pub use udp_forwarder::{UdpForwarderConfig, run_return_loop, send_one as udp_send_one};
-pub use udp_session::{UdpFlowKey, UdpSession, UdpSessionTable};
+pub use udp_session::{UdpFlowKey, UdpNatKey, UdpSession, UdpSessionTable};
 pub use wireguard_tun::WireGuardTunIo;

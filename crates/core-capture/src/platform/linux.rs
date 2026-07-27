@@ -654,6 +654,7 @@ impl CaptureEngine for LinuxTun {
             // route, rule, firewall, or interface mutation.
             g.crash_recovery = Some(crate::platform::linux_recovery::LinuxCaptureGuard::acquire(
                 &effective_plan,
+                crate::platform::linux_recovery::RecoveryMode::Tun,
             )?);
             Self::configure_iface(&effective_plan, device.as_ref())?;
 
@@ -2478,14 +2479,27 @@ impl LinuxTproxy {
                 "IPv6 TPROXY 需要 ip6tables mangle/TPROXY 支持；当前找不到 ip6tables".into(),
             ));
         }
-        if !ip_rule_supported() {
-            return Err(CaptureError::Doctor(
-                "TPROXY 需要 ip rule 支持，用于 fwmark local route".into(),
-            ));
-        }
+        crate::linux_netlink::install_tproxy_policy(
+            plan.ipv6_enabled,
+            tproxy_rules::TPROXY_FWMARK,
+            tproxy_rules::TPROXY_ROUTE_TABLE,
+        )
+        .map_err(|reason| {
+            CaptureError::Doctor(format!(
+                "TPROXY native netlink policy-route setup failed: {reason}"
+            ))
+        })?;
 
-        for cmd in tproxy_rules::setup_commands(plan, outbound_mark) {
+        for cmd in tproxy_rules::setup_commands(plan, outbound_mark)
+            .into_iter()
+            .filter(|cmd| cmd.program != "ip")
+        {
             run_tproxy_command(&cmd).map_err(|reason| {
+                crate::linux_netlink::remove_tproxy_policy(
+                    plan.ipv6_enabled,
+                    tproxy_rules::TPROXY_FWMARK,
+                    tproxy_rules::TPROXY_ROUTE_TABLE,
+                );
                 CaptureError::Doctor(format!(
                     "TPROXY rule command failed: `{}`: {reason}",
                     cmd.render()
@@ -2503,7 +2517,10 @@ impl LinuxTproxy {
     }
 
     fn revert_rules(plan: &CapturePlan) {
-        for cmd in tproxy_rules::cleanup_commands(plan) {
+        for cmd in tproxy_rules::cleanup_commands(plan)
+            .into_iter()
+            .filter(|cmd| cmd.program != "ip")
+        {
             if let Err(reason) = run_tproxy_command(&cmd) {
                 debug!(
                     target: "capture::tproxy::rules",
@@ -2513,6 +2530,11 @@ impl LinuxTproxy {
                 );
             }
         }
+        crate::linux_netlink::remove_tproxy_policy(
+            plan.ipv6_enabled,
+            tproxy_rules::TPROXY_FWMARK,
+            tproxy_rules::TPROXY_ROUTE_TABLE,
+        );
     }
 }
 
@@ -2579,6 +2601,8 @@ impl CaptureEngine for LinuxTproxy {
         if g.on {
             return Ok(());
         }
+        crate::platform::linux_caps::require_net_admin("TPROXY capture")
+            .map_err(CaptureError::Doctor)?;
         let outbound_mark = self
             .plan
             .auto_redirect_marks
@@ -2685,14 +2709,22 @@ impl CaptureEngine for LinuxTproxy {
 
 pub struct LinuxRedirect {
     plan: CapturePlan,
-    state: Mutex<bool>,
+    state: Mutex<RedirectState>,
+}
+
+#[derive(Default)]
+struct RedirectState {
+    on: bool,
+    backend: Option<AutoRedirectBackend>,
+    listener_tasks: Option<JoinSet<()>>,
+    listener_stops: Vec<oneshot::Sender<()>>,
 }
 
 impl LinuxRedirect {
     pub fn new(plan: CapturePlan) -> Self {
         Self {
             plan,
-            state: Mutex::new(false),
+            state: Mutex::new(RedirectState::default()),
         }
     }
 }
@@ -2707,37 +2739,81 @@ impl CaptureEngine for LinuxRedirect {
     }
     async fn start(
         self: Arc<Self>,
-        _events: mpsc::Sender<CaptureEvent>,
-        _runtime: Arc<core_runtime::Runtime>,
+        events: mpsc::Sender<CaptureEvent>,
+        runtime: Arc<core_runtime::Runtime>,
     ) -> Result<(), CaptureError> {
         let mut g = self.state.lock().await;
-        if *g {
+        if g.on {
             return Ok(());
         }
-        let st = std::process::Command::new("iptables")
-            .args(["-t", "nat", "-N", "WUTHERCORE_REDIR"])
-            .status()
-            .map_err(|e| CaptureError::Doctor(format!("iptables: {e}")))?;
-        if !st.success() {
-            warn!(target: "capture", "iptables -N 失败（可能已存在）");
+        crate::platform::linux_caps::require_net_admin("REDIRECT capture")
+            .map_err(CaptureError::Doctor)?;
+        if g.backend.is_some() || g.listener_tasks.is_some() {
+            return Err(CaptureError::Nat(
+                "redirect has a partial activation ledger; stop must clean it before retry".into(),
+            ));
         }
-        *g = true;
-        info!(target: "capture", "linux redirect (TCP-only) started");
+
+        // Bind before publishing firewall rules. This proves both enabled
+        // address families are serviceable and gives nftables exact ports.
+        let listeners = bind_tcp_redirect_listener_set(self.plan.ipv6_enabled)?;
+        let ports =
+            redirect_ports_from_addrs(listeners.iter().map(RedirectTcpListener::local_addr))?;
+
+        // A checked, atomic nft batch is the publication boundary. If this
+        // fails, dropping the pre-bound listeners leaves no host mutation.
+        let backend = linux_auto_redirect::install(&self.plan, ports)?;
+
+        let mut listener_tasks = JoinSet::new();
+        let mut listener_stops = Vec::with_capacity(listeners.len());
+        let mut bound_addrs = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let (listener, local_addr) = listener.into_parts();
+            bound_addrs.push(local_addr);
+            let (stop_tx, stop_rx) = oneshot::channel();
+            listener_stops.push(stop_tx);
+            let events = events.clone();
+            let runtime = runtime.clone();
+            listener_tasks.spawn(async move {
+                if let Err(error) = run_tcp_redirect(listener, events, runtime, stop_rx).await {
+                    warn!(
+                        target: "capture::redirect",
+                        %local_addr,
+                        %error,
+                        "TCP REDIRECT listener stopped with error"
+                    );
+                }
+            });
+        }
+
+        g.backend = Some(backend);
+        g.listener_tasks = Some(listener_tasks);
+        g.listener_stops = listener_stops;
+        g.on = true;
+        info!(
+            target: "capture::redirect",
+            addresses = ?bound_addrs,
+            ?backend,
+            "linux/android TCP REDIRECT started"
+        );
         Ok(())
     }
     async fn stop(self: Arc<Self>) -> Result<(), CaptureError> {
         let mut g = self.state.lock().await;
-        if !*g {
+        if !g.on && g.backend.is_none() && g.listener_tasks.is_none() {
             return Ok(());
         }
-        let _ = std::process::Command::new("iptables")
-            .args(["-t", "nat", "-F", "WUTHERCORE_REDIR"])
-            .status();
-        let _ = std::process::Command::new("iptables")
-            .args(["-t", "nat", "-X", "WUTHERCORE_REDIR"])
-            .status();
-        *g = false;
-        info!(target: "capture", "linux redirect stopped");
+        if let Some(backend) = g.backend {
+            // Keep the ledger intact on failure so a supervisor retry can
+            // finish cleanup instead of forgetting live host rules.
+            linux_auto_redirect::uninstall(backend)?;
+            g.backend = None;
+        }
+        let mut listener_tasks = g.listener_tasks.take().unwrap_or_else(JoinSet::new);
+        let mut listener_stops = std::mem::take(&mut g.listener_stops);
+        g.on = false;
+        stop_listener_tasks(&mut listener_stops, &mut listener_tasks).await;
+        info!(target: "capture::redirect", "linux/android TCP REDIRECT stopped");
         Ok(())
     }
 }

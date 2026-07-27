@@ -26,7 +26,6 @@ use rustls::{
     CertificateCompressionAlgorithm, CertificateError, CipherSuite, ClientConfig, ClientConnection,
     DigitallySignedStruct, Error as RustlsError, NamedGroup, ProtocolVersion, SignatureScheme,
 };
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector as TokioTlsConnector;
 use zeroize::Zeroize;
 
@@ -1083,7 +1082,7 @@ impl RealityTlsSession for RustlsRealityTlsSession {
 
     async fn complete_with_outcome(
         self: Box<Self>,
-        tcp_stream: TcpStream,
+        tcp_stream: BoxedTransportStream,
         prepared: crate::reality::RealityPreparedHandshake,
         mldsa65_verify: Option<Vec<u8>>,
     ) -> Result<RealityTlsSessionOutcome, TransportError> {

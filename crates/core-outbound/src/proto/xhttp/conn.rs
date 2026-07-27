@@ -1,182 +1,310 @@
-//! XHTTP Conn —— `writer + reader + onClose` 抽象，与 mihomo `transport/xhttp/conn.go` 等价。
+//! XHTTP 双向流适配。
 //!
-//! 客户端三种模式都返回这个统一的 BoxedStream-like Conn：
-//! - **stream-one** / **stream-up**：reader = response body, writer = request body pipe
-//! - **packet-up**：reader = response body, writer = PacketUpWriter（序列化 POST）
+//! HTTP/1.1、HTTP/2 与 HTTP/3 的响应体最终都汇入一个有界 channel，
+//! 因而这里不依赖具体 HTTP 实现。写端同样先取得 channel permit 再复制
+//! 调用者的缓冲区，严格遵守 `AsyncWrite::poll_write` 的重试语义并提供背压。
 
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BytesMut};
-use hyper::body::{Body as HyperBody, Incoming};
-use parking_lot::Mutex as PlMutex;
+use bytes::{Buf, Bytes};
+use parking_lot::Mutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc,
+    sync::{Notify, mpsc},
 };
 
-/// WaitReader：阻塞 read 直到底层 reader 被 set
-pub struct WaitReader {
-    inner: Arc<PlMutex<WaitState>>,
-    notify: Arc<tokio::sync::Notify>,
+/// 可跨异步任务复制的 I/O 错误。
+#[derive(Clone, Debug)]
+pub struct IoFailure {
+    kind: std::io::ErrorKind,
+    message: Arc<str>,
 }
 
-enum WaitState {
-    Pending,
-    Ready(Incoming, BytesMut),
-    Error(std::io::Error),
-    Closed,
-}
-
-impl WaitReader {
-    pub fn new() -> Self {
+impl IoFailure {
+    /// 创建可复制的 I/O 错误。
+    pub fn new(kind: std::io::ErrorKind, message: impl Into<String>) -> Self {
         Self {
-            inner: Arc::new(PlMutex::new(WaitState::Pending)),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            kind,
+            message: Arc::from(message.into()),
         }
     }
 
-    pub fn handle(&self) -> WaitReaderHandle {
-        WaitReaderHandle {
-            inner: self.inner.clone(),
-            notify: self.notify.clone(),
+    /// 创建 `Other` 类型错误。
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::new(std::io::ErrorKind::Other, message)
+    }
+
+    /// 还原为标准 I/O 错误。
+    pub fn to_io_error(&self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message.to_string())
+    }
+}
+
+impl From<std::io::Error> for IoFailure {
+    fn from(value: std::io::Error) -> Self {
+        Self::new(value.kind(), value.to_string())
+    }
+}
+
+/// 同一条 XHTTP 逻辑流的取消与首个错误状态。
+#[derive(Debug, Default)]
+pub struct IoState {
+    cancelled: AtomicBool,
+    first_error: Mutex<Option<IoFailure>>,
+    notify: Notify,
+}
+
+impl IoState {
+    /// 创建共享状态。
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 记录首个错误并取消流。
+    pub fn fail(&self, failure: IoFailure) {
+        let mut error = self.first_error.lock();
+        if error.is_none() {
+            *error = Some(failure);
+        }
+        drop(error);
+        self.cancel();
+    }
+
+    /// 取消流并唤醒所有等待者。
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// 流是否已取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// 返回首个错误的副本。
+    pub fn error(&self) -> Option<std::io::Error> {
+        self.first_error.lock().as_ref().map(IoFailure::to_io_error)
+    }
+
+    /// 不丢唤醒的取消等待：先注册 waiter，再检查标志。
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
         }
     }
 }
 
-#[derive(Clone)]
-pub struct WaitReaderHandle {
-    inner: Arc<PlMutex<WaitState>>,
-    notify: Arc<tokio::sync::Notify>,
+/// 响应 channel 中的数据帧或终止错误。
+pub type ResponseItem = Result<Bytes, IoFailure>;
+
+/// 协议无关的响应体读取端。
+pub struct ResponseReader {
+    rx: mpsc::Receiver<ResponseItem>,
+    leftover: Bytes,
+    eof: bool,
+    state: Arc<IoState>,
 }
 
-impl WaitReaderHandle {
-    pub fn set(&self, body: Incoming) {
-        let mut g = self.inner.lock();
-        if matches!(*g, WaitState::Closed) {
-            return;
-        }
-        *g = WaitState::Ready(body, BytesMut::new());
-        self.notify.notify_waiters();
-    }
-
-    pub fn fail(&self, err: std::io::Error) {
-        let mut g = self.inner.lock();
-        if matches!(*g, WaitState::Closed | WaitState::Ready(_, _)) {
-            return;
-        }
-        *g = WaitState::Error(err);
-        self.notify.notify_waiters();
-    }
-
-    pub fn close(&self) {
-        let mut g = self.inner.lock();
-        *g = WaitState::Closed;
-        self.notify.notify_waiters();
+impl ResponseReader {
+    /// 创建读取端与对应的有界发送端。
+    pub fn channel(capacity: usize, state: Arc<IoState>) -> (Self, mpsc::Sender<ResponseItem>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (
+            Self {
+                rx,
+                leftover: Bytes::new(),
+                eof: false,
+                state,
+            },
+            tx,
+        )
     }
 }
 
-impl AsyncRead for WaitReader {
+impl AsyncRead for ResponseReader {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        dst: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut g = self.inner.lock();
-        // 取出 incoming 的可变借用 + leftover，需要小心处理
-        // 这里把 state 的 match 拆分以便释放锁
-        match &mut *g {
-            WaitState::Pending => {
-                drop(g);
-                let notify = self.notify.clone();
-                let mut fut = Box::pin(async move { notify.notified().await });
-                match Future::poll(fut.as_mut(), cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(()) => Poll::Ready(Ok(())),
+        if !self.leftover.is_empty() {
+            let len = dst.remaining().min(self.leftover.len());
+            dst.put_slice(&self.leftover[..len]);
+            self.leftover.advance(len);
+            return Poll::Ready(Ok(()));
+        }
+        if self.eof || dst.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                let len = dst.remaining().min(data.len());
+                dst.put_slice(&data[..len]);
+                if len < data.len() {
+                    self.leftover = data.slice(len..);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.eof = true;
+                Poll::Ready(Err(error.to_io_error()))
+            }
+            Poll::Ready(None) => {
+                self.eof = true;
+                if let Some(error) = self.state.error() {
+                    Poll::Ready(Err(error))
+                } else {
+                    Poll::Ready(Ok(()))
                 }
             }
-            WaitState::Ready(incoming, leftover) => {
-                if !leftover.is_empty() {
-                    let n = std::cmp::min(buf.remaining(), leftover.len());
-                    buf.put_slice(&leftover[..n]);
-                    leftover.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                match Pin::new(incoming).poll_frame(cx) {
-                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                        Ok(data) => {
-                            let n = std::cmp::min(buf.remaining(), data.len());
-                            buf.put_slice(&data[..n]);
-                            if data.len() > n {
-                                leftover.extend_from_slice(&data[n..]);
-                            }
-                            Poll::Ready(Ok(()))
-                        }
-                        Err(_) => Poll::Ready(Ok(())),
-                    },
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("xhttp body: {e}"),
-                    ))),
-                    Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            WaitState::Error(e) => {
-                let kind = e.kind();
-                let msg = e.to_string();
-                Poll::Ready(Err(std::io::Error::new(kind, msg)))
-            }
-            WaitState::Closed => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// PipeWriter：把 write 转发到 mpsc channel（被 hyper request body 消费）
+type ReserveFuture = Pin<Box<dyn Future<Output = Result<mpsc::OwnedPermit<Bytes>, ()>> + Send>>;
+
+/// 把代理协议写入有界请求体 channel。
+///
+/// `reserve_owned` future 会跨 poll 保存；Pending 时不会复制数据，也不会产生
+/// 重复消息。取得 permit 后才复制当前 `data`，所以完全符合 `AsyncWrite` 契约。
 pub struct PipeWriter {
-    tx: mpsc::Sender<Vec<u8>>,
-    closed: bool,
+    tx: Option<mpsc::Sender<Bytes>>,
+    reserve: Option<ReserveFuture>,
+    state: Arc<IoState>,
 }
 
 impl PipeWriter {
-    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { tx, closed: false }
+    /// 创建写入端与对应的请求体接收端。
+    pub fn channel(capacity: usize, state: Arc<IoState>) -> (Self, mpsc::Receiver<Bytes>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (
+            Self {
+                tx: Some(tx),
+                reserve: None,
+                state,
+            },
+            rx,
+        )
+    }
+
+    /// 用现有有界 channel 发送端构造写端。
+    pub fn from_sender(tx: mpsc::Sender<Bytes>, state: Arc<IoState>) -> Self {
+        Self {
+            tx: Some(tx),
+            reserve: None,
+            state,
+        }
     }
 }
 
 impl AsyncWrite for PipeWriter {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if self.closed {
-            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        if let Some(error) = self.state.error() {
+            return Poll::Ready(Err(error));
         }
-        let chunk = data.to_vec();
-        let n = chunk.len();
-        let tx = self.tx.clone();
-        let mut fut = Box::pin(async move { tx.send(chunk).await });
-        match Future::poll(fut.as_mut(), cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+        if self.state.is_cancelled() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "xhttp stream cancelled",
+            )));
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        };
+
+        if self.reserve.is_none() {
+            let tx = tx.clone();
+            let state = self.state.clone();
+            self.reserve = Some(Box::pin(async move {
+                tokio::select! {
+                    permit = tx.reserve_owned() => permit.map_err(|_| ()),
+                    _ = state.cancelled() => Err(()),
+                }
+            }));
+        }
+        let reserve = self.reserve.as_mut().expect("reserve initialized");
+        match Future::poll(reserve.as_mut(), cx) {
+            Poll::Ready(Ok(permit)) => {
+                self.reserve = None;
+                if let Some(error) = self.state.error() {
+                    return Poll::Ready(Err(error));
+                }
+                if self.state.is_cancelled() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "xhttp stream cancelled",
+                    )));
+                }
+                permit.send(Bytes::copy_from_slice(data));
+                Poll::Ready(Ok(data.len()))
+            }
+            Poll::Ready(Err(_)) => {
+                self.reserve = None;
+                Poll::Ready(Err(self.state.error().unwrap_or_else(|| {
+                    let message = if self.state.is_cancelled() {
+                        "xhttp stream cancelled"
+                    } else {
+                        "xhttp request body closed"
+                    };
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, message)
+                })))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
+
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+        if let Some(error) = self.state.error() {
+            Poll::Ready(Err(error))
+        } else if self.state.is_cancelled() {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "xhttp stream cancelled",
+            )))
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.closed = true;
-        Poll::Ready(Ok(()))
+        self.reserve = None;
+        self.tx = None;
+        if let Some(error) = self.state.error() {
+            Poll::Ready(Err(error))
+        } else if self.state.is_cancelled() {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "xhttp stream cancelled",
+            )))
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 }
 
-/// XConn：组合 reader + writer + on_close
+/// 组合响应读取端与请求写入端。
 pub struct XConn<R, W> {
     pub reader: R,
     pub writer: W,
@@ -192,8 +320,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> XConn<R, W> {
         }
     }
 
-    pub fn with_on_close(mut self, f: impl FnOnce() + Send + 'static) -> Self {
-        self.on_close = Some(Box::new(f));
+    pub fn with_on_close(mut self, callback: impl FnOnce() + Send + 'static) -> Self {
+        self.on_close = Some(Box::new(callback));
         self
     }
 }
@@ -202,9 +330,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncRead for XConn<R, W> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        dst: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        Pin::new(&mut self.reader).poll_read(cx, dst)
     }
 }
 
@@ -212,13 +340,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for XConn<R, W> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.writer).poll_write(cx, buf)
+        Pin::new(&mut self.writer).poll_write(cx, data)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
     }
@@ -226,16 +356,69 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for XConn<R, W> {
 
 impl<R, W> Drop for XConn<R, W> {
     fn drop(&mut self) {
-        if let Some(f) = self.on_close.take() {
-            f();
+        if let Some(callback) = self.on_close.take() {
+            callback();
         }
     }
 }
 
-/// 生成 16-byte hex session id
-pub fn new_session_id() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut b);
-    hex::encode(b)
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn pipe_writer_backpressures_without_duplicate_data() {
+        let state = IoState::shared();
+        let (mut writer, mut rx) = PipeWriter::channel(1, state);
+        writer.write_all(b"one").await.unwrap();
+
+        let blocked = tokio::time::timeout(Duration::from_millis(20), writer.write_all(b"two"));
+        assert!(blocked.await.is_err());
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"one"));
+
+        writer.write_all(b"two").await.unwrap();
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"two"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_reaches_writer() {
+        let state = IoState::shared();
+        let (mut writer, _rx) = PipeWriter::channel(1, state.clone());
+        state.fail(IoFailure::other("remote upload failed"));
+        let error = writer.write_all(b"x").await.unwrap_err();
+        assert!(error.to_string().contains("remote upload failed"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_writer_waiting_for_channel_capacity() {
+        let state = IoState::shared();
+        let (mut writer, _rx) = PipeWriter::channel(1, state.clone());
+        writer.write_all(b"one").await.unwrap();
+        let blocked = tokio::spawn(async move { writer.write_all(b"two").await });
+        tokio::task::yield_now().await;
+        state.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("cancelled writer remained blocked")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn response_reader_propagates_body_error() {
+        let state = IoState::shared();
+        let (mut reader, tx) = ResponseReader::channel(1, state);
+        tx.send(Err(IoFailure::other("bad response body")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut byte = [0_u8; 1];
+        let error = reader.read(&mut byte).await.unwrap_err();
+        assert!(error.to_string().contains("bad response body"));
+    }
 }

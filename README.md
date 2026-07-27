@@ -70,7 +70,7 @@ WutherCore 读取 YAML 配置，负责订阅更新、节点选择、规则分流
 
 | 基础 | Shadowsocks 系列 | TLS / UUID 系列 | QUIC / 隧道 |
 | --- | --- | --- | --- |
-| Direct、Block、HTTP、SOCKS5、DNS Hijack | Shadowsocks、Shadowsocks 2022、SSR、Snell | Trojan、VLESS、VMess、AnyTLS | Hysteria、Hysteria 2、TUIC、WireGuard、SSH、Mieru、Sudoku、TrustTunnel |
+| Direct、Block、HTTP、SOCKS5、DNS Hijack | Shadowsocks、Shadowsocks 2022、SSR、Snell | Trojan、VLESS、VMess、AnyTLS | Hysteria、Hysteria 2、TUIC、WireGuard、SSH、Mieru、Sudoku、TrustTunnel、[Naive（可选）](docs/NAIVE.md) |
 
 不同协议的 UDP、复用和传输层组合并不完全相同。功能矩阵只表示代码路径已经实现，不代替与具体服务端版本的兼容性测试。
 

@@ -135,13 +135,17 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
 
     let proto = NodeProtocol::from_scheme(&kind);
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
+    node.user = str_g("username").or_else(|| str_g("user"));
     node.password = str_g("password");
     node.uuid = str_g("uuid");
     node.method = str_g("cipher").or_else(|| str_g("method"));
     node.tls = g("tls").and_then(|v| v.as_bool()).unwrap_or(false)
         || matches!(
             &proto,
-            NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic
+            NodeProtocol::Trojan
+                | NodeProtocol::Naive
+                | NodeProtocol::Hysteria2
+                | NodeProtocol::Tuic
         );
     node.sni = str_g("sni").or_else(|| str_g("servername"));
     if let Some(net) = str_g("network") {
@@ -169,6 +173,8 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
                 | "type"
                 | "server"
                 | "port"
+                | "username"
+                | "user"
                 | "password"
                 | "uuid"
                 | "cipher"
@@ -228,6 +234,24 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
         }
     }
 
+    // SSH 的主机公钥和算法字段在 mihomo 中是字符串数组。ParsedNode 的
+    // 兼容参数表只存字符串，因此分别用换行和逗号保存，避免通用标量路径
+    // 静默丢弃这些安全关键字段。
+    if matches!(proto, NodeProtocol::Ssh) {
+        for (field, separator) in [("host-key", "\n"), ("host-key-algorithms", ",")] {
+            if let Some(sequence) = g(field).and_then(|value| value.as_sequence().cloned()) {
+                let joined = sequence
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(separator);
+                if !joined.is_empty() {
+                    node.params.insert(field.into(), joined);
+                }
+            }
+        }
+    }
+
     // 4. transport-opts 平铺
     flatten_transport_opts(m, "ws-opts", &["path", "headers"], &mut node.params, "ws-");
     flatten_transport_opts(m, "grpc-opts", &["grpc-service-name"], &mut node.params, "");
@@ -275,6 +299,18 @@ fn clash_proxy_to_node(m: &serde_yaml::Mapping) -> Option<ParsedNode> {
             .and_then(|v| v.as_str())
         {
             node.params.insert("serviceName".into(), svc.to_string());
+        }
+    }
+
+    // Naive's extra headers are a map rather than scalars. Preserve them with
+    // an unambiguous prefix for core-outbound.
+    for key in ["extra-headers", "extra_headers"] {
+        if let Some(headers) = g(key).and_then(|v| v.as_mapping().cloned()) {
+            for (name, value) in headers {
+                if let (Some(name), Some(value)) = (name.as_str(), scalar_to_string(&value)) {
+                    node.params.insert(format!("extra-header.{name}"), value);
+                }
+            }
         }
     }
 
@@ -446,6 +482,40 @@ proxies:
     }
 
     #[test]
+    fn parse_naive_clash_headers_and_transport_options() {
+        let yaml = r#"
+proxies:
+  - name: Naive-H3
+    type: naive
+    server: proxy.example.com
+    port: 443
+    username: alice
+    password: secret
+    udp: true
+    udp-over-tcp: true
+    quic: true
+    extra-headers:
+      X-Client: WutherCore
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].protocol, NodeProtocol::Naive);
+        assert_eq!(nodes[0].user.as_deref(), Some("alice"));
+        assert_eq!(
+            nodes[0]
+                .params
+                .get("extra-header.X-Client")
+                .map(String::as_str),
+            Some("WutherCore")
+        );
+        assert_eq!(
+            nodes[0].params.get("udp-over-tcp").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(nodes[0].params.get("quic").map(String::as_str), Some("1"));
+    }
+
+    #[test]
     fn parse_clash_wireguard_preserves_lists_and_multi_peer_objects() {
         let yaml = r#"
 proxies:
@@ -491,6 +561,40 @@ proxies:
             serde_json::from_str(node.params.get("peers").unwrap()).unwrap();
         assert_eq!(peers.as_array().unwrap().len(), 2);
         assert_eq!(peers[0]["reserved"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn parse_clash_ssh_preserves_username_host_keys_and_algorithms() {
+        let yaml = r#"
+proxies:
+  - name: SSH
+    type: ssh
+    server: ssh.example.com
+    port: 22
+    username: alice
+    password: secret
+    host-key:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZha2U"
+      - "rsa-sha2-256 AAAAB3NzaC1yc2EAAAADAQABAAABAQ"
+    host-key-algorithms: [ed25519, rsa]
+"#;
+        let nodes = parse_feed_payload(yaml.as_bytes(), FormatHint::Auto);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].user.as_deref(), Some("alice"));
+        assert_eq!(
+            nodes[0].params.get("host-key").map(String::as_str),
+            Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZha2U\n\
+                 rsa-sha2-256 AAAAB3NzaC1yc2EAAAADAQABAAABAQ"
+            )
+        );
+        assert_eq!(
+            nodes[0]
+                .params
+                .get("host-key-algorithms")
+                .map(String::as_str),
+            Some("ed25519,rsa")
+        );
     }
 
     #[test]

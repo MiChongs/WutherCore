@@ -12,11 +12,14 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
     let listen = cfg.listen.get_or_insert_with(|| Listen {
         local: None,
         panel: None,
+        xhttp: None,
+        shadowsocks: None,
         share: None,
         auth: vec![],
         reality: vec![],
         wireguard: vec![],
         young: vec![],
+        grpc: vec![],
     });
     if listen.local.is_none() {
         listen.local = match profile {

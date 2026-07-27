@@ -148,13 +148,9 @@ async fn query(
     record_type: RecordType,
 ) -> std::io::Result<(Vec<IpAddr>, Duration)> {
     let id = rand::thread_rng().r#gen::<u16>();
-    let mut request = Message::new();
-    request
-        .set_id(id)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(name, record_type));
+    let mut request = Message::new(id, MessageType::Query, OpCode::Query);
+    request.metadata.recursion_desired = true;
+    request.add_query(Query::query(name, record_type));
     let request = request
         .to_bytes()
         .map_err(|error| io_err(format!("wireguard DNS encode failed: {error}")))?;
@@ -179,10 +175,10 @@ async fn query(
     response.truncate(length);
     let message = Message::from_bytes(&response)
         .map_err(|error| io_err(format!("wireguard DNS response is malformed: {error}")))?;
-    if message.id() != id || message.message_type() != MessageType::Response {
+    if message.metadata.id != id || message.metadata.message_type != MessageType::Response {
         return Err(io_err("wireguard DNS response id/type mismatch"));
     }
-    if message.truncated() {
+    if message.metadata.truncation {
         return query_tcp(device, dns, id, request, record_type).await;
     }
     parse_response(message, record_type)
@@ -212,7 +208,7 @@ async fn query_tcp(
         stream.read_exact(&mut response).await?;
         let message = Message::from_bytes(&response)
             .map_err(|error| io_err(format!("wireguard DNS TCP response is malformed: {error}")))?;
-        if message.id() != id || message.message_type() != MessageType::Response {
+        if message.metadata.id != id || message.metadata.message_type != MessageType::Response {
             return Err(io_err("wireguard DNS TCP response id/type mismatch"));
         }
         parse_response(message, record_type)
@@ -230,23 +226,23 @@ fn parse_response(
     message: Message,
     record_type: RecordType,
 ) -> std::io::Result<(Vec<IpAddr>, Duration)> {
-    if message.response_code() != ResponseCode::NoError {
+    if message.metadata.response_code != ResponseCode::NoError {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("wireguard DNS returned {}", message.response_code()),
+            format!("wireguard DNS returned {}", message.metadata.response_code),
         ));
     }
     let mut addresses = Vec::new();
     let mut ttl = MAX_CACHE_TTL;
-    for answer in message.answers() {
-        match answer.data() {
-            Some(RData::A(address)) if record_type == RecordType::A => {
+    for answer in &message.answers {
+        match &answer.data {
+            RData::A(address) if record_type == RecordType::A => {
                 addresses.push(IpAddr::V4((*address).into()));
-                ttl = ttl.min(Duration::from_secs(u64::from(answer.ttl())));
+                ttl = ttl.min(Duration::from_secs(u64::from(answer.ttl)));
             }
-            Some(RData::AAAA(address)) if record_type == RecordType::AAAA => {
+            RData::AAAA(address) if record_type == RecordType::AAAA => {
                 addresses.push(IpAddr::V6((*address).into()));
-                ttl = ttl.min(Duration::from_secs(u64::from(answer.ttl())));
+                ttl = ttl.min(Duration::from_secs(u64::from(answer.ttl)));
             }
             _ => {}
         }
@@ -271,7 +267,7 @@ mod tests {
     #[test]
     fn response_parser_accepts_a_and_aaaa() {
         let name = Name::from_ascii("example.test").unwrap();
-        let mut v4 = Message::new();
+        let mut v4 = Message::response(0, OpCode::Query);
         v4.add_answer(Record::from_rdata(
             name.clone(),
             30,
@@ -281,7 +277,7 @@ mod tests {
         assert_eq!(addresses, vec!["192.0.2.1".parse::<IpAddr>().unwrap()]);
         assert_eq!(ttl, Duration::from_secs(30));
 
-        let mut v6 = Message::new();
+        let mut v6 = Message::response(0, OpCode::Query);
         v6.add_answer(Record::from_rdata(
             name,
             60,

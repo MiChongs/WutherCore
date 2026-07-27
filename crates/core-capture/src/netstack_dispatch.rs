@@ -293,6 +293,7 @@ impl NetstackDispatcher {
             inbound: self.inbound.clone(),
             dns_service: self.dns_service.clone(),
             frame_formats: self.frame_formats.clone(),
+            endpoint_independent_nat: self.plan.endpoint_independent_nat,
         };
         crate::udp_handle::handle_udp_packet(&ctx, device, handler, inner_src, outer_dst, payload)
             .await;

@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use tokio::net::UdpSocket;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -65,17 +65,20 @@ impl EimNatTable {
     where
         F: FnOnce() -> std::io::Result<Arc<UdpSocket>>,
     {
-        if let Some(mut e) = self.map.get_mut(&key) {
-            e.last_seen = Instant::now();
-            return Ok(e.outbound.clone());
+        match self.map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().last_seen = Instant::now();
+                Ok(entry.get().outbound.clone())
+            }
+            Entry::Vacant(entry) => {
+                let outbound = build()?;
+                entry.insert(EimEntry {
+                    outbound: outbound.clone(),
+                    last_seen: Instant::now(),
+                });
+                Ok(outbound)
+            }
         }
-        let sock = build()?;
-        let entry = EimEntry {
-            outbound: sock.clone(),
-            last_seen: Instant::now(),
-        };
-        self.map.insert(key, entry);
-        Ok(sock)
     }
 
     pub fn touch(&self, key: &EimKey) {

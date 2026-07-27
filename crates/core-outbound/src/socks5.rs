@@ -281,16 +281,27 @@ impl UdpSocketLike for Socks5Udp {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.recv_from_endpoint(buf).await.map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<SocketAddr>)> {
         let mut packet = vec![0u8; buf.len().saturating_add(512).max(1500)];
         let n = self.sock.recv(&mut packet).await?;
         if n < 3 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
             return Err(io_err("invalid socks5 udp header"));
         }
-        let (_, _, used) = decode_socks_addr(&packet[3..n])?;
+        let (host, port, used) = decode_socks_addr(&packet[3..n])?;
         let payload = &packet[3 + used..n];
         let copy_len = payload.len().min(buf.len());
         buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        Ok(copy_len)
+        let endpoint = host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|address| SocketAddr::new(address, port));
+        Ok((copy_len, endpoint))
     }
 
     async fn close(&self) -> std::io::Result<()> {
@@ -300,6 +311,10 @@ impl UdpSocketLike for Socks5Udp {
         }
         let _ = &self.loopback_guard;
         Ok(())
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
     }
 }
 

@@ -66,9 +66,9 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
     }
 
     // sing-box 字段一致性检查
-    if plan.auto_redirect && !cfg!(any(target_os = "linux", target_os = "android")) {
+    if plan.auto_redirect && !cfg!(target_os = "linux") {
         warnings.push(format!(
-            "auto_redirect 仅在 Linux/Android 生效（当前 {}）",
+            "auto_redirect 当前仅在 root-managed Linux TUN 生效（当前 {}）",
             std::env::consts::OS
         ));
     }
@@ -103,16 +103,31 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
 
     // 平台特定 doctor
     match plan.kind {
-        EngineKind::Tproxy | EngineKind::Redirect => {
+        EngineKind::Tproxy => {
             if !cfg!(target_os = "linux") && !cfg!(target_os = "android") {
-                blockers.push(format!("{:?} 仅 Linux/Android", plan.kind));
-            } else {
-                if !has_tool("nft") && !has_tool("iptables") {
-                    blockers.push(
-                        "缺少 nft 或 iptables —— OpenWrt 请安装 kmod-nft-tproxy 或 iptables-mod-tproxy"
-                            .into(),
-                    );
-                }
+                blockers.push("Tproxy 仅 Linux/Android".into());
+            } else if !has_tool("iptables") {
+                blockers.push(
+                    "TPROXY 需要 iptables mangle/TPROXY（OpenWrt 请安装 iptables-mod-tproxy）"
+                        .into(),
+                );
+            } else if plan.ipv6_enabled && !has_tool("ip6tables") {
+                blockers.push("IPv6 TPROXY 已启用但缺少 ip6tables".into());
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Err(error) = crate::platform::linux_caps::require_net_admin("TPROXY capture") {
+                blockers.push(error);
+            }
+        }
+        EngineKind::Redirect => {
+            if !cfg!(target_os = "linux") && !cfg!(target_os = "android") {
+                blockers.push("Redirect 仅 Linux/Android".into());
+            } else if !has_tool("nft") {
+                blockers.push("Redirect 需要 nftables，以保证规则原子安装和精确回滚".into());
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Err(error) = crate::platform::linux_caps::require_net_admin("REDIRECT capture") {
+                blockers.push(error);
             }
         }
         EngineKind::Tun => {
@@ -125,7 +140,10 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
             #[cfg(target_os = "windows")]
             {
                 if !has_tool("netsh") {
-                    warnings.push("未找到 netsh；可能无法自动写路由表".into());
+                    warnings.push(
+                        "未找到 netsh；路由已使用 IP Helper API，但 DNS 快照/恢复仍可能不可用"
+                            .into(),
+                    );
                 }
             }
             #[cfg(target_os = "macos")]

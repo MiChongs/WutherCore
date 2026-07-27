@@ -8,7 +8,7 @@
 //! 3. 都不可用：返回 `Unsupported`。
 
 #[cfg(target_os = "android")]
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 #[cfg(target_os = "android")]
@@ -22,19 +22,32 @@ use crate::{
 };
 
 #[cfg(target_os = "android")]
-static INJECTED_FD: Mutex<Option<RawFd>> = Mutex::new(None);
+static INJECTED_FD: Mutex<Option<OwnedFd>> = Mutex::new(None);
 
 /// 由 JNI 调用：注入 VpnService 创建的 fd（dup 后所有权交本进程）。
-/// 多次调用以最后一次为准。
+/// 多次调用以最后一次为准；尚未消费的旧 fd 会立即关闭，避免 VPN 重建泄漏。
 #[cfg(target_os = "android")]
 pub fn set_vpn_fd(fd: RawFd) {
-    *INJECTED_FD.lock() = Some(fd);
+    if fd < 0 {
+        return;
+    }
+    let mut pending = INJECTED_FD.lock();
+    if pending
+        .as_ref()
+        .is_some_and(|current| current.as_raw_fd() == fd)
+    {
+        return;
+    }
+    // SAFETY: the JNI contract transfers ownership of detachFd() to native.
+    // OwnedFd closes the replaced descriptor automatically.
+    *pending = Some(unsafe { OwnedFd::from_raw_fd(fd) });
 }
 
-/// 取出 VpnService fd（take 语义，只能取一次）。
+/// 丢弃尚未被 native TUN 消费的 VpnService fd。
 #[cfg(target_os = "android")]
-pub fn take_injected_fd() -> Option<RawFd> {
-    INJECTED_FD.lock().take()
+pub fn clear_vpn_fd() {
+    // Dropping OwnedFd closes a descriptor that startup has not consumed.
+    drop(INJECTED_FD.lock().take());
 }
 
 #[cfg(target_os = "android")]
@@ -67,11 +80,12 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError> {
 
     // 2. 非 root / root TUN 不可用时，才使用 VpnService fd。
     if let Some(fd) = INJECTED_FD.lock().take() {
+        let raw_fd = fd.as_raw_fd();
         info!(
             target: "capture::android",
             iface = %plan.interface_name,
             mtu = plan.mtu,
-            fd,
+            fd = raw_fd,
             "opening TUN from VpnService fd"
         );
         if !core_outbound::has_socket_protector() {
@@ -81,7 +95,7 @@ pub fn open(plan: &CapturePlan) -> Result<Arc<dyn TunIo>, TunIoError> {
             );
         }
         let dev = crate::platform::vpnservice_tun_io::VpnServiceTunIo::from_raw_fd(
-            fd,
+            fd.into_raw_fd(),
             plan.interface_name.clone(),
             plan.mtu,
         )?;

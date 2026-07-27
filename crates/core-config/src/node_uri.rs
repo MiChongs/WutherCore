@@ -11,7 +11,9 @@ use url::Url;
 
 use crate::{
     error::{ConfigError, ConfigResult},
-    model::RealityClientSettings,
+    model::{
+        RealityClientSettings, XhttpConfig, XhttpDownloadRealitySettings, XhttpDownloadTlsSettings,
+    },
 };
 
 /// 出站类型枚举（与 `core-outbound::OutboundKind` 对齐）。
@@ -27,6 +29,7 @@ pub enum NodeProtocol {
     Vmess,
     Vless,
     Trojan,
+    Naive,
     Hysteria,
     Hysteria2,
     Tuic,
@@ -57,6 +60,8 @@ impl NodeProtocol {
             "vmess" => Self::Vmess,
             "vless" => Self::Vless,
             "trojan" => Self::Trojan,
+            "naive" | "naive+https" => Self::Naive,
+            "naive+quic" => Self::Naive,
             "hysteria" => Self::Hysteria,
             "hysteria2" | "hy2" => Self::Hysteria2,
             "tuic" => Self::Tuic,
@@ -84,6 +89,7 @@ impl NodeProtocol {
             Self::Vmess => "vmess",
             Self::Vless => "vless",
             Self::Trojan => "trojan",
+            Self::Naive => "naive",
             Self::Hysteria => "hysteria",
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
@@ -118,11 +124,26 @@ pub struct ParsedNode {
     #[serde(default)]
     pub reality: Option<RealityClientSettings>,
     pub transport: String,
+    /// 结构化传输覆盖；与 URI `params` 并存，注册时强类型字段优先。
+    pub transport_host: Option<String>,
+    pub transport_path: Option<String>,
+    pub transport_service: Option<String>,
+    pub xhttp: Option<XhttpConfig>,
+    /// Strongly typed primary TLS settings. Keeping this object intact avoids
+    /// losing certificate, ECH, pinning, and list semantics in the legacy
+    /// string parameter map.
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    /// Strongly typed primary REALITY settings.
+    pub reality_settings: Option<XhttpDownloadRealitySettings>,
     pub udp: bool,
     /// 原始 URI，便于调试与 explain。
     pub raw: String,
     /// 协议自定义参数（query / json 字段）。
     pub params: std::collections::BTreeMap<String, String>,
+    /// Typed Xray-compatible transport policy. URI nodes leave this empty;
+    /// structured nodes populate it from `streamSettings`.
+    #[serde(default)]
+    pub stream_settings: Option<crate::stream_settings::NodeStreamSettings>,
 }
 
 impl ParsedNode {
@@ -145,9 +166,16 @@ impl ParsedNode {
             sni: None,
             reality: None,
             transport: "tcp".into(),
+            transport_host: None,
+            transport_path: None,
+            transport_service: None,
+            xhttp: None,
+            tls_settings: None,
+            reality_settings: None,
             udp: true,
             raw: String::new(),
             params: Default::default(),
+            stream_settings: None,
         }
     }
 }
@@ -170,6 +198,7 @@ pub fn parse_uri(uri: &str) -> ConfigResult<ParsedNode> {
         NodeProtocol::Vless
         | NodeProtocol::Young
         | NodeProtocol::Trojan
+        | NodeProtocol::Naive
         | NodeProtocol::Hysteria2
         | NodeProtocol::Tuic
         | NodeProtocol::Hysteria => parse_url_like(uri, proto)?,
@@ -225,20 +254,33 @@ fn require_host_port(url: &Url) -> ConfigResult<(String, u16)> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ConfigError::bad_node(format!("URI 缺少端口: {url}")))?;
-    Ok((host.to_string(), port))
+    Ok((
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string(),
+        port,
+    ))
 }
 
 fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     let url = Url::parse(uri).map_err(|e| ConfigError::bad_node(format!("非法 URI: {e}")))?;
     let (host, port) = require_host_port(&url)?;
     let name = fragment_name(&url, &format!("{}-{}", proto.as_str(), host));
-    let params = collect_params(&url);
+    let mut params = collect_params(&url);
+    if scheme_is_naive_quic(uri) {
+        params.insert("quic".into(), "true".into());
+    }
 
     let mut node = ParsedNode::new(name, proto.clone(), host, port);
     node.raw = uri.to_string();
     node.tls = matches!(
         proto,
-        NodeProtocol::Trojan | NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Young
+        NodeProtocol::Trojan
+            | NodeProtocol::Naive
+            | NodeProtocol::Hysteria2
+            | NodeProtocol::Tuic
+            | NodeProtocol::Young
     ) || params
         .get("security")
         .map(|s| matches!(s.as_str(), "tls" | "reality"))
@@ -312,6 +354,11 @@ fn parse_url_like(uri: &str, proto: NodeProtocol) -> ConfigResult<ParsedNode> {
     }
     node.params = params;
     Ok(node)
+}
+
+fn scheme_is_naive_quic(uri: &str) -> bool {
+    uri.get(..uri.find("://").unwrap_or_default())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("naive+quic"))
 }
 
 fn validate_young_certificate_pin(value: &str) -> ConfigResult<()> {
@@ -687,6 +734,29 @@ mod tests {
         assert_eq!(n.password.as_deref(), Some("pwd"));
         assert_eq!(n.sni.as_deref(), Some("example.com"));
         assert!(n.tls);
+    }
+
+    #[test]
+    fn parse_naive_h2_and_quic_links() {
+        let h2 = parse_uri(
+            "naive://alice:secret@proxy.example:443?insecure_concurrency=2&udp_over_tcp=true&sni=edge.example#H2",
+        )
+        .unwrap();
+        assert_eq!(h2.protocol, NodeProtocol::Naive);
+        assert_eq!(h2.user.as_deref(), Some("alice"));
+        assert_eq!(h2.password.as_deref(), Some("secret"));
+        assert_eq!(h2.sni.as_deref(), Some("edge.example"));
+        assert!(h2.tls);
+        assert_eq!(
+            h2.params.get("udp_over_tcp").map(String::as_str),
+            Some("true")
+        );
+
+        let quic =
+            parse_uri("naive+quic://u:p@[2001:db8::1]:443?quic_congestion_control=bbr2").unwrap();
+        assert_eq!(quic.protocol, NodeProtocol::Naive);
+        assert_eq!(quic.host, "2001:db8::1");
+        assert_eq!(quic.params.get("quic").map(String::as_str), Some("true"));
     }
 
     #[test]

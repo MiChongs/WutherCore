@@ -65,6 +65,28 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
         ));
     }
 
+    for shadowsocks in plan
+        .listen
+        .shadowsocks
+        .iter()
+        .filter(|listener| listener.enabled)
+    {
+        let address = shadowsocks
+            .socket_addr()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        ensure!(
+            address.port() != 0,
+            "Shadowsocks listener port 0 cannot be reserved"
+        );
+        let owner = host_owner("wuther.shadowsocks");
+        if shadowsocks.enable_tcp() {
+            claims.insert(socket_claim(owner.clone(), SocketTransport::Tcp, address));
+        }
+        if shadowsocks.enable_udp() {
+            claims.insert(socket_claim(owner, SocketTransport::Udp, address));
+        }
+    }
+
     if plan.ui.on {
         if let Some(panel) = &plan.listen.panel {
             let address = panel
@@ -281,6 +303,50 @@ ui:
         );
 
         assert!(listener_resource_claims(&plan).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shadowsocks_listener_modes_reserve_their_tcp_and_udp_resources() {
+        let plan = plan(
+            r#"
+version: 1
+profile: server
+listen:
+  panel: false
+  shadowsocks:
+    - {address: 127.0.0.1, port: 8388, method: aes-128-gcm, password: one, mode: tcp_only, tag: tcp}
+    - {address: 127.0.0.1, port: 8389, method: aes-128-gcm, password: two, mode: udp_only, tag: udp}
+    - {address: 127.0.0.1, port: 8390, method: aes-128-gcm, password: three, mode: tcp_and_udp, tag: both}
+    - {enabled: false, address: 127.0.0.1, port: 8391, method: aes-128-gcm, password: four, mode: tcp_and_udp, tag: disabled}
+route:
+  preset: direct
+"#,
+        );
+        assert_eq!(
+            sockets(&listener_resource_claims(&plan).unwrap()),
+            BTreeSet::from([
+                (
+                    "wuther.shadowsocks".to_owned(),
+                    SocketTransport::Tcp,
+                    "127.0.0.1:8388".parse().unwrap(),
+                ),
+                (
+                    "wuther.shadowsocks".to_owned(),
+                    SocketTransport::Udp,
+                    "127.0.0.1:8389".parse().unwrap(),
+                ),
+                (
+                    "wuther.shadowsocks".to_owned(),
+                    SocketTransport::Tcp,
+                    "127.0.0.1:8390".parse().unwrap(),
+                ),
+                (
+                    "wuther.shadowsocks".to_owned(),
+                    SocketTransport::Udp,
+                    "127.0.0.1:8390".parse().unwrap(),
+                ),
+            ])
+        );
     }
 
     #[test]

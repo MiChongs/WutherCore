@@ -16,6 +16,8 @@ pub mod anytls;
 pub mod hysteria;
 pub mod hysteria2;
 pub mod mieru;
+#[cfg(feature = "naive")]
+pub mod naive;
 pub mod shadowsocks;
 pub mod snell;
 pub mod ss2022;

@@ -60,6 +60,7 @@
 //! ```
 
 use std::{
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -71,7 +72,7 @@ use aes::{
 };
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, Payload},
 };
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, BytesMut};
@@ -83,7 +84,7 @@ use sha3::{
     Shake128,
     digest::{ExtendableOutput, XofReader},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
 use crate::{
@@ -167,6 +168,8 @@ pub struct VmessOutbound {
     pub sni: Option<String>,
     pub insecure: bool,
     pub alpn: Vec<String>,
+    /// 完整 TLS/ECH 客户端配置；由注册层一次性严格编译。
+    pub tls_options: Option<TlsOptions>,
     pub network: VmessNetwork,
     pub ws: Option<WsOptions>,
     pub http: Option<HttpOptions>,
@@ -218,6 +221,7 @@ impl VmessOutbound {
             sni: None,
             insecure: false,
             alpn: vec![],
+            tls_options: None,
             network: VmessNetwork::Tcp,
             ws: None,
             http: None,
@@ -228,12 +232,18 @@ impl VmessOutbound {
     }
 
     fn tls_opts(&self) -> TlsOptions {
-        TlsOptions {
+        self.tls_options.clone().unwrap_or_else(|| TlsOptions {
             enabled: self.tls,
             sni: self.sni.clone(),
             insecure: self.insecure,
             alpn: self.alpn.clone(),
-        }
+            fingerprint: String::new(),
+            enable_session_resumption: false,
+            pinned_peer_cert_sha256: Vec::new(),
+            verify_peer_cert_by_name: Vec::new(),
+            xray_settings: None,
+            resolved_ech_config_list: None,
+        })
     }
 
     async fn dial_transport(&self) -> std::io::Result<BoxedStream> {
@@ -355,10 +365,17 @@ impl OutboundAdapter for VmessOutbound {
         let mut stream = stream;
         stream.write_all(&wire).await?;
 
-        // 5) 读取响应头部 + 校验 ResponseAuth
+        // 5) The VMess response header is produced by the downlink task.
+        // Consuming it here would deadlock request/response protocols whose
+        // origin does not speak until the caller writes its first payload.
         let resp_key_seed = sha256_first_16(&req_key);
         let resp_iv_seed = sha256_first_16(&iv);
-        verify_response_header(&mut stream, &resp_key_seed, &resp_iv_seed, resp_auth[0]).await?;
+        let stream: BoxedStream = Box::pin(VmessResponseStream::new(
+            stream,
+            &resp_key_seed,
+            &resp_iv_seed,
+            resp_auth[0],
+        ));
 
         // 6) 包装 chunk stream
         wrap_chunk_stream(stream, security, &req_key, &iv, self.options)
@@ -396,13 +413,29 @@ pub fn wrap_chunk_stream(
     req_iv: &[u8; 16],
     options: u8,
 ) -> std::io::Result<BoxedStream> {
-    let send_iv = sha256_first_16(req_iv);
+    if options & VMESS_OPTION_GLOBAL_PADDING != 0 && options & VMESS_OPTION_CHUNK_MASKING == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VMess GLOBAL_PADDING requires CHUNK_MASKING",
+        ));
+    }
+    if options & VMESS_OPTION_AUTH_LEN != 0 && security == VmessSecurity::None {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VMess AUTH_LEN requires an AEAD body security",
+        ));
+    }
+
+    let send_iv = *req_iv;
     let send_key = *req_key;
     let recv_iv = sha256_first_16(req_iv);
     let recv_key = sha256_first_16(req_key);
 
-    let send = ChunkCryptor::new(security, &send_key, &send_iv, options);
-    let recv = ChunkCryptor::new(security, &recv_key, &recv_iv, options);
+    let send = ChunkCryptor::new(security, &send_key, &send_iv, options, req_key, req_iv);
+    // Xray intentionally derives response authenticated-length framing from
+    // the request key/IV, while response payload encryption and masking use
+    // SHA-256(request key/IV).
+    let recv = ChunkCryptor::new(security, &recv_key, &recv_iv, options, req_key, req_iv);
 
     Ok(Box::pin(VmessStream {
         inner: stream,
@@ -413,6 +446,7 @@ pub fn wrap_chunk_stream(
         recv_state: RecvState::Length,
         recv_pending_size: 0,
         recv_pending_padding: 0,
+        pending_write: None,
     }))
 }
 
@@ -503,7 +537,13 @@ fn aead_seal_header_length(
     let nonce = Nonce::from_slice(&nonce_full);
     let payload = length.to_be_bytes();
     cipher
-        .encrypt(nonce, payload.as_ref())
+        .encrypt(
+            nonce,
+            Payload {
+                msg: payload.as_ref(),
+                aad: auth_id,
+            },
+        )
         .map_err(|_| io_err("aead seal length"))
 }
 
@@ -518,7 +558,13 @@ fn aead_seal_header_payload(
     let cipher = Aes128Gcm::new_from_slice(&key).map_err(|_| io_err("aead key payload"))?;
     let nonce = Nonce::from_slice(&nonce_full);
     cipher
-        .encrypt(nonce, payload)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: payload,
+                aad: auth_id,
+            },
+        )
         .map_err(|_| io_err("aead seal payload"))
 }
 
@@ -532,45 +578,209 @@ fn sha256_first_16(data: &[u8]) -> [u8; 16] {
     out
 }
 
-async fn verify_response_header(
-    stream: &mut BoxedStream,
-    resp_key_seed: &[u8; 16],
-    resp_iv_seed: &[u8; 16],
-    expect_resp_auth: u8,
-) -> std::io::Result<()> {
-    let mut len_buf = [0u8; 18];
-    stream.read_exact(&mut len_buf).await?;
-    let len_key = kdf_n(resp_key_seed, &[KDF_AEAD_RESP_HEADER_LEN_KEY], 16);
-    let len_nonce = kdf_n(resp_iv_seed, &[KDF_AEAD_RESP_HEADER_LEN_IV], 12);
-    let len_cipher = Aes128Gcm::new_from_slice(&len_key).map_err(|_| io_err("resp len key"))?;
-    let dec_len = len_cipher
-        .decrypt(Nonce::from_slice(&len_nonce), len_buf.as_ref())
-        .map_err(|_| io_err("resp len decrypt"))?;
-    if dec_len.len() != 2 {
-        return Err(io_err("resp len size"));
-    }
-    let header_len = u16::from_be_bytes([dec_len[0], dec_len[1]]) as usize;
+enum VmessResponseHeaderState {
+    Length { buffer: [u8; 18], filled: usize },
+    Payload { buffer: Vec<u8>, filled: usize },
+    Ready,
+    Failed,
+}
 
-    let mut hdr_buf = vec![0u8; header_len + 16];
-    stream.read_exact(&mut hdr_buf).await?;
-    let p_key = kdf_n(resp_key_seed, &[KDF_AEAD_RESP_HEADER_PAYLOAD_KEY], 16);
-    let p_nonce = kdf_n(resp_iv_seed, &[KDF_AEAD_RESP_HEADER_PAYLOAD_IV], 12);
-    let p_cipher = Aes128Gcm::new_from_slice(&p_key).map_err(|_| io_err("resp payload key"))?;
-    let dec = p_cipher
-        .decrypt(Nonce::from_slice(&p_nonce), hdr_buf.as_ref())
-        .map_err(|_| io_err("resp payload decrypt"))?;
-    // 完整解析: ResponseAuth(1) || Options(1) || CmdRespSize(1) || Cmd(1) || CmdResp(M)
-    if dec.is_empty() || dec[0] != expect_resp_auth {
-        return Err(io_err("resp auth mismatch"));
-    }
-    if dec.len() >= 4 {
-        // 跳过 cmd_resp（含 dynamic port 等扩展），mihomo 默认不主动处理
-        let cmd_resp_size = dec[2] as usize;
-        if dec.len() < 4 + cmd_resp_size {
-            return Err(io_err("resp cmd size truncated"));
+/// Strips and authenticates VMess's encrypted response header on the first
+/// application read. Writes always pass through immediately.
+struct VmessResponseStream {
+    inner: BoxedStream,
+    state: VmessResponseHeaderState,
+    length_key: [u8; 16],
+    length_nonce: [u8; 12],
+    payload_key: [u8; 16],
+    payload_nonce: [u8; 12],
+    expected_response_auth: u8,
+}
+
+impl VmessResponseStream {
+    fn new(
+        inner: BoxedStream,
+        response_key: &[u8; 16],
+        response_iv: &[u8; 16],
+        expected_response_auth: u8,
+    ) -> Self {
+        Self {
+            inner,
+            state: VmessResponseHeaderState::Length {
+                buffer: [0; 18],
+                filled: 0,
+            },
+            length_key: kdf_n(response_key, &[KDF_AEAD_RESP_HEADER_LEN_KEY], 16)
+                .try_into()
+                .expect("fixed VMess response length key"),
+            length_nonce: kdf_n(response_iv, &[KDF_AEAD_RESP_HEADER_LEN_IV], 12)
+                .try_into()
+                .expect("fixed VMess response length nonce"),
+            payload_key: kdf_n(response_key, &[KDF_AEAD_RESP_HEADER_PAYLOAD_KEY], 16)
+                .try_into()
+                .expect("fixed VMess response payload key"),
+            payload_nonce: kdf_n(response_iv, &[KDF_AEAD_RESP_HEADER_PAYLOAD_IV], 12)
+                .try_into()
+                .expect("fixed VMess response payload nonce"),
+            expected_response_auth,
         }
     }
-    Ok(())
+
+    fn fail(&mut self, error: io::Error) -> Poll<io::Result<()>> {
+        self.state = VmessResponseHeaderState::Failed;
+        Poll::Ready(Err(error))
+    }
+
+    fn decrypt_length(&self, encrypted: &[u8; 18]) -> io::Result<usize> {
+        let cipher = Aes128Gcm::new_from_slice(&self.length_key)
+            .map_err(|_| invalid_data("invalid VMess response length key"))?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&self.length_nonce), encrypted.as_ref())
+            .map_err(|_| invalid_data("VMess response length authentication failed"))?;
+        let bytes: [u8; 2] = plaintext
+            .try_into()
+            .map_err(|_| invalid_data("invalid VMess response length plaintext"))?;
+        Ok(usize::from(u16::from_be_bytes(bytes)))
+    }
+
+    fn validate_payload(&self, encrypted: &[u8]) -> io::Result<()> {
+        let cipher = Aes128Gcm::new_from_slice(&self.payload_key)
+            .map_err(|_| invalid_data("invalid VMess response payload key"))?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&self.payload_nonce), encrypted)
+            .map_err(|_| invalid_data("VMess response payload authentication failed"))?;
+        if plaintext.len() < 4 {
+            return Err(invalid_data("truncated VMess response header"));
+        }
+        if plaintext[0] != self.expected_response_auth {
+            return Err(invalid_data(format!(
+                "unexpected VMess response authentication byte: expected {}, received {}",
+                self.expected_response_auth, plaintext[0]
+            )));
+        }
+        // Xray layout: response-auth, options, command-id, command-length,
+        // command payload. The command itself is advisory (for example the
+        // legacy dynamic-port command), but its declared framing is strict.
+        let command_length = usize::from(plaintext[3]);
+        if plaintext.len() != 4 + command_length {
+            return Err(invalid_data("invalid VMess response command length"));
+        }
+        Ok(())
+    }
+}
+
+fn poll_fill_exact(
+    inner: &mut BoxedStream,
+    cx: &mut Context<'_>,
+    buffer: &mut [u8],
+    filled: &mut usize,
+    label: &'static str,
+) -> Poll<io::Result<()>> {
+    while *filled < buffer.len() {
+        let mut read_buf = ReadBuf::new(&mut buffer[*filled..]);
+        match inner.as_mut().poll_read(cx, &mut read_buf) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, label)));
+            }
+            Poll::Ready(Ok(())) => *filled += read_buf.filled().len(),
+        }
+    }
+    Poll::Ready(Ok(()))
+}
+
+impl AsyncRead for VmessResponseStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let this = self.get_mut();
+        loop {
+            let state = std::mem::replace(&mut this.state, VmessResponseHeaderState::Failed);
+            match state {
+                VmessResponseHeaderState::Length {
+                    mut buffer,
+                    mut filled,
+                } => match poll_fill_exact(
+                    &mut this.inner,
+                    cx,
+                    &mut buffer,
+                    &mut filled,
+                    "truncated VMess encrypted response length",
+                ) {
+                    Poll::Pending => {
+                        this.state = VmessResponseHeaderState::Length { buffer, filled };
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(error)) => return this.fail(error),
+                    Poll::Ready(Ok(())) => match this.decrypt_length(&buffer) {
+                        Ok(length) => {
+                            this.state = VmessResponseHeaderState::Payload {
+                                buffer: vec![0; length + 16],
+                                filled: 0,
+                            };
+                        }
+                        Err(error) => return this.fail(error),
+                    },
+                },
+                VmessResponseHeaderState::Payload {
+                    mut buffer,
+                    mut filled,
+                } => match poll_fill_exact(
+                    &mut this.inner,
+                    cx,
+                    &mut buffer,
+                    &mut filled,
+                    "truncated VMess encrypted response payload",
+                ) {
+                    Poll::Pending => {
+                        this.state = VmessResponseHeaderState::Payload { buffer, filled };
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(error)) => return this.fail(error),
+                    Poll::Ready(Ok(())) => match this.validate_payload(&buffer) {
+                        Ok(()) => this.state = VmessResponseHeaderState::Ready,
+                        Err(error) => return this.fail(error),
+                    },
+                },
+                VmessResponseHeaderState::Ready => {
+                    this.state = VmessResponseHeaderState::Ready;
+                    return this.inner.as_mut().poll_read(cx, output);
+                }
+                VmessResponseHeaderState::Failed => {
+                    this.state = VmessResponseHeaderState::Failed;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "VMess response header validation previously failed",
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for VmessResponseStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, input)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
+    }
 }
 
 /* ---------------- Shaker (SHAKE128 派生器) ---------------- */
@@ -604,67 +814,103 @@ enum ChunkAead {
     None,
 }
 
+enum LengthAead {
+    Aes128(Aes128Gcm),
+    Chacha(ChaCha20Poly1305),
+}
+
+fn chacha_key_from_16(key: &[u8; 16]) -> [u8; 32] {
+    let first = {
+        let mut hash = Md5::new();
+        Digest::update(&mut hash, key);
+        hash.finalize()
+    };
+    let second = {
+        let mut hash = Md5::new();
+        Digest::update(&mut hash, &first);
+        hash.finalize()
+    };
+    let mut output = [0_u8; 32];
+    output[..16].copy_from_slice(&first);
+    output[16..].copy_from_slice(&second);
+    output
+}
+
 struct ChunkCryptor {
     aead: ChunkAead,
     iv_base: [u8; 16],
+    auth_len_iv_base: [u8; 16],
     counter: u16,
     sec: VmessSecurity,
-    options: u8,
     chunk_masker: Option<Shaker>,
     padding_gen: Option<Shaker>,
-    auth_len_aead: Option<Aes128Gcm>,
+    shared_masker_and_padding: bool,
+    auth_len_aead: Option<LengthAead>,
     auth_len_counter: u16,
 }
 
 impl ChunkCryptor {
-    fn new(sec: VmessSecurity, key: &[u8; 16], iv: &[u8; 16], options: u8) -> Self {
+    fn new(
+        sec: VmessSecurity,
+        key: &[u8; 16],
+        iv: &[u8; 16],
+        options: u8,
+        auth_len_key_seed: &[u8; 16],
+        auth_len_iv: &[u8; 16],
+    ) -> Self {
         let aead = match sec {
             VmessSecurity::Aes128Gcm => {
                 ChunkAead::Aes128(Aes128Gcm::new_from_slice(key).expect("aes128 key"))
             }
             VmessSecurity::Chacha20Poly1305 => {
-                let k1 = {
-                    let mut h = Md5::new();
-                    Digest::update(&mut h, key);
-                    h.finalize()
-                };
-                let k2 = {
-                    let mut h = Md5::new();
-                    Digest::update(&mut h, &k1);
-                    h.finalize()
-                };
-                let mut full = [0u8; 32];
-                full[..16].copy_from_slice(&k1);
-                full[16..].copy_from_slice(&k2);
+                let full = chacha_key_from_16(key);
                 ChunkAead::Chacha(ChaCha20Poly1305::new_from_slice(&full).expect("chacha key"))
             }
             VmessSecurity::None | VmessSecurity::Auto => ChunkAead::None,
         };
-        let chunk_masker = if options & VMESS_OPTION_CHUNK_MASKING != 0 {
+        let uses_authenticated_length = options & VMESS_OPTION_AUTH_LEN != 0;
+        let uses_masking = options & VMESS_OPTION_CHUNK_MASKING != 0;
+        let uses_padding = options & VMESS_OPTION_GLOBAL_PADDING != 0;
+        let shared_masker_and_padding = uses_padding && uses_masking && !uses_authenticated_length;
+        let chunk_masker = if uses_masking && !uses_authenticated_length {
             Some(Shaker::from_seed(iv))
         } else {
             None
         };
-        let padding_gen = if options & VMESS_OPTION_GLOBAL_PADDING != 0 {
+        let padding_gen = if uses_padding && !shared_masker_and_padding {
             Some(Shaker::from_seed(iv))
         } else {
             None
         };
-        let auth_len_aead = if options & VMESS_OPTION_AUTH_LEN != 0 {
-            // KDF 的 key 输入是主 req_key，路径 "auth_len"
-            let auth_key = kdf_n(key, &[KDF_AUTH_LEN], 16);
-            Some(Aes128Gcm::new_from_slice(&auth_key).expect("auth_len key"))
+        let auth_len_aead = if uses_authenticated_length {
+            let auth_key = kdf_n(auth_len_key_seed, &[KDF_AUTH_LEN], 16);
+            match sec {
+                VmessSecurity::Aes128Gcm | VmessSecurity::Auto => Some(LengthAead::Aes128(
+                    Aes128Gcm::new_from_slice(&auth_key).expect("VMess auth-length AES key"),
+                )),
+                VmessSecurity::Chacha20Poly1305 => {
+                    let auth_key: [u8; 16] =
+                        auth_key.try_into().expect("fixed VMess auth-length key");
+                    let full_key = chacha_key_from_16(&auth_key);
+                    Some(LengthAead::Chacha(
+                        ChaCha20Poly1305::new_from_slice(&full_key)
+                            .expect("VMess auth-length ChaCha key"),
+                    ))
+                }
+                VmessSecurity::None => None,
+            }
         } else {
             None
         };
         Self {
             aead,
             iv_base: *iv,
+            auth_len_iv_base: *auth_len_iv,
             counter: 0,
             sec,
-            options,
             chunk_masker,
             padding_gen,
+            shared_masker_and_padding,
             auth_len_aead,
             auth_len_counter: 0,
         }
@@ -681,16 +927,21 @@ impl ChunkCryptor {
     fn next_auth_len_nonce(&mut self) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[..2].copy_from_slice(&self.auth_len_counter.to_be_bytes());
-        nonce[2..12].copy_from_slice(&self.iv_base[2..12]);
+        nonce[2..12].copy_from_slice(&self.auth_len_iv_base[2..12]);
         self.auth_len_counter = self.auth_len_counter.wrapping_add(1);
         nonce
     }
 
     fn next_padding_len(&mut self) -> usize {
-        match &mut self.padding_gen {
-            Some(g) => (g.next_u16() % 64) as usize,
-            None => 0,
+        if self.shared_masker_and_padding {
+            return self
+                .chunk_masker
+                .as_mut()
+                .map_or(0, |generator| usize::from(generator.next_u16() % 64));
         }
+        self.padding_gen
+            .as_mut()
+            .map_or(0, |generator| usize::from(generator.next_u16() % 64))
     }
 
     fn mask_size_encode(&mut self, size: u16) -> u16 {
@@ -736,11 +987,25 @@ impl ChunkCryptor {
     fn encode_length_field(&mut self, ct_len: u16) -> std::io::Result<Vec<u8>> {
         if self.auth_len_aead.is_some() {
             let nonce = self.next_auth_len_nonce();
-            let pt = ct_len.to_be_bytes();
+            // Xray's AEADChunkSizeParser authenticates
+            // `wire_chunk_size - length_aead_overhead` and adds the overhead
+            // back after opening.
+            let authenticated = ct_len
+                .checked_sub(16)
+                .ok_or_else(|| invalid_data("VMess chunk is smaller than AEAD overhead"))?;
+            let plaintext = authenticated.to_be_bytes();
             let aead = self.auth_len_aead.as_ref().expect("checked");
-            let sealed = aead
-                .encrypt(Nonce::from_slice(&nonce), pt.as_ref())
-                .map_err(|_| io_err("auth_len encrypt"))?;
+            let sealed = match aead {
+                LengthAead::Aes128(cipher) => cipher
+                    .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+                    .map_err(|_| io_err("auth_len AES encrypt"))?,
+                LengthAead::Chacha(cipher) => cipher
+                    .encrypt(
+                        chacha20poly1305::Nonce::from_slice(&nonce),
+                        plaintext.as_ref(),
+                    )
+                    .map_err(|_| io_err("auth_len ChaCha encrypt"))?,
+            };
             return Ok(sealed);
         }
         let masked = self.mask_size_encode(ct_len);
@@ -754,13 +1019,20 @@ impl ChunkCryptor {
             }
             let nonce = self.next_auth_len_nonce();
             let aead = self.auth_len_aead.as_ref().expect("checked");
-            let pt = aead
-                .decrypt(Nonce::from_slice(&nonce), buf)
-                .map_err(|_| io_err("auth_len decrypt"))?;
-            if pt.len() != 2 {
+            let plaintext = match aead {
+                LengthAead::Aes128(cipher) => cipher
+                    .decrypt(Nonce::from_slice(&nonce), buf)
+                    .map_err(|_| io_err("auth_len AES decrypt"))?,
+                LengthAead::Chacha(cipher) => cipher
+                    .decrypt(chacha20poly1305::Nonce::from_slice(&nonce), buf)
+                    .map_err(|_| io_err("auth_len ChaCha decrypt"))?,
+            };
+            if plaintext.len() != 2 {
                 return Err(io_err("auth_len plain size"));
             }
-            return Ok(u16::from_be_bytes([pt[0], pt[1]]));
+            return u16::from_be_bytes([plaintext[0], plaintext[1]])
+                .checked_add(16)
+                .ok_or_else(|| invalid_data("VMess authenticated chunk length overflow"));
         }
         if buf.len() != 2 {
             return Err(io_err("plain length buf size"));
@@ -785,6 +1057,12 @@ enum RecvState {
     Body,
 }
 
+struct PendingWrite {
+    packet: Vec<u8>,
+    offset: usize,
+    plaintext_len: usize,
+}
+
 pin_project! {
     struct VmessStream {
         #[pin]
@@ -796,6 +1074,7 @@ pin_project! {
         recv_state: RecvState,
         recv_pending_size: usize,    // 解密后的密文长度（含 tag）
         recv_pending_padding: usize, // 该 chunk 末尾的 padding
+        pending_write: Option<PendingWrite>,
     }
 }
 
@@ -822,9 +1101,11 @@ impl AsyncRead for VmessStream {
                             return Ok(false);
                         }
                         let buf = this.cipher_buf.split_to(need).to_vec();
+                        // Xray advances the shared SHAKE padding generator
+                        // before decoding the masked length field.
+                        let padding = this.recv.next_padding_len();
                         let total = this.recv.decode_length_field(&buf)? as usize;
                         // total = ct_len + padding_len（GLOBAL_PADDING 启用时）
-                        let padding = this.recv.next_padding_len();
                         if total < padding {
                             return Err(io_err("chunk total smaller than padding"));
                         }
@@ -883,37 +1164,61 @@ impl AsyncWrite for VmessStream {
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut this = self.project();
-        let max = PAYLOAD_MAX - this.send.tag_len();
-        let chunk = &data[..data.len().min(max)];
-        let sealed = match this.send.seal_payload(chunk) {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        // padding
-        let padding_len = this.send.next_padding_len();
-        let mut padding = vec![0u8; padding_len];
-        rand::rngs::OsRng.fill_bytes(&mut padding);
-        let total_size = (sealed.len() + padding_len) as u16;
-        let length_field = match this.send.encode_length_field(total_size) {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        let mut packet = Vec::with_capacity(length_field.len() + sealed.len() + padding_len);
-        packet.extend_from_slice(&length_field);
-        packet.extend_from_slice(&sealed);
-        packet.extend_from_slice(&padding);
-        let mut written = 0;
-        while written < packet.len() {
-            match this.inner.as_mut().poll_write(cx, &packet[written..]) {
+        if this.pending_write.is_none() {
+            if data.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let max = PAYLOAD_MAX - this.send.tag_len();
+            let chunk = &data[..data.len().min(max)];
+            let sealed = match this.send.seal_payload(chunk) {
+                Ok(value) => value,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            // Xray asks the padding generator before encoding the size.
+            let padding_len = this.send.next_padding_len();
+            let mut padding = vec![0_u8; padding_len];
+            rand::rngs::OsRng.fill_bytes(&mut padding);
+            let total_size = (sealed.len() + padding_len) as u16;
+            let length_field = match this.send.encode_length_field(total_size) {
+                Ok(value) => value,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let mut packet = Vec::with_capacity(length_field.len() + sealed.len() + padding_len);
+            packet.extend_from_slice(&length_field);
+            packet.extend_from_slice(&sealed);
+            packet.extend_from_slice(&padding);
+            *this.pending_write = Some(PendingWrite {
+                packet,
+                offset: 0,
+                plaintext_len: chunk.len(),
+            });
+        }
+
+        loop {
+            let pending = this
+                .pending_write
+                .as_mut()
+                .expect("VMess pending write initialized");
+            match this
+                .inner
+                .as_mut()
+                .poll_write(cx, &pending.packet[pending.offset..])
+            {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
                 }
-                Poll::Ready(Ok(n)) => written += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(written)) => {
+                    pending.offset += written;
+                    if pending.offset == pending.packet.len() {
+                        let plaintext_len = pending.plaintext_len;
+                        *this.pending_write = None;
+                        return Poll::Ready(Ok(plaintext_len));
+                    }
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        Poll::Ready(Ok(chunk.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -927,6 +1232,10 @@ impl AsyncWrite for VmessStream {
 
 fn io_err(s: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, s)
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[allow(dead_code)]
@@ -1015,16 +1324,16 @@ mod tests {
         let key = [0xaau8; 16];
         let iv = [0xbbu8; 16];
         let opts = VMESS_DEFAULT_OPTIONS;
-        let mut send = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts);
-        let mut recv = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts);
+        let mut send = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts, &key, &iv);
+        let mut recv = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts, &key, &iv);
         let pt = b"hello vmess full feature";
         let sealed = send.seal_payload(pt).unwrap();
         let padding_len_send = send.next_padding_len();
         let total_size = (sealed.len() + padding_len_send) as u16;
         let length_field = send.encode_length_field(total_size).unwrap();
         // 接收
-        let total_dec = recv.decode_length_field(&length_field).unwrap() as usize;
         let padding_len_recv = recv.next_padding_len();
+        let total_dec = recv.decode_length_field(&length_field).unwrap() as usize;
         assert_eq!(padding_len_send, padding_len_recv);
         let ct_len = total_dec - padding_len_recv;
         assert_eq!(ct_len, sealed.len());
@@ -1037,8 +1346,10 @@ mod tests {
         let key = [0x11u8; 16];
         let iv = [0x22u8; 16];
         let opts = VMESS_OPTION_CHUNK_STREAM;
-        let mut send = ChunkCryptor::new(VmessSecurity::Chacha20Poly1305, &key, &iv, opts);
-        let mut recv = ChunkCryptor::new(VmessSecurity::Chacha20Poly1305, &key, &iv, opts);
+        let mut send =
+            ChunkCryptor::new(VmessSecurity::Chacha20Poly1305, &key, &iv, opts, &key, &iv);
+        let mut recv =
+            ChunkCryptor::new(VmessSecurity::Chacha20Poly1305, &key, &iv, opts, &key, &iv);
         let ct = send.seal_payload(b"payload").unwrap();
         let lf = send.encode_length_field(ct.len() as u16).unwrap();
         assert_eq!(lf.len(), 2);
@@ -1052,8 +1363,8 @@ mod tests {
         let key = [0x33u8; 16];
         let iv = [0x44u8; 16];
         let opts = VMESS_OPTION_CHUNK_STREAM | VMESS_OPTION_AUTH_LEN;
-        let mut send = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts);
-        let mut recv = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts);
+        let mut send = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts, &key, &iv);
+        let mut recv = ChunkCryptor::new(VmessSecurity::Aes128Gcm, &key, &iv, opts, &key, &iv);
         let ct = send.seal_payload(b"auth_len test").unwrap();
         let lf = send.encode_length_field(ct.len() as u16).unwrap();
         assert_eq!(lf.len(), 18);

@@ -29,6 +29,7 @@ pub fn spawn_system_gc(
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let period = purge_period(udp_timeout);
     let handle = tokio::spawn(async move {
+        let mut network_changes = crate::net_monitor::subscribe();
         let mut ticker = tokio::time::interval(period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // 跳过首个立即 tick，避免启动瞬间空转。
@@ -36,6 +37,19 @@ pub fn spawn_system_gc(
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
+                event = network_changes.recv() => {
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        break;
+                    }
+                    let udp_removed = udp_sessions.clear();
+                    if udp_removed > 0 {
+                        debug!(
+                            target: "capture::system",
+                            udp_removed,
+                            "network changed; invalidated bound UDP associations"
+                        );
+                    }
+                }
                 _ = ticker.tick() => {
                     let tcp_removed = tcp_nat.purge_expired();
                     let udp_removed = udp_sessions.purge();
@@ -64,12 +78,26 @@ pub fn spawn_tun_gc(
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let period = purge_period(udp_timeout);
     let handle = tokio::spawn(async move {
+        let mut network_changes = crate::net_monitor::subscribe();
         let mut ticker = tokio::time::interval(period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await;
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
+                event = network_changes.recv() => {
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        break;
+                    }
+                    let removed = udp_sessions.clear();
+                    if removed > 0 {
+                        debug!(
+                            target: "capture::tun",
+                            udp_removed = removed,
+                            "network changed; invalidated bound UDP associations"
+                        );
+                    }
+                }
                 _ = ticker.tick() => {
                     let removed = udp_sessions.purge();
                     if removed > 0 {

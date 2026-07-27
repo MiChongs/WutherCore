@@ -196,6 +196,76 @@ impl TransportStream for tokio_rustls::client::TlsStream<TcpStream> {
 
 pub type BoxedTransportStream = Box<dyn TransportStream>;
 
+struct AsyncTransportStream<S> {
+    inner: S,
+}
+
+impl<S> AsyncRead for AsyncTransportStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, output)
+    }
+}
+
+impl<S> AsyncWrite for AsyncTransportStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, input)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> TransportStream for AsyncTransportStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, input)
+    }
+}
+
+/// Erases an arbitrary asynchronous byte carrier while preserving REALITY's
+/// post-authentication direct-read/direct-write transition.  For carriers
+/// without a second TLS layer (for example FinalMask), "direct" means the
+/// carrier's ordinary byte interface.
+pub fn boxed_transport_stream<S>(stream: S) -> BoxedTransportStream
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    Box::new(AsyncTransportStream { inner: stream })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocketHandle {
     raw: i64,

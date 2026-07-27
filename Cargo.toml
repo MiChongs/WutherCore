@@ -6,6 +6,7 @@ members = [
     "crates/core-runtime",
     "crates/core-inbound",
     "crates/core-outbound",
+    "crates/core-grpc",
     "crates/core-feeds",
     "crates/core-store",
     "crates/core-ruleset",
@@ -22,11 +23,15 @@ members = [
     "crates/wuther-core",
     "tests-e2e",
 ]
+exclude = [
+    "third_party/h3-c38a1af/h3",
+    "third_party/shaped-rustls-94f088e",
+]
 
 [workspace.package]
 version = "0.3.1-rc.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 authors = ["WutherCore Contributors"]
 repository = "https://github.com/MiChongs/WutherCore"
@@ -58,6 +63,7 @@ bytes = "1"
 url = "2"
 ipnet = { version = "2", features = ["serde"] }
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "dns-over-rustls", "dns-over-https-rustls", "system-config"] }
+hickory-proto = "0.26"
 
 # Hash / 集合 / 内存优化
 ahash = "0.8"
@@ -88,6 +94,9 @@ hyper            = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util       = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 http             = "1"
 http-body-util   = "0.1"
+prost            = "=0.13.5"
+tonic            = { version = "=0.13.1", default-features = false, features = ["prost"] }
+tokio-stream     = { version = "=0.1.18", features = ["sync"] }
 flate2           = "1"
 brotli           = "7"
 redb = "2.2"
@@ -99,10 +108,14 @@ sha2              = "0.10"
 hmac              = "0.12"
 md-5              = "0.10"
 blake3            = "1"
-rustls            = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls      = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls            = { version = "=0.23.40", default-features = false, features = ["aws_lc_rs", "brotli", "ring", "std", "tls12"] }
+tokio-rustls      = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "ring", "tls12"] }
 rustls-pki-types  = "1"
 webpki-roots      = "0.26"
+rustls-native-certs = "0.8.4"
+boring            = { version = "=4.19.0" }
+boring-sys        = { version = "=4.19.0" }
+tokio-boring      = { version = "=4.19.0" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 uuid              = { version = "1", features = ["v4"] }
 aes               = "0.8"
@@ -115,10 +128,14 @@ sha3              = "0.10"
 sha1              = "0.10"
 rc4               = "0.1"
 chacha20          = "0.10"
+cronet            = "0.2.0"
+shadowsocks       = { version = "=1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher", "security-replay-attack-detect"] }
 
 # QUIC + UDP 协议（Hysteria / TUIC）
 quinn             = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
 quinn-proto       = { version = "0.11", default-features = false, features = ["rustls", "ring"] }
+h3                = { git = "https://github.com/hyperium/h3", rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3" }
+h3-quinn          = { git = "https://github.com/hyperium/h3", rev = "c38a1af632afbbbc8f6716c196ad67f40bc122e3" }
 
 # SSH 客户端
 russh             = "0.46"
@@ -137,6 +154,10 @@ rand = "0.8"
 hex = "0.4"
 tempfile = "3"
 libc = "0.2"
+caps = "0.5.6"
+route_manager = "0.2.12"
+rtnetlink = "0.21.0"
+netlink-packet-route = "0.30.0"
 
 # 内部 crate
 core-config   = { path = "crates/core-config" }
@@ -144,6 +165,7 @@ core-fetch    = { path = "crates/core-fetch" }
 core-runtime  = { path = "crates/core-runtime" }
 core-inbound  = { path = "crates/core-inbound" }
 core-outbound = { path = "crates/core-outbound" }
+core-grpc     = { path = "crates/core-grpc" }
 core-feeds    = { path = "crates/core-feeds" }
 core-store    = { path = "crates/core-store" }
 core-ruleset  = { path = "crates/core-ruleset" }
@@ -167,8 +189,15 @@ xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3
 
 [patch.crates-io]
 # REALITY 必须在同一个真实 ClientHello 上完成 session-id 封装并继续握手；
-# 上游 rustls 没有 finalizer hook，固定使用经过该能力审阅的 shaped-rustls 提交。
-rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "94f088e210fd2a56e413cce1c6d79c10852d500a" }
+# XHTTP 的 uTLS/ECH 也依赖精确扩展塑形。上游 rustls 没有这些 finalizer/
+# customizer hook，因此固定使用经过审阅的同 revision 本地源码。
+rustls = { path = "third_party/shaped-rustls-94f088e/rustls" }
+
+[patch."https://github.com/hyperium/h3"]
+# c38a1af 的 h3 会把合法的零长度 DATA 帧误报成消息 EOF。XHTTP/3
+# 服务端需要用这种无业务负载的帧探测对端 STOP_SENDING，因此固定使用带
+# 最小修复的同版本源码；h3-quinn 仍来自同一个上游提交并解析到此 h3。
+h3 = { path = "third_party/h3-c38a1af/h3" }
 
 # ============================================================================
 # 编译时间 / 二进制大小 / 运行性能的权衡

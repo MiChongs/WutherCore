@@ -71,6 +71,31 @@ pub fn generate_padding(method: PaddingMethod, length: usize) -> String {
     }
 }
 
+/// Validate an incoming padding value against the configured on-wire range.
+///
+/// `repeat-x` is measured as raw bytes because the value is deliberately made
+/// of the HPACK/QPACK eight-bit `X` code. `tokenish` is measured after the
+/// RFC 7541 Huffman transform, matching Xray's server-side validation.
+pub fn is_padding_valid(method: PaddingMethod, value: &str, min: usize, max: usize) -> bool {
+    if value.is_empty() || min > max {
+        return false;
+    }
+
+    match method {
+        // Xray validates the encoded length here, not the alphabet.  The
+        // client generator still emits only `X`, but accepting any value of
+        // the configured length is required for wire compatibility with
+        // alternate clients and with Xray's own server.
+        PaddingMethod::RepeatX => (min..=max).contains(&value.len()),
+        PaddingMethod::Tokenish => {
+            let encoded = huffman_encode_length(value);
+            let min = min.saturating_sub(VALIDATION_TOLERANCE as usize);
+            let max = max.saturating_add(VALIDATION_TOLERANCE as usize);
+            (min..=max).contains(&encoded)
+        }
+    }
+}
+
 pub fn generate_tokenish_padding_base62(target_huffman_bytes: i32) -> String {
     if target_huffman_bytes <= 0 {
         return String::new();
@@ -228,5 +253,26 @@ mod tests {
         assert_eq!(PaddingMethod::parse("tokenish"), PaddingMethod::Tokenish);
         assert_eq!(PaddingMethod::parse("repeat-x"), PaddingMethod::RepeatX);
         assert_eq!(PaddingMethod::parse(""), PaddingMethod::RepeatX);
+    }
+
+    #[test]
+    fn repeat_x_validation_matches_xray_length_only_semantics() {
+        assert!(is_padding_valid(PaddingMethod::RepeatX, "XXXXX", 5, 5));
+        assert!(is_padding_valid(PaddingMethod::RepeatX, "XXYXX", 5, 5));
+        assert!(!is_padding_valid(PaddingMethod::RepeatX, "XXXX", 5, 5));
+    }
+
+    #[test]
+    fn tokenish_validation_uses_huffman_length_without_alphabet_restriction() {
+        let value = generate_padding(PaddingMethod::Tokenish, 128);
+        assert!(is_padding_valid(PaddingMethod::Tokenish, &value, 128, 128));
+        let punctuation = "!@#$%^&*()";
+        let encoded = huffman_encode_length(punctuation);
+        assert!(is_padding_valid(
+            PaddingMethod::Tokenish,
+            punctuation,
+            encoded,
+            encoded,
+        ));
     }
 }

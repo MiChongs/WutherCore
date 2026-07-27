@@ -74,10 +74,28 @@ impl Transport for RealityTransport {
                 }
             };
             let _ = stream.set_nodelay(true);
+            let local_addr = stream.local_addr().ok();
+            let mut carrier: BoxedStream = Box::pin(stream);
+            if let Some(masks) = crate::socket_policy::current()
+                .as_ref()
+                .and_then(|policy| policy.settings.finalmask.as_ref())
+                .map(|finalmask| finalmask.tcp.as_slice())
+                .filter(|masks| !masks.is_empty())
+            {
+                carrier = crate::transport::finalmask::wrap_tcp_client(
+                    carrier,
+                    masks,
+                    local_addr,
+                    Some(address),
+                    host,
+                    port,
+                )
+                .await?;
+            }
             let lifetime: RealityConnectionLifetime = Arc::new(guard);
             match self
                 .client
-                .connect_with_lifetime(stream, Some(lifetime))
+                .connect_io_with_lifetime(carrier, Some(lifetime))
                 .await
             {
                 Ok(stream) => {

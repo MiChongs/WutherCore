@@ -21,7 +21,7 @@ use xray_transport::reality_connector::{
 };
 use xray_transport::{
     BoxedTransportStream, RealityClientConfig as XrayRealityClientConfig,
-    RustlsRealityTlsSessionProvider,
+    RustlsRealityTlsSessionProvider, boxed_transport_stream,
 };
 use zeroize::Zeroize;
 
@@ -310,6 +310,20 @@ impl RealityClient {
         stream: TcpStream,
         lifetime: Option<RealityConnectionLifetime>,
     ) -> Result<RealityClientStream, RealityClientError> {
+        self.connect_io_with_lifetime(stream, lifetime).await
+    }
+
+    /// Complete REALITY over an arbitrary policy-aware byte carrier.  This is
+    /// required for FinalMask, whose TCP wrappers intentionally sit below the
+    /// REALITY ClientHello while preserving the authenticated TLS stream above.
+    pub async fn connect_io_with_lifetime<S>(
+        &self,
+        stream: S,
+        lifetime: Option<RealityConnectionLifetime>,
+    ) -> Result<RealityClientStream, RealityClientError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
         let normalized_fingerprint =
             xray_utls::normalize_reality_supported_fingerprint(&self.config.fingerprint)
                 .expect("configuration was validated");
@@ -344,8 +358,11 @@ impl RealityClient {
                 },
             )
             .map_err(|error| RealityClientError::Handshake(error.to_string()))?;
-        let complete =
-            session.complete_with_outcome(stream, prepared, xray_config.mldsa65_verify.clone());
+        let complete = session.complete_with_outcome(
+            boxed_transport_stream(stream),
+            prepared,
+            xray_config.mldsa65_verify.clone(),
+        );
         let completion = tokio::time::timeout(self.config.handshake_timeout, complete)
             .await
             .map_err(|_| RealityClientError::HandshakeTimeout)?;

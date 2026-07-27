@@ -21,6 +21,7 @@ use std::{
 };
 
 use base64::Engine;
+use core_outbound::BoxedStream;
 use core_runtime::{InboundMetadata, ListenerHandler, Runtime};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -69,19 +70,59 @@ pub struct MixedListener {
     pub auth: Option<Vec<core_config::runtime_plan::UserPass>>,
     /// Whether RFC 1928 UDP ASSOCIATE is accepted on the mixed listener.
     pub udp: bool,
+    /// Listener-side socket policy and TCP final masks.
+    pub stream_settings: Option<core_config::NodeStreamSettings>,
 }
 
-async fn bind_mixed_listener(listen: SocketAddr) -> io::Result<TcpListener> {
-    TcpListener::bind(listen).await
+async fn bind_mixed_listener(
+    listen: SocketAddr,
+    socket_config: Option<&core_config::OutboundSocketConfig>,
+) -> io::Result<TcpListener> {
+    core_outbound::transport::tcp::bind_inbound_listener(listen, socket_config)
 }
 
 pub async fn run_mixed(listener: MixedListener, runtime: Arc<Runtime>) -> io::Result<()> {
+    validate_mixed_stream_settings(listener.stream_settings.as_ref())?;
+    let socket_config = listener
+        .stream_settings
+        .as_ref()
+        .and_then(|settings| settings.sockopt.as_ref());
     // Host-resource arbitration reserves this exact address. Falling back to a
     // different port would make the reservation and the live socket diverge.
-    let l = bind_mixed_listener(listener.listen).await?;
+    let l = bind_mixed_listener(listener.listen, socket_config).await?;
     let bound = l.local_addr()?;
     info!(addr = %bound, "mixed inbound listening");
     serve_mixed(l, listener, runtime).await
+}
+
+fn validate_mixed_stream_settings(
+    settings: Option<&core_config::NodeStreamSettings>,
+) -> io::Result<()> {
+    if let Some(network) = settings.and_then(|settings| settings.network.as_deref())
+        && !network.is_empty()
+        && !network.eq_ignore_ascii_case("tcp")
+        && !network.eq_ignore_ascii_case("raw")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("mixed inbound only supports streamSettings.network=tcp/raw, got `{network}`"),
+        ));
+    }
+    if let Some(finalmask) = settings.and_then(|settings| settings.finalmask.as_ref()) {
+        if !finalmask.udp.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mixed inbound cannot attach raw UDP final masks to SOCKS5 UDP ASSOCIATE; a protocol UDP listener must call wrap_udp_server",
+            ));
+        }
+        if finalmask.quic_params.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mixed inbound network=tcp/raw cannot execute finalmask.quicParams",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn serve_mixed(
@@ -90,6 +131,7 @@ async fn serve_mixed(
     runtime: Arc<Runtime>,
 ) -> io::Result<()> {
     let auth = listener.auth.map(Arc::new);
+    let stream_settings = listener.stream_settings.map(Arc::new);
     let connection_permits = Arc::new(Semaphore::new(MIXED_MAX_CONNECTIONS));
     let udp_session_permits = Arc::new(Semaphore::new(MIXED_MAX_UDP_TARGET_SESSIONS));
     // JoinSet aborts every in-flight connection when this listener future is
@@ -111,10 +153,21 @@ async fn serve_mixed(
                 let runtime = runtime.clone();
                 let auth = auth.clone();
                 let udp = listener.udp;
+                let stream_settings = stream_settings.clone();
                 let udp_session_permits = udp_session_permits.clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle(sock, peer, runtime, auth, udp, udp_session_permits).await {
+                    if let Err(e) = handle(
+                        sock,
+                        peer,
+                        runtime,
+                        auth,
+                        udp,
+                        udp_session_permits,
+                        stream_settings,
+                    )
+                    .await
+                    {
                         debug!(error = %e, peer = %peer, "mixed handle error");
                     }
                 });
@@ -130,14 +183,47 @@ async fn serve_mixed(
 
 async fn handle(
     sock: TcpStream,
-    peer: SocketAddr,
+    mut peer: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<Arc<Vec<core_config::runtime_plan::UserPass>>>,
     udp_enabled: bool,
     udp_session_permits: Arc<Semaphore>,
+    stream_settings: Option<Arc<core_config::NodeStreamSettings>>,
 ) -> io::Result<()> {
-    let mut peek = [0u8; 1];
-    let n = timeout(MIXED_PROTOCOL_DETECT_TIMEOUT, sock.peek(&mut peek))
+    let mut local = sock.local_addr()?;
+    let mut stream: BoxedStream = Box::pin(sock);
+    if stream_settings
+        .as_ref()
+        .and_then(|settings| settings.sockopt.as_ref())
+        .is_some_and(|sockopt| sockopt.accept_proxy_protocol)
+    {
+        let endpoints = timeout(
+            MIXED_PROTOCOL_DETECT_TIMEOUT,
+            read_proxy_protocol(&mut stream, peer, local),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "PROXY protocol header timed out")
+        })??;
+        peer = endpoints.0;
+        local = endpoints.1;
+    }
+    if let Some(masks) = stream_settings
+        .as_ref()
+        .and_then(|settings| settings.finalmask.as_ref())
+        .map(|finalmask| finalmask.tcp.as_slice())
+        .filter(|masks| !masks.is_empty())
+    {
+        stream = core_outbound::transport::finalmask::wrap_tcp_server(
+            stream,
+            masks,
+            Some(local),
+            Some(peer),
+        )
+        .await?;
+    }
+    let mut first = [0u8; 1];
+    timeout(MIXED_PROTOCOL_DETECT_TIMEOUT, stream.read_exact(&mut first))
         .await
         .map_err(|_| {
             io::Error::new(
@@ -145,13 +231,12 @@ async fn handle(
                 "mixed protocol detection timed out",
             )
         })??;
-    if n == 0 {
-        return Ok(());
-    }
-    if peek[0] == 0x05 {
+    let stream: BoxedStream = Box::pin(PrefixedStream::new(stream, first[0]));
+    if first[0] == 0x05 {
         handle_socks5(
-            sock,
+            stream,
             peer,
+            local,
             runtime,
             auth.as_deref().map(|v| v.as_slice()),
             udp_enabled,
@@ -159,15 +244,230 @@ async fn handle(
         )
         .await
     } else {
-        handle_http(sock, peer, runtime, auth.as_deref().map(|v| v.as_slice())).await
+        handle_http(
+            stream,
+            peer,
+            local,
+            runtime,
+            auth.as_deref().map(|v| v.as_slice()),
+            stream_settings
+                .as_ref()
+                .and_then(|settings| settings.sockopt.as_ref())
+                .map(|sockopt| sockopt.trusted_x_forwarded_for.as_slice())
+                .unwrap_or_default(),
+        )
+        .await
+    }
+}
+
+/// Replays the protocol discriminator consumed after FinalMask decoding.
+struct PrefixedStream {
+    inner: BoxedStream,
+    prefix: Option<u8>,
+}
+
+impl PrefixedStream {
+    fn new(inner: BoxedStream, prefix: u8) -> Self {
+        Self {
+            inner,
+            prefix: Some(prefix),
+        }
+    }
+}
+
+impl AsyncRead for PrefixedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() > 0
+            && let Some(prefix) = this.prefix.take()
+        {
+            buf.put_slice(&[prefix]);
+            return Poll::Ready(Ok(()));
+        }
+        this.inner.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
+    }
+}
+
+const PROXY_V2_SIGNATURE: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
+const PROXY_V1_MAX_LINE: usize = 108;
+
+/// Consume a required HAProxy PROXY protocol v1/v2 header and return the
+/// logical source and destination endpoints.  LOCAL/UNKNOWN preserve the
+/// kernel endpoints, while TCP4/TCP6 accept and ignore arbitrary v2 TLVs.
+pub(crate) async fn read_proxy_protocol<R>(
+    stream: &mut R,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> io::Result<(SocketAddr, SocketAddr)>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut prefix = [0u8; 6];
+    stream.read_exact(&mut prefix).await?;
+    if &prefix == b"PROXY " {
+        return read_proxy_v1(stream, peer, local).await;
+    }
+    if prefix == PROXY_V2_SIGNATURE[..6] {
+        let mut signature_tail = [0u8; 6];
+        stream.read_exact(&mut signature_tail).await?;
+        if signature_tail != PROXY_V2_SIGNATURE[6..] {
+            return Err(invalid_data("invalid PROXY protocol v2 signature"));
+        }
+        return read_proxy_v2(stream, peer, local).await;
+    }
+    Err(invalid_data("required PROXY protocol header is missing"))
+}
+
+async fn read_proxy_v1<R>(
+    stream: &mut R,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> io::Result<(SocketAddr, SocketAddr)>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut line = b"PROXY ".to_vec();
+    while line.len() < PROXY_V1_MAX_LINE {
+        let byte = stream.read_u8().await?;
+        line.push(byte);
+        if line.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    if !line.ends_with(b"\r\n") {
+        return Err(invalid_data("PROXY protocol v1 header exceeds 108 bytes"));
+    }
+    let text = std::str::from_utf8(&line[6..line.len() - 2])
+        .map_err(|_| invalid_data("PROXY protocol v1 header is not ASCII"))?;
+    let fields = text.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.first() == Some(&"UNKNOWN") {
+        return Ok((peer, local));
+    }
+    if fields.len() != 5 || !matches!(fields[0], "TCP4" | "TCP6") {
+        return Err(invalid_data("invalid PROXY protocol v1 address record"));
+    }
+    let source_ip = fields[1]
+        .parse::<IpAddr>()
+        .map_err(|_| invalid_data("invalid PROXY protocol v1 source address"))?;
+    let destination_ip = fields[2]
+        .parse::<IpAddr>()
+        .map_err(|_| invalid_data("invalid PROXY protocol v1 destination address"))?;
+    let source_port = fields[3]
+        .parse::<u16>()
+        .map_err(|_| invalid_data("invalid PROXY protocol v1 source port"))?;
+    let destination_port = fields[4]
+        .parse::<u16>()
+        .map_err(|_| invalid_data("invalid PROXY protocol v1 destination port"))?;
+    let expected_v4 = fields[0] == "TCP4";
+    if source_ip.is_ipv4() != expected_v4 || destination_ip.is_ipv4() != expected_v4 {
+        return Err(invalid_data("PROXY protocol v1 address family mismatch"));
+    }
+    Ok((
+        SocketAddr::new(source_ip, source_port),
+        SocketAddr::new(destination_ip, destination_port),
+    ))
+}
+
+async fn read_proxy_v2<R>(
+    stream: &mut R,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> io::Result<(SocketAddr, SocketAddr)>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await?;
+    if header[0] >> 4 != 0x2 {
+        return Err(invalid_data("invalid PROXY protocol v2 version"));
+    }
+    let command = header[0] & 0x0f;
+    if command > 1 {
+        return Err(invalid_data("unsupported PROXY protocol v2 command"));
+    }
+    let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await?;
+    if command == 0 {
+        return Ok((peer, local));
+    }
+    let family = header[1] >> 4;
+    let protocol = header[1] & 0x0f;
+    if family == 0 && protocol == 0 {
+        return Ok((peer, local));
+    }
+    if protocol != 1 {
+        return Err(invalid_data(
+            "PROXY protocol v2 record on a TCP listener must use STREAM",
+        ));
+    }
+    match family {
+        1 => {
+            if payload.len() < 12 {
+                return Err(invalid_data("truncated PROXY protocol v2 TCP4 address"));
+            }
+            let source = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    payload[0], payload[1], payload[2], payload[3],
+                )),
+                u16::from_be_bytes([payload[8], payload[9]]),
+            );
+            let destination = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    payload[4], payload[5], payload[6], payload[7],
+                )),
+                u16::from_be_bytes([payload[10], payload[11]]),
+            );
+            Ok((source, destination))
+        }
+        2 => {
+            if payload.len() < 36 {
+                return Err(invalid_data("truncated PROXY protocol v2 TCP6 address"));
+            }
+            let source_bytes: [u8; 16] = payload[..16].try_into().unwrap();
+            let destination_bytes: [u8; 16] = payload[16..32].try_into().unwrap();
+            let source = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(source_bytes)),
+                u16::from_be_bytes([payload[32], payload[33]]),
+            );
+            let destination = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(destination_bytes)),
+                u16::from_be_bytes([payload[34], payload[35]]),
+            );
+            Ok((source, destination))
+        }
+        _ => Err(invalid_data("unsupported PROXY protocol v2 address family")),
     }
 }
 
 /* ---------------- SOCKS5 ---------------- */
 
 async fn handle_socks5(
-    mut sock: TcpStream,
+    mut sock: BoxedStream,
     peer: SocketAddr,
+    inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
     udp_enabled: bool,
@@ -190,12 +490,21 @@ async fn handle_socks5(
                     .await?;
                 return Err(invalid_data("SOCKS5 CONNECT target port must not be zero"));
             }
-            handle_socks5_connect(sock, peer, runtime, request.address, request.port).await
+            handle_socks5_connect(
+                sock,
+                peer,
+                inbound_addr,
+                runtime,
+                request.address,
+                request.port,
+            )
+            .await
         }
         SOCKS_CMD_UDP_ASSOCIATE if udp_enabled => {
             handle_socks5_udp_associate(
                 sock,
                 peer,
+                inbound_addr,
                 runtime,
                 request.address,
                 request.port,
@@ -231,10 +540,13 @@ async fn handle_socks5(
     }
 }
 
-async fn negotiate_socks5_auth(
-    sock: &mut TcpStream,
+async fn negotiate_socks5_auth<S>(
+    sock: &mut S,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     // VER + NMETHODS
     let mut head = [0u8; 2];
     read_control(sock, &mut head).await?;
@@ -308,7 +620,10 @@ async fn negotiate_socks5_auth(
     Ok(())
 }
 
-async fn read_socks5_request(sock: &mut TcpStream) -> Result<SocksRequest, SocksRequestError> {
+async fn read_socks5_request<S>(sock: &mut S) -> Result<SocksRequest, SocksRequestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     let mut h = [0u8; 4];
     read_control(sock, &mut h)
         .await
@@ -372,14 +687,14 @@ async fn read_socks5_request(sock: &mut TcpStream) -> Result<SocksRequest, Socks
 }
 
 async fn handle_socks5_connect(
-    mut sock: TcpStream,
+    mut sock: BoxedStream,
     peer: SocketAddr,
+    inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
     address: SocksAddress,
     port: u16,
 ) -> io::Result<()> {
     let handler = ListenerHandler::new(runtime);
-    let inbound_addr = sock.local_addr()?;
     let metadata =
         InboundMetadata::tcp("socks5", "Socks5", peer, inbound_addr, address.host(), port);
     match handler.prepare_tcp(metadata).await {
@@ -467,21 +782,30 @@ impl SocksRequestError {
     }
 }
 
-async fn read_control(sock: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
+async fn read_control<R>(sock: &mut R, buf: &mut [u8]) -> io::Result<()>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     timeout(SOCKS_CONTROL_IO_TIMEOUT, sock.read_exact(buf))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 control read timed out"))??;
     Ok(())
 }
 
-async fn write_control(sock: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
+async fn write_control<W>(sock: &mut W, buf: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     timeout(SOCKS_CONTROL_IO_TIMEOUT, sock.write_all(buf))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 control write timed out"))??;
     Ok(())
 }
 
-async fn send_socks5_reply(sock: &mut TcpStream, reply: u8, bound: SocketAddr) -> io::Result<()> {
+async fn send_socks5_reply<W>(sock: &mut W, reply: u8, bound: SocketAddr) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     let mut frame = Vec::with_capacity(22);
     frame.extend_from_slice(&[SOCKS_VERSION, reply, 0x00]);
     SocksAddress::Ip(bound.ip()).encode(&mut frame)?;
@@ -801,15 +1125,15 @@ fn advertised_udp_addr(
 }
 
 async fn handle_socks5_udp_associate(
-    mut control: TcpStream,
+    mut control: BoxedStream,
     peer: SocketAddr,
+    control_local: SocketAddr,
     runtime: Arc<Runtime>,
     client_address: SocksAddress,
     client_port: u16,
     limits: UdpRelayLimits,
     udp_session_permits: Arc<Semaphore>,
 ) -> io::Result<()> {
-    let control_local = control.local_addr()?;
     let mut client_pin = match client_pin_from_request(&client_address, client_port, peer).await {
         Ok(pin) => pin,
         Err(error) => {
@@ -1199,10 +1523,12 @@ async fn shutdown_udp_sessions(
 /* ---------------- HTTP ---------------- */
 
 async fn handle_http(
-    mut sock: TcpStream,
+    mut sock: BoxedStream,
     peer: SocketAddr,
+    inbound_addr: SocketAddr,
     runtime: Arc<Runtime>,
     auth: Option<&[core_config::runtime_plan::UserPass]>,
+    trusted_x_forwarded_for: &[String],
 ) -> io::Result<()> {
     let (head, prefetched) = match read_http_head(&mut sock, HTTP_HEADER_TIMEOUT).await {
         Ok(value) => value,
@@ -1256,7 +1582,7 @@ async fn handle_http(
     };
 
     let handler = ListenerHandler::new(runtime);
-    let inbound_addr = sock.local_addr()?;
+    let peer = apply_trusted_x_forwarded_for(&request, trusted_x_forwarded_for, peer);
     match route {
         HttpRoute::Connect(authority) => {
             let metadata = InboundMetadata::tcp(
@@ -1697,6 +2023,38 @@ impl HttpRequestHead {
             .map(trim_http_ows)
             .any(|option| option.eq_ignore_ascii_case(name.as_bytes()))
     }
+}
+
+/// Xray interprets `trustedXForwardedFor` as a list of trusted marker header
+/// names (for example `X-Trusted-CDN`), not as a CIDR allowlist.  Only when at
+/// least one marker is present may the first IP in X-Forwarded-For replace the
+/// transport peer; malformed/domain values are ignored.
+fn apply_trusted_x_forwarded_for(
+    request: &HttpRequestHead,
+    trusted_headers: &[String],
+    peer: SocketAddr,
+) -> SocketAddr {
+    let Some(value) = request.header("x-forwarded-for") else {
+        return peer;
+    };
+    if !trusted_headers
+        .iter()
+        .any(|name| request.header(name).is_some())
+    {
+        return peer;
+    }
+    let first = value
+        .split(|byte| *byte == b',')
+        .next()
+        .map(trim_http_ows)
+        .unwrap_or_default();
+    let Ok(first) = std::str::from_utf8(first) else {
+        return peer;
+    };
+    let Ok(ip) = first.parse::<IpAddr>() else {
+        return peer;
+    };
+    SocketAddr::new(ip, 0)
 }
 
 fn parse_absolute_target(target: &str) -> io::Result<ForwardTarget> {
@@ -2360,7 +2718,10 @@ fn validate_http_trailer_name(name: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-async fn write_http_control(sock: &mut TcpStream, response: &[u8]) -> io::Result<()> {
+async fn write_http_control<W>(sock: &mut W, response: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     timeout(HTTP_CONTROL_IO_TIMEOUT, sock.write_all(response))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP response write timed out"))?
@@ -2386,11 +2747,119 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = occupied.local_addr().unwrap();
 
-        let error = bind_mixed_listener(address)
+        let error = bind_mixed_listener(address, None)
             .await
             .expect_err("must not fall back to an undeclared port");
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn mixed_stream_settings_fail_closed_for_unexecutable_udp_and_quic_fields() {
+        let udp = core_config::NodeStreamSettings {
+            network: Some("raw".into()),
+            finalmask: Some(core_config::FinalMaskConfig {
+                udp: vec![core_config::UdpMaskConfig::MkcpLegacy(Default::default())],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = validate_mixed_stream_settings(Some(&udp)).unwrap_err();
+        assert!(error.to_string().contains("wrap_udp_server"));
+
+        let quic = core_config::NodeStreamSettings {
+            network: Some("raw".into()),
+            finalmask: Some(core_config::FinalMaskConfig {
+                quic_params: Some(core_config::QuicParamsConfig {
+                    congestion: "bbr".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = validate_mixed_stream_settings(Some(&quic)).unwrap_err();
+        assert!(error.to_string().contains("quicParams"));
+
+        let tcp = core_config::NodeStreamSettings {
+            network: Some("raw".into()),
+            finalmask: Some(core_config::FinalMaskConfig {
+                tcp: vec![core_config::TcpMaskConfig::Fragment(Default::default())],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_mixed_stream_settings(Some(&tcp)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_v1_preserves_payload_and_overrides_endpoints() {
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"PROXY TCP4 192.0.2.10 198.51.100.20 4567 443\r\nhello")
+                .await
+                .unwrap();
+        });
+        let kernel_peer = "127.0.0.1:1234".parse().unwrap();
+        let kernel_local = "127.0.0.1:7890".parse().unwrap();
+        let (peer, local) = read_proxy_protocol(&mut reader, kernel_peer, kernel_local)
+            .await
+            .unwrap();
+        assert_eq!(peer, "192.0.2.10:4567".parse().unwrap());
+        assert_eq!(local, "198.51.100.20:443".parse().unwrap());
+        let mut payload = [0u8; 5];
+        reader.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_v2_tcp6_consumes_tlvs_without_eating_payload() {
+        let source = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+        let destination = "2001:db8::2".parse::<Ipv6Addr>().unwrap();
+        let mut record = PROXY_V2_SIGNATURE.to_vec();
+        record.extend_from_slice(&[0x21, 0x21]);
+        let address_and_tlv_length = 36u16 + 5;
+        record.extend_from_slice(&address_and_tlv_length.to_be_bytes());
+        record.extend_from_slice(&source.octets());
+        record.extend_from_slice(&destination.octets());
+        record.extend_from_slice(&12345u16.to_be_bytes());
+        record.extend_from_slice(&8443u16.to_be_bytes());
+        record.extend_from_slice(&[0x01, 0x00, 0x02, b'h', b'2']);
+        record.extend_from_slice(b"next");
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            writer.write_all(&record).await.unwrap();
+        });
+        let (peer, local) = read_proxy_protocol(
+            &mut reader,
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer, "[2001:db8::1]:12345".parse().unwrap());
+        assert_eq!(local, "[2001:db8::2]:8443".parse().unwrap());
+        let mut payload = [0u8; 4];
+        reader.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"next");
+    }
+
+    #[test]
+    fn trusted_xff_requires_configured_marker_header() {
+        let request = parse_http_request_head(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nX-Forwarded-For: 192.0.2.1, 198.51.100.2\r\nX-Trusted-CDN: \r\n\r\n",
+        )
+        .unwrap();
+        let peer = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&request, &["X-Trusted-CDN".into()], peer),
+            "192.0.2.1:0".parse().unwrap()
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&request, &["X-Other".into()], peer),
+            peer
+        );
     }
 
     fn test_runtime() -> Arc<Runtime> {
@@ -2404,7 +2873,7 @@ route:
 "#,
         )
         .unwrap();
-        Arc::new(Runtime::build(plan))
+        Arc::new(Runtime::build(plan).unwrap())
     }
 
     struct TestMixedServer {
@@ -2429,6 +2898,7 @@ route:
             listen: addr,
             auth,
             udp,
+            stream_settings: None,
         };
         let runtime = test_runtime();
         let task = tokio::spawn(async move {
