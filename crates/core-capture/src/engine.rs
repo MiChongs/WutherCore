@@ -438,6 +438,66 @@ fn decide_kind(c: &Capture) -> Result<EngineKind, CaptureError> {
     decide_kind_for_os(c, std::env::consts::OS)
 }
 
+/// Machine-readable platform/data-plane contract exposed by every engine.
+///
+/// Callers should use this instead of inferring support from an engine name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CaptureCapabilities {
+    pub ipv4: bool,
+    pub ipv6: bool,
+    pub tcp: bool,
+    pub udp: bool,
+    pub dns_hijack: bool,
+    pub transparent_tcp: bool,
+    pub transparent_udp: bool,
+    pub native_route_api: bool,
+    pub crash_recovery: bool,
+    pub network_rebind: bool,
+    pub outbound_loop_guard: bool,
+    pub interface_filter: bool,
+    pub uid_filter: bool,
+    pub application_filter: bool,
+    pub limitations: Vec<&'static str>,
+}
+
+impl CaptureCapabilities {
+    pub fn for_plan(plan: &CapturePlan) -> Self {
+        let linux_family = cfg!(any(target_os = "linux", target_os = "android"));
+        let transparent = matches!(plan.kind, EngineKind::Tproxy | EngineKind::Redirect);
+        let mut limitations = Vec::new();
+        if plan.kind == EngineKind::Redirect {
+            limitations.push("redirect_is_tcp_only");
+        }
+        if cfg!(target_os = "windows") && transparent {
+            limitations.push("windows_requires_tun");
+        }
+        if !cfg!(target_os = "android") && !plan.filters.include_package.is_empty() {
+            limitations.push("package_filter_requires_android");
+        }
+        Self {
+            ipv4: plan.kind != EngineKind::None,
+            ipv6: plan.kind != EngineKind::None && plan.ipv6_enabled,
+            tcp: plan.kind != EngineKind::None,
+            udp: !matches!(plan.kind, EngineKind::None | EngineKind::Redirect),
+            dns_hijack: plan.kind != EngineKind::None && plan.hijack_dns,
+            transparent_tcp: transparent,
+            transparent_udp: plan.kind == EngineKind::Tproxy,
+            native_route_api: cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "windows"
+            )),
+            crash_recovery: linux_family,
+            network_rebind: plan.kind != EngineKind::None,
+            outbound_loop_guard: plan.kind != EngineKind::None,
+            interface_filter: linux_family,
+            uid_filter: linux_family,
+            application_filter: cfg!(target_os = "android"),
+            limitations,
+        }
+    }
+}
+
 fn decide_kind_for_os(c: &Capture, os: &str) -> Result<EngineKind, CaptureError> {
     if !c.on {
         return Ok(EngineKind::None);
@@ -530,6 +590,7 @@ pub trait CaptureEngine: Send + Sync {
             "traffic": format!("{:?}", self.plan().traffic).to_lowercase(),
             "mtu": self.plan().mtu,
             "interface": self.plan().interface_name,
+            "capabilities": CaptureCapabilities::for_plan(self.plan()),
         })
     }
 }
@@ -582,6 +643,18 @@ mod tests {
             decide_kind_for_os(&capture, "windows").unwrap(),
             EngineKind::Tun
         );
+    }
+
+    #[test]
+    fn capability_contract_does_not_claim_udp_for_redirect() {
+        let mut plan = CapturePlan::from_config(&base()).unwrap();
+        plan.kind = EngineKind::Redirect;
+        let capabilities = CaptureCapabilities::for_plan(&plan);
+        assert!(capabilities.tcp);
+        assert!(!capabilities.udp);
+        assert!(capabilities.transparent_tcp);
+        assert!(!capabilities.transparent_udp);
+        assert!(capabilities.limitations.contains(&"redirect_is_tcp_only"));
     }
 
     #[test]

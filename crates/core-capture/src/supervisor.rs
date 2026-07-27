@@ -656,8 +656,13 @@ impl CaptureSupervisor {
             OutboundFwmarkLease::install(runtime.capture_outbound_fwmark())?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.plan.kind != EngineKind::Tun {
+            let mode = match self.plan.kind {
+                EngineKind::Tproxy => crate::platform::linux_recovery::RecoveryMode::Tproxy,
+                EngineKind::Redirect => crate::platform::linux_recovery::RecoveryMode::Redirect,
+                EngineKind::Tun | EngineKind::None => unreachable!(),
+            };
             transaction.resources_mut().crash_recovery = Some(
-                crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan)?,
+                crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan, mode)?,
             );
         }
         transaction.mark_engine_started();

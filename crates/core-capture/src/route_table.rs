@@ -16,7 +16,7 @@
 
 use std::{net::IpAddr, sync::Arc};
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use ipnet::IpNet;
@@ -37,6 +37,10 @@ pub struct ManagedRoute {
 pub trait RouteBackend: Send + Sync + std::fmt::Debug {
     fn add(&self, r: &ManagedRoute) -> Result<(), String>;
     fn del(&self, r: &ManagedRoute) -> Result<(), String>;
+    /// Ensure an owned route still exists without adding another ledger item.
+    fn ensure(&self, r: &ManagedRoute) -> Result<(), String> {
+        self.add(r)
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +83,23 @@ impl RouteTable {
 
     pub fn list(&self) -> Vec<ManagedRoute> {
         self.inner.lock().clone()
+    }
+
+    /// Re-assert routes already present in the ownership ledger.
+    ///
+    /// This is used after Windows network profile/interface changes, where
+    /// the OS may discard routes while the Wintun adapter remains alive.
+    pub fn reconcile_all(&self) -> Result<(), String> {
+        let routes = self.inner.lock().clone();
+        let errors = routes
+            .iter()
+            .filter_map(|route| self.backend.ensure(route).err())
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// 退出时回滚所有由本管理器创建的路由（best-effort）。
@@ -152,79 +173,45 @@ impl RouteBackend for SystemBackend {
     fn del(&self, r: &ManagedRoute) -> Result<(), String> {
         platform_del(r)
     }
+    #[cfg(target_os = "windows")]
+    fn ensure(&self, r: &ManagedRoute) -> Result<(), String> {
+        windows_ensure_route(r)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_add(r: &ManagedRoute) -> Result<(), String> {
-    let dest = r.dest.to_string();
-    let metric = r.metric.to_string();
-    let mut args: Vec<&str> = if r.dest.addr().is_ipv6() {
-        vec![
-            "-6",
-            "route",
-            "add",
-            &dest,
-            "dev",
-            &r.interface,
-            "metric",
-            &metric,
-        ]
-    } else {
-        vec![
-            "route",
-            "add",
-            &dest,
-            "dev",
-            &r.interface,
-            "metric",
-            &metric,
-        ]
-    };
-    let gw_str;
-    if let Some(gw) = r.gateway {
-        gw_str = gw.to_string();
-        args.extend_from_slice(&["via", &gw_str]);
-    }
-    let table_str;
-    if let Some(table) = r.table {
-        table_str = table.to_string();
-        args.extend_from_slice(&["table", &table_str]);
-    }
-    run_cmd("ip", &args)
+    crate::linux_netlink::add_route(r)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
-    let dest = r.dest.to_string();
-    let metric = r.metric.to_string();
-    let mut args: Vec<&str> = if r.dest.addr().is_ipv6() {
-        vec![
-            "-6",
-            "route",
-            "del",
-            &dest,
-            "dev",
-            &r.interface,
-            "metric",
-            &metric,
-        ]
+    crate::linux_netlink::delete_route(r)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ensure_route(r: &ManagedRoute) -> Result<(), String> {
+    let route = windows_native_route(r)?;
+    let mut manager = route_manager::RouteManager::new()
+        .map_err(|error| format!("open Windows IP Helper route manager: {error}"))?;
+    let exists = manager
+        .list()
+        .map_err(|error| format!("GetIpForwardTable2: {error}"))?
+        .into_iter()
+        .any(|current| {
+            current.destination() == route.destination()
+                && current.prefix() == route.prefix()
+                && current.if_name() == route.if_name()
+                && windows_gateway_matches(current.gateway(), route.gateway())
+                && current.metric() == route.metric()
+        });
+    if exists {
+        Ok(())
     } else {
-        vec![
-            "route",
-            "del",
-            &dest,
-            "dev",
-            &r.interface,
-            "metric",
-            &metric,
-        ]
-    };
-    let table_str;
-    if let Some(table) = r.table {
-        table_str = table.to_string();
-        args.extend_from_slice(&["table", &table_str]);
+        manager
+            .add(&route)
+            .map_err(|error| format!("recreate IP Helper route {}: {error}", r.dest))
     }
-    run_cmd("ip", &args)
 }
 
 #[cfg(target_os = "macos")]
@@ -266,6 +253,16 @@ fn platform_add(r: &ManagedRoute) -> Result<(), String> {
     manager
         .add(&route)
         .map_err(|error| format!("CreateIpForwardEntry2 for {}: {error}", r.dest))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_gateway_matches(current: Option<IpAddr>, expected: Option<IpAddr>) -> bool {
+    current == expected
+        || (expected.is_none()
+            && current.is_some_and(|gateway| match gateway {
+                IpAddr::V4(address) => address.is_unspecified(),
+                IpAddr::V6(address) => address.is_unspecified(),
+            }))
 }
 
 #[cfg(target_os = "windows")]
@@ -373,6 +370,7 @@ mod tests {
     struct FakeBackend {
         added: AtomicUsize,
         deleted: AtomicUsize,
+        ensured: AtomicUsize,
         fail_add: bool,
     }
 
@@ -387,6 +385,10 @@ mod tests {
         }
         fn del(&self, _r: &ManagedRoute) -> Result<(), String> {
             self.deleted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn ensure(&self, _r: &ManagedRoute) -> Result<(), String> {
+            self.ensured.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -582,6 +584,38 @@ mod tests {
         assert_eq!(native.prefix(), 1);
         assert_eq!(native.if_name().map(String::as_str), Some("WutherCoreTun"));
         assert_eq!(native.metric(), Some(1));
+    }
+
+    #[test]
+    fn reconcile_reasserts_ledger_without_duplicating_it() {
+        let backend = Arc::new(FakeBackend::default());
+        let table = RouteTable::with_backend(backend.clone());
+        table
+            .add(ManagedRoute {
+                dest: "0.0.0.0/1".parse().unwrap(),
+                gateway: None,
+                interface: "wuther0".into(),
+                metric: 1,
+                table: None,
+            })
+            .unwrap();
+        table.reconcile_all().unwrap();
+        assert_eq!(backend.ensured.load(Ordering::Relaxed), 1);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_unspecified_next_hop_matches_on_link_route() {
+        assert!(windows_gateway_matches(
+            Some("0.0.0.0".parse().unwrap()),
+            None
+        ));
+        assert!(windows_gateway_matches(Some("::".parse().unwrap()), None));
+        assert!(!windows_gateway_matches(
+            Some("192.0.2.1".parse().unwrap()),
+            None
+        ));
     }
 
     #[cfg(target_os = "windows")]

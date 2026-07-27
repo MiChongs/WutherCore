@@ -31,6 +31,8 @@ pub mod fakeip_dns;
 pub mod frame_cache;
 pub mod gc;
 pub mod ipset;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_netlink;
 pub mod nat;
 pub mod net_monitor;
 pub mod net_monitor_event;
@@ -67,8 +69,8 @@ pub use dial_meta::{DialTarget, DnsMode, build_dial_target};
 pub use doctor::{DoctorReport, diagnose};
 pub use eim_nat::{EimEntry, EimKey, EimNatTable};
 pub use engine::{
-    AutoRedirectMarks, CaptureEngine, CaptureError, CaptureEvent, CaptureFilters, CapturePlan,
-    EngineKind,
+    AutoRedirectMarks, CaptureCapabilities, CaptureEngine, CaptureError, CaptureEvent,
+    CaptureFilters, CapturePlan, EngineKind,
 };
 pub use ipset::{
     IpSetPrefixSemantics, IpSetPrefixSet, IpSetPrefixSnapshot, IpSetPrefixStatus, IpSetProvider,

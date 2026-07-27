@@ -47,6 +47,8 @@ tun-rs = { version = "2", features = ["async"] }
 nix      = { version = "0.29", features = ["net", "socket", "ioctl", "fs", "user"] }
 libc     = "0.2"
 caps     = { workspace = true }
+rtnetlink = { workspace = true }
+netlink-packet-route = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # blake3 用于 wintun adapter 稳定 GUID

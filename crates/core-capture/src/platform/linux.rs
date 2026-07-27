@@ -654,6 +654,7 @@ impl CaptureEngine for LinuxTun {
             // route, rule, firewall, or interface mutation.
             g.crash_recovery = Some(crate::platform::linux_recovery::LinuxCaptureGuard::acquire(
                 &effective_plan,
+                crate::platform::linux_recovery::RecoveryMode::Tun,
             )?);
             Self::configure_iface(&effective_plan, device.as_ref())?;
 
@@ -2478,14 +2479,27 @@ impl LinuxTproxy {
                 "IPv6 TPROXY 需要 ip6tables mangle/TPROXY 支持；当前找不到 ip6tables".into(),
             ));
         }
-        if !ip_rule_supported() {
-            return Err(CaptureError::Doctor(
-                "TPROXY 需要 ip rule 支持，用于 fwmark local route".into(),
-            ));
-        }
+        crate::linux_netlink::install_tproxy_policy(
+            plan.ipv6_enabled,
+            tproxy_rules::TPROXY_FWMARK,
+            tproxy_rules::TPROXY_ROUTE_TABLE,
+        )
+        .map_err(|reason| {
+            CaptureError::Doctor(format!(
+                "TPROXY native netlink policy-route setup failed: {reason}"
+            ))
+        })?;
 
-        for cmd in tproxy_rules::setup_commands(plan, outbound_mark) {
+        for cmd in tproxy_rules::setup_commands(plan, outbound_mark)
+            .into_iter()
+            .filter(|cmd| cmd.program != "ip")
+        {
             run_tproxy_command(&cmd).map_err(|reason| {
+                crate::linux_netlink::remove_tproxy_policy(
+                    plan.ipv6_enabled,
+                    tproxy_rules::TPROXY_FWMARK,
+                    tproxy_rules::TPROXY_ROUTE_TABLE,
+                );
                 CaptureError::Doctor(format!(
                     "TPROXY rule command failed: `{}`: {reason}",
                     cmd.render()
@@ -2503,7 +2517,10 @@ impl LinuxTproxy {
     }
 
     fn revert_rules(plan: &CapturePlan) {
-        for cmd in tproxy_rules::cleanup_commands(plan) {
+        for cmd in tproxy_rules::cleanup_commands(plan)
+            .into_iter()
+            .filter(|cmd| cmd.program != "ip")
+        {
             if let Err(reason) = run_tproxy_command(&cmd) {
                 debug!(
                     target: "capture::tproxy::rules",
@@ -2513,6 +2530,11 @@ impl LinuxTproxy {
                 );
             }
         }
+        crate::linux_netlink::remove_tproxy_policy(
+            plan.ipv6_enabled,
+            tproxy_rules::TPROXY_FWMARK,
+            tproxy_rules::TPROXY_ROUTE_TABLE,
+        );
     }
 }
 
