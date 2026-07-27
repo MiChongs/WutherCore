@@ -12,18 +12,29 @@ on:
         required: false
         type: string
         default: ""
+      tags:
+        description: Exact comma-separated component tags; empty uses the standard build.
+        required: false
+        type: string
+        default: ""
       retention-days:
         description: Artifact retention period.
         required: false
         type: number
         default: 1
   workflow_dispatch:
+    inputs:
+      tags:
+        description: Exact component tags, for example with_quic,with_vless,with_grpc. Empty uses standard.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.workflow }}-${{ github.ref }}-${{ inputs.tags || 'standard' }}
   cancel-in-progress: true
 
 env:
@@ -70,6 +81,24 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Resolve component tags
+        shell: bash
+        env:
+          REQUESTED_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          normalized="$(tr ' ;' ',,' <<< "$REQUESTED_TAGS" | sed -E 's/,+/,/g; s/^,//; s/,$//')"
+          if [ -n "$normalized" ] && [[ ! "$normalized" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
+            exit 1
+          fi
+          echo "WUTHER_BUILD_TAGS=$normalized" >> "$GITHUB_ENV"
+          if [ -n "$normalized" ]; then
+            echo "WUTHER_BUILD_TAG_LABEL=$normalized" >> "$GITHUB_ENV"
+          else
+            echo "WUTHER_BUILD_TAG_LABEL=standard (default)" >> "$GITHUB_ENV"
+          fi
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,12 +143,22 @@ jobs:
       - name: Run Cargo NDK Build (Android)
         if: matrix.platform.is_android == true
         run: |
-          cargo ndk --target ${{ matrix.platform.target }} --platform 24 build --release --locked -p wuther-core
+          feature_args=()
+          if [ -n "$WUTHER_BUILD_TAGS" ]; then
+            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+          fi
+          cargo ndk --target ${{ matrix.platform.target }} --platform 24 \
+            build --release --locked -p wuther-core "${feature_args[@]}"
 
       - name: Run Cross Build (Non-Android)
         if: matrix.platform.is_android != true
         run: |
-          cross build --release --locked --target ${{ matrix.platform.target }} -p wuther-core
+          feature_args=()
+          if [ -n "$WUTHER_BUILD_TAGS" ]; then
+            feature_args=(--no-default-features --features "$WUTHER_BUILD_TAGS")
+          fi
+          cross build --release --locked --target ${{ matrix.platform.target }} \
+            -p wuther-core "${feature_args[@]}"
 
       - name: Package Artifacts
         env:
@@ -144,6 +183,11 @@ jobs:
           cp README.md LICENSE ./pkg_dir/
           cp third_party/xray-transport/LICENSE-MPL-2.0 ./pkg_dir/licenses/xray-transport-MPL-2.0.txt
           cp -R examples ./pkg_dir/
+          {
+            echo "version=${RELEASE_VERSION:-workspace}"
+            echo "target=${{ matrix.platform.target }}"
+            echo "tags=$WUTHER_BUILD_TAG_LABEL"
+          } > ./pkg_dir/BUILD-COMPONENTS.txt
 
           ARCHIVE_NAME="wuther-core-${PLATFORM_NAME}.zip"
           if [ -n "$RELEASE_VERSION" ]; then

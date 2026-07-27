@@ -16,6 +16,7 @@ use core_config::model::XhttpDownloadTlsSettings;
 
 use crate::adapter::BoxedStream;
 
+#[cfg(feature = "with_utls")]
 pub(crate) mod boring_tls;
 mod browser_identity;
 pub(crate) mod ech;

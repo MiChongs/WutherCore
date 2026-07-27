@@ -17,10 +17,78 @@ build.cmd linux
 :: 多目标 + 先清理
 build.cmd --clean windows linux
 
+:: 精确组件构建（指定 --tags 后不会隐式加入 standard）
+build.cmd --tags "with_quic,with_vless,with_grpc,with_utls" windows
+
 :: 强制使用某个后端
 pwsh -File scripts/build-all.ps1 -Backend zigbuild -Targets "x86_64-unknown-linux-musl"
 pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "aarch64-linux-android"
 ```
+
+## 按组件标签编译
+
+WutherCore 使用 Cargo features 提供与 Go `-tags` 等价的编译期组件裁剪。未指定
+`--tags` 时使用 `standard`，行为与引入组件标签前一致（除需单独许可的 Naive
+外全部启用）。一旦指定 `--tags`，脚本会自动添加 `--no-default-features`，只有
+列出的标签及其依赖会进入构建。
+
+```cmd
+:: VLESS + gRPC + uTLS，只构建 Windows x64
+build.cmd --tags "with_vless,with_grpc,with_utls" windows
+
+:: Hysteria 2 会自动带上 with_quic
+build.cmd --tags "with_hysteria2" linux
+
+:: 完整标准集
+build.cmd --tags "standard" windows
+
+:: 标准集再加 GPL/Cronet Naive
+build.cmd --tags "all_components" windows
+```
+
+也可以直接使用 Cargo：
+
+```bash
+cargo build --release -p wuther-core \
+  --no-default-features \
+  --features "with_quic,with_vless,with_grpc,with_utls"
+
+# 检查一个二进制实际包含哪些组件
+wuther-core components
+wuther-core components --json
+```
+
+### 可用标签
+
+| 类别 | 标签 | 能力 |
+|---|---|---|
+| 预设 | `standard` | 默认标准组件集，不含 Naive/Cronet |
+| 预设 | `all_components` | `standard` 加 `with_naive` |
+| 运行组件 | `with_api` | 管理 API 与面板服务 |
+| 运行组件 | `with_tun` | TUN/TProxy/Redirect capture |
+| 传输 | `with_quic` | QUIC/H3 基础能力 |
+| 传输 | `with_grpc` | Xray gRPC 入站与出站传输 |
+| 传输 | `with_reality` | REALITY |
+| 传输 | `with_utls` | uTLS ClientHello 指纹 |
+| 传输 | `with_ws` | WebSocket 传输 |
+| 传输 | `with_http_transport` | HTTP/2 transport |
+| 传输 | `with_xhttp` | XHTTP/SplitHTTP（自动启用 `with_quic`） |
+| 协议 | `with_http`, `with_socks` | HTTP 与 SOCKS5 出站 |
+| 协议 | `with_shadowsocks`, `with_shadowsocksr` | Shadowsocks/2022 与 SSR |
+| 协议 | `with_vmess`, `with_vless`, `with_trojan` | VMess、VLESS、Trojan |
+| 协议 | `with_hysteria`, `with_hysteria2`, `with_tuic` | QUIC 协议（自动启用 `with_quic`） |
+| 协议 | `with_wireguard` | WireGuard 客户端与服务端 |
+| 协议 | `with_anytls`, `with_snell`, `with_ssh` | AnyTLS、Snell、SSH |
+| 协议 | `with_mieru`, `with_sudoku`, `with_trusttunnel` | Mieru、Sudoku、TrustTunnel |
+| 协议 | `with_young` | Young + Mozilla Neqo/NSS |
+| 协议 | `with_naive` | Naive + Cronet；需单独满足 GPL 与原生库要求 |
+
+`DIRECT`、`BLOCK` 与 DNS hijack 是路由运行时的基础能力，所有构建始终保留。
+若配置引用了未编译组件，`check` 和 `run` 会直接给出缺少的 `with_*` 标签，不会
+静默注册占位实现。每个本地和 CI 归档都包含 `BUILD-COMPONENTS.txt`。
+
+GitHub Actions 的 **Build Matrix** 和 **CI** 手动运行入口也提供 `tags` 输入，
+语义与本地 `--tags` 完全相同；留空使用 `standard`。
 
 ## 短别名
 

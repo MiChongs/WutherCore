@@ -8,6 +8,7 @@ REM   build.cmd                              default target matrix
 REM   build.cmd x86_64-pc-windows-msvc       single target
 REM   build.cmd --clean                      cargo clean before build
 REM   build.cmd android                      shorthand for aarch64-linux-android
+REM   build.cmd --tags "with_quic,with_vless" windows
 REM Other args are forwarded to scripts\build-all.ps1.
 
 set "SCRIPT_DIR=%~dp0"
@@ -41,7 +42,21 @@ if /I "%~1"=="--skip-checks" (
     goto parse
 )
 if /I "%~1"=="--profile" (
+    if "%~2"=="" (
+        echo ERROR: --profile requires a value.
+        exit /b 2
+    )
     set "EXTRA_ARGS=!EXTRA_ARGS! -Profile %~2"
+    shift
+    shift
+    goto parse
+)
+if /I "%~1"=="--tags" (
+    if "%~2"=="" (
+        echo ERROR: --tags requires a comma-separated value.
+        exit /b 2
+    )
+    set "EXTRA_ARGS=!EXTRA_ARGS! -Tags ""%~2"""
     shift
     shift
     goto parse

@@ -203,6 +203,11 @@ jobs:
           cp README.md LICENSE "$package_dir/"
           cp third_party/xray-transport/LICENSE-MPL-2.0 "$package_dir/licenses/xray-transport-MPL-2.0.txt"
           cp -R examples "$package_dir/"
+          {
+            echo "version=$RELEASE_VERSION"
+            echo "target=$TARGET"
+            echo "tags=standard (default)"
+          } > "$package_dir/BUILD-COMPONENTS.txt"
 
           cd "$package_dir"
           zip -X -r "../dist/$archive" .
@@ -226,6 +231,11 @@ jobs:
           Copy-Item README.md, LICENSE $packageDir
           Copy-Item examples (Join-Path $packageDir 'examples') -Recurse
           Copy-Item third_party/xray-transport/LICENSE-MPL-2.0 (Join-Path $licenseDir 'xray-transport-MPL-2.0.txt')
+          @(
+            "version=$env:RELEASE_VERSION"
+            "target=$env:TARGET"
+            "tags=standard (default)"
+          ) | Set-Content -Path (Join-Path $packageDir 'BUILD-COMPONENTS.txt') -Encoding UTF8
           Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath $archive -CompressionLevel Optimal
 
       - name: Upload artifact

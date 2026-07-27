@@ -4,12 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["with_tun"]
+with_tun = ["dep:core-capture"]
+
 [dependencies]
 core-config  = { workspace = true }
 core-smart   = { workspace = true }
 core-runtime = { workspace = true }
 core-route   = { workspace = true }
-core-capture = { workspace = true }
+core-capture = { workspace = true, optional = true }
 core-mesh    = { workspace = true }
 core-feeds   = { workspace = true }
 core-observe = { workspace = true }

@@ -8,17 +8,28 @@ on:
         required: false
         type: string
         default: ""
+      tags:
+        description: Exact component tags; empty validates the standard workspace.
+        required: false
+        type: string
+        default: ""
   pull_request:
     branches: ["main"]
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      tags:
+        description: Exact component tags, for example with_quic,with_vless,with_grpc. Empty uses standard.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}-${{ inputs.tags || 'standard' }}
   cancel-in-progress: true
 
 env:
@@ -73,8 +84,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Resolve component tags
+        shell: bash
+        env:
+          REQUESTED_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          normalized="$(tr ' ;' ',,' <<< "$REQUESTED_TAGS" | sed -E 's/,+/,/g; s/^,//; s/,$//')"
+          if [ -n "$normalized" ] && [[ ! "$normalized" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
+            exit 1
+          fi
+          echo "WUTHER_BUILD_TAGS=$normalized" >> "$GITHUB_ENV"
+
       # Validate every Rust target without repeatedly linking the full workspace.
       # Feature-specific linking and artifact validation belong to their dedicated
       # workflows.
       - name: Check workspace
-        run: cargo check --workspace --all-targets --locked
+        shell: bash
+        run: |
+          if [ -n "$WUTHER_BUILD_TAGS" ]; then
+            cargo check -p wuther-core --all-targets --locked \
+              --no-default-features --features "$WUTHER_BUILD_TAGS"
+          else
+            cargo check --workspace --all-targets --locked
+          fi

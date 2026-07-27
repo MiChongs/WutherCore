@@ -19,6 +19,7 @@ pub struct NativeState {
     pub secret: Option<String>,
     pub urltest: Arc<UrlTester>,
     /// 由 main.rs 在 capture 启动后注入；为空时 /v1/capture/state 仅回静态配置。
+    #[cfg(feature = "with_tun")]
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
     /// 统一组网监督器；`/v1/mesh/status` 只返回脱敏后的结构化快照。
     pub mesh: Option<Arc<core_mesh::MeshSupervisor>>,
@@ -46,6 +47,7 @@ impl NativeState {
             started_at: std::time::Instant::now(),
             secret: None,
             urltest,
+            #[cfg(feature = "with_tun")]
             capture: None,
             mesh: None,
             feeds,
@@ -253,6 +255,7 @@ async fn route_check(
 
 async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
     let c = &s.runtime.plan.capture;
+    #[allow(unused_mut)]
     let mut body = json!({
         "on": c.on,
         "method": format!("{:?}", c.method).to_lowercase(),
@@ -277,9 +280,12 @@ async fn capture_state(State(s): State<NativeState>) -> impl IntoResponse {
             "loopback_address": c.tun.loopback_address.clone(),
         }
     });
-    if let Some(sup) = &s.capture {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("runtime".into(), sup.report());
+    #[cfg(feature = "with_tun")]
+    {
+        if let Some(sup) = &s.capture {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("runtime".into(), sup.report());
+            }
         }
     }
     Json(body)

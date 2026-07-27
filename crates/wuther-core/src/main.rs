@@ -13,14 +13,18 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "with_api")]
 use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
-use core_inbound::{
-    GrpcListener, MixedListener, ShadowsocksListenerHandle, XhttpListenerHandle,
-    ensure_best_effort_privilege, run_grpc, run_mixed, start_shadowsocks_listeners,
-    start_xhttp_listeners,
-};
+#[cfg(feature = "with_grpc")]
+use core_inbound::{GrpcListener, run_grpc};
+use core_inbound::{MixedListener, ensure_best_effort_privilege, run_mixed};
+#[cfg(feature = "with_shadowsocks")]
+use core_inbound::{ShadowsocksListenerHandle, start_shadowsocks_listeners};
+#[cfg(feature = "with_xhttp")]
+use core_inbound::{XhttpListenerHandle, start_xhttp_listeners};
+#[cfg(feature = "with_wireguard")]
 use core_outbound::proto::wireguard::{
     WireGuardServer, WireGuardServerConfig, WireGuardServerPeerConfig,
 };
@@ -77,6 +81,12 @@ enum Cmd {
     Ruleset {
         #[command(subcommand)]
         action: RulesetCmd,
+    },
+    /// 显示当前二进制实际编译进入的组件标签。
+    Components {
+        /// 以 JSON 输出，便于脚本和部署系统读取。
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -177,7 +187,128 @@ fn main() -> anyhow::Result<()> {
                 .build()?;
             rt.block_on(cmd_ruleset(action))
         }
+        Cmd::Components { json } => cmd_components(json),
     }
+}
+
+fn compiled_component_tags() -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    macro_rules! push_tag {
+        ($feature:literal) => {
+            if cfg!(feature = $feature) {
+                tags.push($feature);
+            }
+        };
+    }
+    push_tag!("with_api");
+    push_tag!("with_tun");
+    push_tag!("with_anytls");
+    push_tag!("with_grpc");
+    push_tag!("with_hysteria");
+    push_tag!("with_hysteria2");
+    push_tag!("with_http");
+    push_tag!("with_http_transport");
+    push_tag!("with_mieru");
+    push_tag!("with_naive");
+    push_tag!("with_quic");
+    push_tag!("with_reality");
+    push_tag!("with_shadowsocks");
+    push_tag!("with_shadowsocksr");
+    push_tag!("with_snell");
+    push_tag!("with_socks");
+    push_tag!("with_ssh");
+    push_tag!("with_sudoku");
+    push_tag!("with_trojan");
+    push_tag!("with_trusttunnel");
+    push_tag!("with_tuic");
+    push_tag!("with_utls");
+    push_tag!("with_vless");
+    push_tag!("with_vmess");
+    push_tag!("with_wireguard");
+    push_tag!("with_ws");
+    push_tag!("with_xhttp");
+    push_tag!("with_young");
+    tags
+}
+
+fn cmd_components(json: bool) -> anyhow::Result<()> {
+    let tags = compiled_component_tags();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tags)?);
+    } else if tags.is_empty() {
+        println!("minimal (no optional component tags)");
+    } else {
+        println!("{}", tags.join(","));
+    }
+    Ok(())
+}
+
+fn validate_compiled_components(
+    plan: &core_config::runtime_plan::RuntimePlan,
+) -> anyhow::Result<()> {
+    for node in &plan.nodes {
+        core_outbound::registry::validate_node_components(node).map_err(|error| {
+            anyhow::anyhow!(
+                "node `{}` requires an omitted component: {error}",
+                node.name
+            )
+        })?;
+    }
+
+    macro_rules! require_empty {
+        ($enabled:expr, $value:expr, $name:literal, $tag:literal) => {
+            if !$enabled && !$value.is_empty() {
+                anyhow::bail!(
+                    "{} is configured but not compiled in; rebuild with `{}`",
+                    $name,
+                    $tag
+                );
+            }
+        };
+    }
+    require_empty!(
+        cfg!(feature = "with_grpc"),
+        plan.listen.grpc,
+        "gRPC inbound",
+        "with_grpc"
+    );
+    require_empty!(
+        cfg!(feature = "with_xhttp"),
+        plan.listen.xhttp,
+        "XHTTP inbound",
+        "with_xhttp"
+    );
+    require_empty!(
+        cfg!(feature = "with_shadowsocks"),
+        plan.listen.shadowsocks,
+        "Shadowsocks inbound",
+        "with_shadowsocks"
+    );
+    require_empty!(
+        cfg!(feature = "with_wireguard"),
+        plan.listen.wireguard,
+        "WireGuard inbound",
+        "with_wireguard"
+    );
+    require_empty!(
+        cfg!(feature = "with_young"),
+        plan.listen.young,
+        "Young inbound",
+        "with_young"
+    );
+    require_empty!(
+        cfg!(feature = "with_reality"),
+        plan.listen.reality,
+        "REALITY inbound",
+        "with_reality"
+    );
+    if plan.capture.on && !cfg!(feature = "with_tun") {
+        anyhow::bail!("capture/TUN is configured but not compiled in; rebuild with `with_tun`");
+    }
+    if plan.ui.on && !cfg!(feature = "with_api") {
+        anyhow::bail!("API/UI is configured but not compiled in; rebuild with `with_api`");
+    }
+    Ok(())
 }
 
 async fn cmd_ruleset(action: RulesetCmd) -> anyhow::Result<()> {
@@ -417,7 +548,7 @@ async fn cmd_feeds(action: FeedsCmd) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "with_tun"))]
 mod tests {
     use core_config::model::{Log, LogFile, LogFormat, LogLevel};
 
@@ -642,6 +773,7 @@ nodes: []
         assert!(wait_for_mesh_fail_stop(&mut updates).await.is_none());
     }
 
+    #[cfg(feature = "with_xhttp")]
     #[tokio::test]
     async fn configured_xhttp_is_prebound_by_main_startup_path() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -695,6 +827,7 @@ route:
 
 fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    validate_compiled_components(&plan)?;
     listener_resource_claims(&plan).context("listener resource validation failed")?;
     println!(
         "OK: {} 节点 / {} 分组 / {} 条规则",
@@ -707,6 +840,7 @@ fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
 
 fn cmd_explain(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    validate_compiled_components(&plan)?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
 }
@@ -744,6 +878,7 @@ fn tracing_config_from_user_log(log: &core_config::model::Log) -> core_observe::
 }
 
 /// Attach the process-level host owner to capture's platform-specific claims.
+#[cfg(feature = "with_tun")]
 fn capture_resource_claims(plan: &core_capture::CapturePlan) -> Vec<core_mesh::HostResourceClaim> {
     use core_mesh::{HostResourceClaim, HostSubsystemId};
     let owner =
@@ -756,6 +891,7 @@ fn capture_resource_claims(plan: &core_capture::CapturePlan) -> Vec<core_mesh::H
 
 async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     let plan = load_from_path(&config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    validate_compiled_components(&plan)?;
     if let Some(log) = &plan.log {
         core_observe::init_tracing_with_config(tracing_config_from_user_log(log), None);
     } else {
@@ -809,6 +945,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     // 诊断 capture / mesh
+    #[cfg(feature = "with_tun")]
     match core_capture::diagnose(&plan.capture, &plan.mesh) {
         Ok(report) => info!(target: "capture", report = ?report, "diagnose"),
         Err(e) => warn!(target: "capture", error = %e, "diagnose failed"),
@@ -820,10 +957,17 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     // 后续具体产品后端按独立 PR 加入 registry。即使 registry 为空，保留资源也会
     // 出现在 /v1/mesh/status，且同一条事务路径已经覆盖未来后端的
     // probe -> preflight -> reconcile。
-    let mut capture_plan = core_capture::CapturePlan::from_config(&plan.capture)
-        .map_err(|error| anyhow::anyhow!("capture resource declaration failed: {error}"))?;
-    capture_plan.ipv6_enabled = plan.resolver.ipv6;
+    #[cfg(feature = "with_tun")]
+    let capture_plan = {
+        let mut capture_plan = core_capture::CapturePlan::from_config(&plan.capture)
+            .map_err(|error| anyhow::anyhow!("capture resource declaration failed: {error}"))?;
+        capture_plan.ipv6_enabled = plan.resolver.ipv6;
+        capture_plan
+    };
+    #[cfg(feature = "with_tun")]
     let mut host_claims = capture_resource_claims(&capture_plan);
+    #[cfg(not(feature = "with_tun"))]
+    let mut host_claims = Vec::new();
     host_claims.extend(listener_resource_claims(&plan)?);
     let mesh_supervisor = Arc::new(core_mesh::MeshSupervisor::new(
         core_mesh::BackendRegistry::new(),
@@ -864,8 +1008,10 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     );
     // XHTTP 的证书/ALPN 与 TCP/UDP socket 必须在宣告进程启动前全部准备完成。
     // 任何一项失败都会关闭已启动的同类监听并直接返回 cmd_run。
+    #[cfg(feature = "with_xhttp")]
     let mut xhttp_listener_handles =
         start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
+    #[cfg(feature = "with_shadowsocks")]
     let mut shadowsocks_listener_handles =
         start_configured_shadowsocks_inbounds(&plan, runtime.clone()).await?;
 
@@ -943,161 +1089,171 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     // 启动 capture supervisor（如果配置开启）—— 复用上面建好的 ruleset_index。
     // auto_route / auto_redirect 会改系统路由：启动失败必须 fail-closed，
     // 不能 warn 后继续跑“半透明代理”状态。
+    #[cfg(feature = "with_tun")]
     let mut capture_handle: Option<Arc<core_capture::CaptureSupervisor>> = None;
-    let capture_fail_closed = plan.capture.on
-        && (plan.capture.tun.auto_route
-            || plan.capture.tun.auto_redirect
-            || matches!(
-                plan.capture.method,
-                core_config::model::CaptureMethod::Tproxy
-                    | core_config::model::CaptureMethod::Redirect
-            ));
-    match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6) {
-        Ok(Some(sup)) => {
-            // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
-            sup.set_ip_set_provider(Arc::new(RulesetIpSetProvider {
-                index: ruleset_index.clone(),
-            }));
-            if let Err(e) = sup.start(runtime.clone()).await {
+    #[cfg(feature = "with_tun")]
+    {
+        let capture_fail_closed = plan.capture.on
+            && (plan.capture.tun.auto_route
+                || plan.capture.tun.auto_redirect
+                || matches!(
+                    plan.capture.method,
+                    core_config::model::CaptureMethod::Tproxy
+                        | core_config::model::CaptureMethod::Redirect
+                ));
+        match core_capture::CaptureSupervisor::build(&plan.capture, &plan.mesh, plan.resolver.ipv6)
+        {
+            Ok(Some(sup)) => {
+                // 注入 IpSetProvider，把 ruleset 的 cidr_v4/cidr_v6 暴露给 supervisor.allow_ip。
+                sup.set_ip_set_provider(Arc::new(RulesetIpSetProvider {
+                    index: ruleset_index.clone(),
+                }));
+                if let Err(e) = sup.start(runtime.clone()).await {
+                    if capture_fail_closed {
+                        // 尽力停掉可能半装好的状态，再把错误抛给 CLI。
+                        let _ = sup.stop().await;
+                        let _ = mesh_supervisor.stop().await;
+                        runtime.shutdown().await;
+                        anyhow::bail!(
+                            "capture supervisor start failed under auto_route/tproxy/redirect \
+                         (fail-closed): {e}"
+                        );
+                    }
+                    warn!(target: "capture", error = %e, "capture supervisor start failed");
+                    // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
+                    // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
+                    // 否则 drop supervisor 会同时丢失路由/fwmark 的恢复入口。
+                    if let Err(cleanup_error) = sup.stop().await {
+                        return Err(anyhow::anyhow!(
+                            "capture start failed ({e}); cleanup retry also failed \
+                         ({cleanup_error}); refusing to continue with possibly active \
+                         transparent-capture state"
+                        ));
+                    }
+                } else {
+                    capture_handle = Some(sup);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
                 if capture_fail_closed {
-                    // 尽力停掉可能半装好的状态，再把错误抛给 CLI。
-                    let _ = sup.stop().await;
                     let _ = mesh_supervisor.stop().await;
                     runtime.shutdown().await;
                     anyhow::bail!(
-                        "capture supervisor start failed under auto_route/tproxy/redirect \
-                         (fail-closed): {e}"
+                        "capture supervisor build failed under auto_route/tproxy/redirect \
+                     (fail-closed): {e}"
                     );
                 }
-                warn!(target: "capture", error = %e, "capture supervisor start failed");
-                // start() 已尝试一次事务回滚；若平台 pre_stop/stop 当次失败，
-                // supervisor 会保留 CleanupFailed 账本。调用方必须显式重试，
-                // 否则 drop supervisor 会同时丢失路由/fwmark 的恢复入口。
-                if let Err(cleanup_error) = sup.stop().await {
-                    return Err(anyhow::anyhow!(
-                        "capture start failed ({e}); cleanup retry also failed \
-                         ({cleanup_error}); refusing to continue with possibly active \
-                         transparent-capture state"
-                    ));
-                }
-            } else {
-                capture_handle = Some(sup);
+                warn!(target: "capture", error = %e, "capture supervisor build failed");
             }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            if capture_fail_closed {
-                let _ = mesh_supervisor.stop().await;
-                runtime.shutdown().await;
-                anyhow::bail!(
-                    "capture supervisor build failed under auto_route/tproxy/redirect \
-                     (fail-closed): {e}"
-                );
-            }
-            warn!(target: "capture", error = %e, "capture supervisor build failed");
         }
     }
 
     let mut handles = Vec::new();
+    #[cfg(feature = "with_wireguard")]
     let mut wireguard_inbounds: Vec<(
         Arc<WireGuardServer>,
         core_capture::NetstackDispatcherHandles,
     )> = Vec::new();
 
-    // WireGuard 服务端入站。WireGuardServer 负责 NoiseIK、cookie/MAC、重放保护、
-    // roaming 与多 peer 路由；WireGuardTunIo 把认证后的裸 IP 包接入与系统 TUN
-    // 共用的 netstack dispatcher，因此 TCP 与 UDP 最终都经过同一 Runtime 路由。
-    for (index, listener) in plan.listen.wireguard.iter().enumerate() {
-        let peers = listener
-            .peers
-            .iter()
-            .map(|peer| WireGuardServerPeerConfig {
-                public_key: peer.public_key,
-                preshared_key: peer.preshared_key,
-                allowed_ips: peer.allowed_ips.clone(),
-                reserved: peer.reserved,
-                persistent_keepalive: peer.persistent_keepalive,
+    #[cfg(feature = "with_wireguard")]
+    {
+        // WireGuard 服务端入站。WireGuardServer 负责 NoiseIK、cookie/MAC、重放保护、
+        // roaming 与多 peer 路由；WireGuardTunIo 把认证后的裸 IP 包接入与系统 TUN
+        // 共用的 netstack dispatcher，因此 TCP 与 UDP 最终都经过同一 Runtime 路由。
+        for (index, listener) in plan.listen.wireguard.iter().enumerate() {
+            let peers = listener
+                .peers
+                .iter()
+                .map(|peer| WireGuardServerPeerConfig {
+                    public_key: peer.public_key,
+                    preshared_key: peer.preshared_key,
+                    allowed_ips: peer.allowed_ips.clone(),
+                    reserved: peer.reserved,
+                    persistent_keepalive: peer.persistent_keepalive,
+                })
+                .collect();
+            let server = match WireGuardServer::bind(WireGuardServerConfig {
+                bind: listener.bind,
+                private_key: listener.private_key,
+                peers,
+                mtu: listener.mtu,
+                packet_queue: listener.packet_queue,
+                handshake_rate_limit: listener.handshake_rate_limit,
             })
-            .collect();
-        let server = match WireGuardServer::bind(WireGuardServerConfig {
-            bind: listener.bind,
-            private_key: listener.private_key,
-            peers,
-            mtu: listener.mtu,
-            packet_queue: listener.packet_queue,
-            handshake_rate_limit: listener.handshake_rate_limit,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "bind WireGuard inbound listen.wireguard[{index}] at {}",
-                listener.bind
-            )
-        }) {
-            Ok(server) => Arc::new(server),
-            Err(error) => {
-                // A later listener can fail after earlier listeners already started their
-                // netstack tasks. Roll every subsystem back explicitly instead of relying
-                // on runtime teardown or detached Tokio task drops.
-                for (server, dispatcher) in wireguard_inbounds.drain(..) {
-                    dispatcher.stop();
-                    server.close().await;
-                }
-                if let Some(supervisor) = capture_handle.as_ref() {
-                    if let Err(cleanup_error) = supervisor.stop().await {
+            .await
+            .with_context(|| {
+                format!(
+                    "bind WireGuard inbound listen.wireguard[{index}] at {}",
+                    listener.bind
+                )
+            }) {
+                Ok(server) => Arc::new(server),
+                Err(error) => {
+                    // A later listener can fail after earlier listeners already started their
+                    // netstack tasks. Roll every subsystem back explicitly instead of relying
+                    // on runtime teardown or detached Tokio task drops.
+                    for (server, dispatcher) in wireguard_inbounds.drain(..) {
+                        dispatcher.stop();
+                        server.close().await;
+                    }
+                    if let Some(supervisor) = capture_handle.as_ref() {
+                        if let Err(cleanup_error) = supervisor.stop().await {
+                            warn!(
+                                target: "capture",
+                                error = %cleanup_error,
+                                "capture stop failed while rolling back WireGuard startup"
+                            );
+                        }
+                    }
+                    if let Err(cleanup_error) = mesh_supervisor.stop().await {
                         warn!(
-                            target: "capture",
+                            target: "mesh",
                             error = %cleanup_error,
-                            "capture stop failed while rolling back WireGuard startup"
+                            "mesh stop failed while rolling back WireGuard startup"
                         );
                     }
+                    feed_mgr_handle.stop();
+                    runtime.shutdown().await;
+                    return Err(error);
                 }
-                if let Err(cleanup_error) = mesh_supervisor.stop().await {
-                    warn!(
-                        target: "mesh",
-                        error = %cleanup_error,
-                        "mesh stop failed while rolling back WireGuard startup"
-                    );
-                }
-                feed_mgr_handle.stop();
-                runtime.shutdown().await;
-                return Err(error);
-            }
-        };
-        let mut dispatcher_plan = capture_plan.clone();
-        dispatcher_plan.mtu = std::num::NonZeroU16::new(
-            u16::try_from(listener.mtu).expect("validated WireGuard MTU always fits into u16"),
-        )
-        .expect("validated WireGuard MTU is non-zero");
-        dispatcher_plan.ipv6_enabled = plan.resolver.ipv6;
-        dispatcher_plan.allow_loopback_destination = true;
-        let fake_pool = runtime
-            .resolver
-            .fake_pool()
-            .unwrap_or_else(|| Arc::new(core_resolver::FakeIpPool::default()));
-        let dispatcher = Arc::new(core_capture::NetstackDispatcher::new(
-            dispatcher_plan.clone(),
-            Arc::new(core_capture::NatTable::default()),
-            Arc::new(core_capture::EimNatTable::new(dispatcher_plan.udp_timeout)),
-            fake_pool,
-            runtime.dns_service.clone(),
-            core_capture::noop_ipset_provider(),
-        ));
-        let device = Arc::new(core_capture::WireGuardTunIo::new(
-            server.clone(),
-            format!("wireguard-inbound-{index}"),
-            u32::from(dispatcher_plan.mtu.get()),
-        ));
-        let dispatcher_handles = dispatcher.start(device, runtime.clone());
-        info!(
-            target: "inbound::wireguard",
-            addr = %server.local_addr().unwrap_or(listener.bind),
-            peers = listener.peers.len(),
-            mtu = listener.mtu,
-            "WireGuard inbound ready (TCP+UDP)"
-        );
-        wireguard_inbounds.push((server, dispatcher_handles));
+            };
+            let mut dispatcher_plan = capture_plan.clone();
+            dispatcher_plan.mtu = std::num::NonZeroU16::new(
+                u16::try_from(listener.mtu).expect("validated WireGuard MTU always fits into u16"),
+            )
+            .expect("validated WireGuard MTU is non-zero");
+            dispatcher_plan.ipv6_enabled = plan.resolver.ipv6;
+            dispatcher_plan.allow_loopback_destination = true;
+            let fake_pool = runtime
+                .resolver
+                .fake_pool()
+                .unwrap_or_else(|| Arc::new(core_resolver::FakeIpPool::default()));
+            let dispatcher = Arc::new(core_capture::NetstackDispatcher::new(
+                dispatcher_plan.clone(),
+                Arc::new(core_capture::NatTable::default()),
+                Arc::new(core_capture::EimNatTable::new(dispatcher_plan.udp_timeout)),
+                fake_pool,
+                runtime.dns_service.clone(),
+                core_capture::noop_ipset_provider(),
+            ));
+            let device = Arc::new(core_capture::WireGuardTunIo::new(
+                server.clone(),
+                format!("wireguard-inbound-{index}"),
+                u32::from(dispatcher_plan.mtu.get()),
+            ));
+            let dispatcher_handles = dispatcher.start(device, runtime.clone());
+            info!(
+                target: "inbound::wireguard",
+                addr = %server.local_addr().unwrap_or(listener.bind),
+                peers = listener.peers.len(),
+                mtu = listener.mtu,
+                "WireGuard inbound ready (TCP+UDP)"
+            );
+            wireguard_inbounds.push((server, dispatcher_handles));
+        }
     }
+    #[cfg(feature = "with_young")]
     let mut young_server_handles = Vec::new();
 
     // Standalone DNS server —— mihomo `dns.listen` 等价。
@@ -1136,6 +1292,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
 
     // Young 原生入站：每个监听器由独立 current-thread runtime 驱动 Mozilla Neqo。
     // handle 持有关闭通道，必须存活到全局 shutdown。
+    #[cfg(feature = "with_young")]
     for listener in &plan.listen.young {
         let listen = listener
             .socket_addr()
@@ -1199,6 +1356,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
 
     // Xray gRPC（gun）入站。core-grpc 负责真实 tonic/prost Tun/TunMulti
     // framing，core-inbound 负责 VLESS TCP/UDP/mux 与统一路由运行时。
+    #[cfg(feature = "with_grpc")]
     for config in &plan.listen.grpc {
         let listener = GrpcListener::from_config(config)
             .map_err(|error| anyhow::anyhow!("gRPC listener configuration failed: {error}"))?;
@@ -1214,6 +1372,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     // 控制面板/API
+    #[cfg(feature = "with_api")]
     if plan.ui.on {
         if let Some(panel) = &plan.listen.panel {
             let addr = panel.socket_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1223,6 +1382,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
                 secret: plan.ui.secret.clone(),
                 clash_compat: plan.ui.api.clash_compat,
                 urltest: urltest.clone(),
+                #[cfg(feature = "with_tun")]
                 capture: capture_handle.clone(),
                 mesh: Some(mesh_supervisor.clone()),
                 feeds: Some(feed_mgr_handle.clone()),
@@ -1262,11 +1422,13 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             Ok(())
         }
     };
+    #[cfg(feature = "with_tun")]
     if let Some(sup) = capture_handle {
         if let Err(e) = sup.stop().await {
             warn!(target: "capture", error = %e, "capture stop failed");
         }
     }
+    #[cfg(feature = "with_wireguard")]
     for (server, dispatcher) in wireguard_inbounds {
         dispatcher.stop();
         server.close().await;
@@ -1276,6 +1438,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
     feed_mgr_handle.stop();
     _ruleset_mgr_handle.stop();
+    #[cfg(feature = "with_shadowsocks")]
     for listener in &mut shadowsocks_listener_handles {
         if let Err(error) = listener.shutdown().await {
             warn!(
@@ -1286,6 +1449,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
             );
         }
     }
+    #[cfg(feature = "with_xhttp")]
     for listener in &mut xhttp_listener_handles {
         if let Err(error) = listener.shutdown().await {
             warn!(
@@ -1297,6 +1461,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         }
     }
     runtime.shutdown().await;
+    #[cfg(feature = "with_young")]
     for server in &young_server_handles {
         if let Err(error) = server.shutdown() {
             warn!(target: "young", %error, "Young server shutdown failed");
@@ -1339,6 +1504,7 @@ async fn wait_for_mesh_fail_stop(
     }
 }
 
+#[cfg(feature = "with_xhttp")]
 async fn start_configured_xhttp_inbounds(
     plan: &core_config::runtime_plan::RuntimePlan,
     runtime: Arc<Runtime>,
@@ -1348,6 +1514,7 @@ async fn start_configured_xhttp_inbounds(
         .context("XHTTP 入站启动失败")
 }
 
+#[cfg(feature = "with_shadowsocks")]
 async fn start_configured_shadowsocks_inbounds(
     plan: &core_config::runtime_plan::RuntimePlan,
     runtime: Arc<Runtime>,
@@ -1362,10 +1529,12 @@ async fn start_configured_shadowsocks_inbounds(
 /// `route_address_set: ["geoip-cn"]` → 查 ruleset_index 的 `geoip-cn`，
 /// 命中 cidr_v4 / cidr_v6 即视为白/黑名单元素。
 #[derive(Debug)]
+#[cfg(feature = "with_tun")]
 struct RulesetIpSetProvider {
     index: Arc<core_ruleset::RulesetIndex>,
 }
 
+#[cfg(feature = "with_tun")]
 impl core_capture::IpSetProvider for RulesetIpSetProvider {
     fn contains(&self, name: &str, ip: std::net::IpAddr) -> bool {
         let Some(matcher) = self.index.get(name) else {
@@ -1405,6 +1574,7 @@ impl core_capture::IpSetProvider for RulesetIpSetProvider {
     }
 }
 
+#[cfg(feature = "with_tun")]
 fn map_ruleset_prefix_snapshot(
     snapshot: core_ruleset::RulesetIpPrefixSnapshot,
 ) -> core_capture::IpSetPrefixSnapshot {

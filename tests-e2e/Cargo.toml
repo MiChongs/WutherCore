@@ -11,14 +11,14 @@ path = "src/lib.rs"
 [dependencies]
 core-config  = { workspace = true }
 core-runtime = { workspace = true }
-core-inbound = { workspace = true }
-core-outbound = { workspace = true }
+core-inbound = { workspace = true, features = ["standard"] }
+core-outbound = { workspace = true, features = ["standard"] }
 core-smart   = { workspace = true }
 
 [dev-dependencies]
 base64       = { workspace = true }
 core-grpc     = { workspace = true }
-core-outbound = { workspace = true }
+core-outbound = { workspace = true, features = ["standard"] }
 core-reality  = { workspace = true }
 futures       = { workspace = true }
 hex          = { workspace = true }

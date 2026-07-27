@@ -16,7 +16,7 @@ pub mod anytls;
 pub mod hysteria;
 pub mod hysteria2;
 pub mod mieru;
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 pub mod naive;
 pub mod shadowsocks;
 pub mod snell;
@@ -33,4 +33,5 @@ pub mod vmess_kdf;
 pub mod vmess_legacy;
 pub mod wireguard;
 pub mod xhttp;
+#[cfg(feature = "with_young")]
 pub mod young;

@@ -168,8 +168,8 @@ rtnetlink = "0.21.0"
 core-config   = { path = "crates/core-config" }
 core-fetch    = { path = "crates/core-fetch" }
 core-runtime  = { path = "crates/core-runtime" }
-core-inbound  = { path = "crates/core-inbound" }
-core-outbound = { path = "crates/core-outbound" }
+core-inbound  = { path = "crates/core-inbound", default-features = false }
+core-outbound = { path = "crates/core-outbound", default-features = false }
 core-grpc     = { path = "crates/core-grpc" }
 core-feeds    = { path = "crates/core-feeds" }
 core-store    = { path = "crates/core-store" }
@@ -177,7 +177,7 @@ core-ruleset  = { path = "crates/core-ruleset" }
 core-route    = { path = "crates/core-route" }
 core-resolver = { path = "crates/core-resolver" }
 core-smart    = { path = "crates/core-smart" }
-core-api      = { path = "crates/core-api" }
+core-api      = { path = "crates/core-api", default-features = false }
 core-capture  = { path = "crates/core-capture" }
 core-mesh     = { path = "crates/core-mesh" }
 core-observe  = { path = "crates/core-observe" }

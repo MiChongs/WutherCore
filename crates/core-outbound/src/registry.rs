@@ -15,9 +15,17 @@ use core_config::{
 };
 use uuid::Uuid;
 
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_http")]
+use crate::http::HttpOutbound;
+#[cfg(feature = "with_naive")]
 use crate::proto::naive::{NaiveOutbound, NaiveOutboundConfig};
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_young")]
+use crate::proto::young::YoungOutbound;
+#[cfg(feature = "with_socks")]
+use crate::socks5::Socks5Outbound;
+#[cfg(any(feature = "with_naive", feature = "with_young"))]
+use crate::stub::StubOutbound;
+#[cfg(feature = "with_naive")]
 use cronet::Header;
 
 use crate::{
@@ -25,7 +33,6 @@ use crate::{
     block::BlockOutbound,
     direct::DirectOutbound,
     dns_hijack::DnsHijackOutbound,
-    http::HttpOutbound,
     proto::{
         anytls::AnyTlsOutbound,
         hysteria::HysteriaOutbound,
@@ -47,17 +54,145 @@ use crate::{
             Config as XhttpConfig, DownloadRealitySettings, DownloadSettings,
             DownloadSocketSettings, DownloadTlsSettings, DownloadTransportSettings,
         },
-        young::YoungOutbound,
     },
     socket_policy::ConfiguredOutbound,
-    socks5::Socks5Outbound,
-    stub::StubOutbound,
     transport::{
         GrpcOptions, H2Options, HttpOptions, RealityOptions, TlsOptions, WsOptions, XhttpOptions,
     },
 };
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> Option<SharedOutbound> + Send + Sync>;
+
+/// Canonical compile-time component tags accepted by `wuther-core`.
+pub const COMPONENT_TAGS: &[&str] = &[
+    "with_anytls",
+    "with_grpc",
+    "with_hysteria",
+    "with_hysteria2",
+    "with_http",
+    "with_http_transport",
+    "with_mieru",
+    "with_naive",
+    "with_quic",
+    "with_reality",
+    "with_shadowsocks",
+    "with_shadowsocksr",
+    "with_snell",
+    "with_socks",
+    "with_ssh",
+    "with_sudoku",
+    "with_trojan",
+    "with_trusttunnel",
+    "with_tuic",
+    "with_utls",
+    "with_vless",
+    "with_vmess",
+    "with_wireguard",
+    "with_ws",
+    "with_xhttp",
+    "with_young",
+];
+
+/// Return the build tag controlling one protocol. Direct, block and DNS are
+/// foundational and intentionally remain available in every build.
+pub fn protocol_component_tag(protocol: &NodeProtocol) -> Option<&'static str> {
+    match protocol {
+        NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Dns => None,
+        NodeProtocol::Http => Some("with_http"),
+        NodeProtocol::Socks5 => Some("with_socks"),
+        NodeProtocol::Shadowsocks => Some("with_shadowsocks"),
+        NodeProtocol::ShadowsocksR => Some("with_shadowsocksr"),
+        NodeProtocol::Vmess => Some("with_vmess"),
+        NodeProtocol::Vless => Some("with_vless"),
+        NodeProtocol::Trojan => Some("with_trojan"),
+        NodeProtocol::Naive => Some("with_naive"),
+        NodeProtocol::Snell => Some("with_snell"),
+        NodeProtocol::AnyTls => Some("with_anytls"),
+        NodeProtocol::Ssh => Some("with_ssh"),
+        NodeProtocol::Hysteria => Some("with_hysteria"),
+        NodeProtocol::Hysteria2 => Some("with_hysteria2"),
+        NodeProtocol::Tuic => Some("with_tuic"),
+        NodeProtocol::Wireguard => Some("with_wireguard"),
+        NodeProtocol::Mieru => Some("with_mieru"),
+        NodeProtocol::Sudoku => Some("with_sudoku"),
+        NodeProtocol::TrustTunnel => Some("with_trusttunnel"),
+        NodeProtocol::Young => Some("with_young"),
+        NodeProtocol::Other(_) => None,
+    }
+}
+
+pub fn protocol_component_enabled(protocol: &NodeProtocol) -> bool {
+    match protocol {
+        NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Dns => true,
+        NodeProtocol::Http => cfg!(feature = "with_http"),
+        NodeProtocol::Socks5 => cfg!(feature = "with_socks"),
+        NodeProtocol::Shadowsocks => cfg!(feature = "with_shadowsocks"),
+        NodeProtocol::ShadowsocksR => cfg!(feature = "with_shadowsocksr"),
+        NodeProtocol::Vmess => cfg!(feature = "with_vmess"),
+        NodeProtocol::Vless => cfg!(feature = "with_vless"),
+        NodeProtocol::Trojan => cfg!(feature = "with_trojan"),
+        NodeProtocol::Naive => cfg!(feature = "with_naive"),
+        NodeProtocol::Snell => cfg!(feature = "with_snell"),
+        NodeProtocol::AnyTls => cfg!(feature = "with_anytls"),
+        NodeProtocol::Ssh => cfg!(feature = "with_ssh"),
+        NodeProtocol::Hysteria => cfg!(feature = "with_hysteria"),
+        NodeProtocol::Hysteria2 => cfg!(feature = "with_hysteria2"),
+        NodeProtocol::Tuic => cfg!(feature = "with_tuic"),
+        NodeProtocol::Wireguard => cfg!(feature = "with_wireguard"),
+        NodeProtocol::Mieru => cfg!(feature = "with_mieru"),
+        NodeProtocol::Sudoku => cfg!(feature = "with_sudoku"),
+        NodeProtocol::TrustTunnel => cfg!(feature = "with_trusttunnel"),
+        NodeProtocol::Young => cfg!(feature = "with_young"),
+        NodeProtocol::Other(_) => true,
+    }
+}
+
+/// Fail closed when a configuration asks for code omitted by this build.
+pub fn validate_node_components(node: &ParsedNode) -> Result<(), String> {
+    if !protocol_component_enabled(&node.protocol) {
+        let tag = protocol_component_tag(&node.protocol).expect("disabled protocols have a tag");
+        return Err(format!(
+            "protocol `{}` is not compiled in; rebuild with `{tag}`",
+            node.protocol.as_str()
+        ));
+    }
+
+    let transport = node.transport.trim().to_ascii_lowercase();
+    let required_transport = match transport.as_str() {
+        "ws" | "websocket" => (!cfg!(feature = "with_ws")).then_some("with_ws"),
+        "http" | "h2" => (!cfg!(feature = "with_http_transport")).then_some("with_http_transport"),
+        "grpc" | "gun" => (!cfg!(feature = "with_grpc")).then_some("with_grpc"),
+        "xhttp" | "splithttp" => (!cfg!(feature = "with_xhttp")).then_some("with_xhttp"),
+        "quic" | "h3" => (!cfg!(feature = "with_quic")).then_some("with_quic"),
+        _ => None,
+    };
+    if let Some(tag) = required_transport {
+        return Err(format!(
+            "transport `{transport}` is not compiled in; rebuild with `{tag}`"
+        ));
+    }
+
+    if (node.reality.is_some() || node.reality_settings.is_some())
+        && !cfg!(feature = "with_reality")
+    {
+        return Err("REALITY is not compiled in; rebuild with `with_reality`".into());
+    }
+
+    let fingerprint = node
+        .tls_settings
+        .as_ref()
+        .and_then(|settings| settings.fingerprint.as_deref())
+        .or_else(|| node.params.get("fingerprint").map(String::as_str))
+        .unwrap_or_default()
+        .trim();
+    if !fingerprint.is_empty()
+        && !fingerprint.eq_ignore_ascii_case("unsafe")
+        && !cfg!(feature = "with_utls")
+    {
+        return Err("uTLS fingerprinting is not compiled in; rebuild with `with_utls`".into());
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub struct OutboundRegistry {
@@ -146,41 +281,60 @@ pub fn register_nodes(reg: &mut OutboundRegistry, nodes: &[ParsedNode]) -> Resul
 }
 
 pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    validate_node_components(node)?;
+
+    macro_rules! compiled {
+        ($feature:literal, $expression:expr) => {{
+            #[cfg(feature = $feature)]
+            {
+                $expression
+            }
+            #[cfg(not(feature = $feature))]
+            {
+                unreachable!("component availability was validated before dispatch")
+            }
+        }};
+    }
+
     let outbound: SharedOutbound = match node.protocol {
         NodeProtocol::Direct => DirectOutbound::new(),
         NodeProtocol::Block => BlockOutbound::new(),
         NodeProtocol::Dns => DnsHijackOutbound::new(node.name.clone()),
-        NodeProtocol::Http => {
+        NodeProtocol::Http => compiled!("with_http", {
             let mut ob = HttpOutbound::new(&node.name, &node.host, node.port);
             if let (Some(u), Some(p)) = (node.user.clone(), node.password.clone()) {
                 ob = ob.with_auth(u, p);
             }
             ob.into_arc()
-        }
-        NodeProtocol::Socks5 => {
+        }),
+        NodeProtocol::Socks5 => compiled!("with_socks", {
             let mut ob = Socks5Outbound::new(&node.name, &node.host, node.port).with_udp(node.udp);
             if let (Some(u), Some(p)) = (node.user.clone(), node.password.clone()) {
                 ob = ob.with_auth(u, p);
             }
             ob.into_arc()
+        }),
+        NodeProtocol::Shadowsocks => {
+            compiled!("with_shadowsocks", build_shadowsocks(node)?)
         }
-        NodeProtocol::Shadowsocks => build_shadowsocks(node)?,
-        NodeProtocol::ShadowsocksR => build_ssr(node)?,
-        NodeProtocol::Vmess => return build_vmess(node),
-        NodeProtocol::Vless => return build_vless(node),
-        NodeProtocol::Trojan => Arc::new(build_trojan(node)?),
-        NodeProtocol::Naive => build_naive(node),
-        NodeProtocol::Snell => build_snell(node)?,
-        NodeProtocol::AnyTls => build_anytls(node)?,
-        NodeProtocol::Ssh => build_ssh(node)?,
-        NodeProtocol::Hysteria => build_hysteria_v1(node)?,
-        NodeProtocol::Hysteria2 => build_hysteria2(node)?,
-        NodeProtocol::Tuic => build_tuic(node)?,
-        NodeProtocol::Wireguard => build_wireguard(node)?,
-        NodeProtocol::Mieru => build_mieru(node),
-        NodeProtocol::Sudoku => build_sudoku(node)?,
-        NodeProtocol::TrustTunnel => build_trusttunnel(node),
-        NodeProtocol::Young => build_young(node),
+        NodeProtocol::ShadowsocksR => compiled!("with_shadowsocksr", build_ssr(node)?),
+        NodeProtocol::Vmess => compiled!("with_vmess", build_vmess(node)?),
+        NodeProtocol::Vless => compiled!("with_vless", build_vless(node)?),
+        NodeProtocol::Trojan => compiled!("with_trojan", Arc::new(build_trojan(node)?)),
+        NodeProtocol::Naive => compiled!("with_naive", build_naive(node)),
+        NodeProtocol::Snell => compiled!("with_snell", build_snell(node)?),
+        NodeProtocol::AnyTls => compiled!("with_anytls", build_anytls(node)?),
+        NodeProtocol::Ssh => compiled!("with_ssh", build_ssh(node)?),
+        NodeProtocol::Hysteria => compiled!("with_hysteria", build_hysteria_v1(node)?),
+        NodeProtocol::Hysteria2 => compiled!("with_hysteria2", build_hysteria2(node)?),
+        NodeProtocol::Tuic => compiled!("with_tuic", build_tuic(node)?),
+        NodeProtocol::Wireguard => compiled!("with_wireguard", build_wireguard(node)?),
+        NodeProtocol::Mieru => compiled!("with_mieru", build_mieru(node)),
+        NodeProtocol::Sudoku => compiled!("with_sudoku", build_sudoku(node)?),
+        NodeProtocol::TrustTunnel => {
+            compiled!("with_trusttunnel", build_trusttunnel(node))
+        }
+        NodeProtocol::Young => compiled!("with_young", build_young(node)),
         NodeProtocol::Other(ref protocol) => {
             return Err(format!("unsupported outbound protocol `{protocol}`"));
         }
@@ -193,7 +347,7 @@ pub fn try_build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
     build_outbound(node)
 }
 
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 fn build_naive(node: &ParsedNode) -> SharedOutbound {
     let mut config = NaiveOutboundConfig::new(&node.host, node.port);
     config.username = node.user.clone();
@@ -309,12 +463,7 @@ fn build_naive(node: &ParsedNode) -> SharedOutbound {
     }
 }
 
-#[cfg(not(feature = "naive"))]
-fn build_naive(node: &ParsedNode) -> SharedOutbound {
-    StubOutbound::new(node.name.clone(), "naive(feature-disabled)")
-}
-
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 fn param_bool(node: &ParsedNode, keys: &[&str], default: bool) -> bool {
     keys.iter()
         .find_map(|key| node.params.get(*key))
@@ -327,7 +476,7 @@ fn param_bool(node: &ParsedNode, keys: &[&str], default: bool) -> bool {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 fn param_usize(node: &ParsedNode, keys: &[&str], default: usize) -> usize {
     keys.iter()
         .find_map(|key| node.params.get(*key))
@@ -335,7 +484,7 @@ fn param_usize(node: &ParsedNode, keys: &[&str], default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 fn param_u64(node: &ParsedNode, keys: &[&str], default: u64) -> u64 {
     keys.iter()
         .find_map(|key| node.params.get(*key))
@@ -343,7 +492,7 @@ fn param_u64(node: &ParsedNode, keys: &[&str], default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "naive")]
+#[cfg(feature = "with_naive")]
 fn decode_config_blob(value: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
@@ -4052,6 +4201,7 @@ fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
+#[cfg(feature = "with_young")]
 fn build_young(node: &ParsedNode) -> SharedOutbound {
     let encoded_key = node
         .user
@@ -4143,7 +4293,7 @@ fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "standard"))]
 mod tests {
     use base64::Engine;
     use core_config::{
@@ -4153,7 +4303,7 @@ mod tests {
     };
     use uuid::Uuid;
 
-    #[cfg(feature = "naive")]
+    #[cfg(feature = "with_naive")]
     use super::decode_config_blob;
     use super::{
         DownloadTlsSettings, build_node_tls_options, build_outbound, build_trojan,
@@ -4165,7 +4315,7 @@ mod tests {
     const VALID_ECH_CONFIG_LIST: &str =
         "AD7+DQA6AAAgACC7Lynj4wV+BBnVL8X0QRh3b422HOpP33YHm5NgbFpiSAAIAAEAAQABAAMAB2VjaC5jb20AAA==";
 
-    #[cfg(feature = "naive")]
+    #[cfg(feature = "with_naive")]
     #[test]
     fn naive_registry_enables_uot_and_rejects_unsafe_combinations() {
         let mut node = ParsedNode::new("naive", NodeProtocol::Naive, "proxy.example", 443);
@@ -4191,7 +4341,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "naive")]
+    #[cfg(feature = "with_naive")]
     #[test]
     fn naive_registry_decodes_ech_config_formats() {
         assert_eq!(decode_config_blob("000102ff"), Some(vec![0, 1, 2, 255]));

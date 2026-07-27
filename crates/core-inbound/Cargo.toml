@@ -4,16 +4,44 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["standard"]
+standard = ["with_grpc", "with_reality", "with_shadowsocks", "with_xhttp"]
+with_grpc = ["dep:core-grpc", "with_reality", "tls_inbound"]
+with_reality = ["dep:core-reality"]
+with_shadowsocks = ["dep:shadowsocks"]
+with_xhttp = [
+    "tls_inbound",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:quinn",
+]
+# Shared by gRPC TLS and XHTTP. This is kept separate so minimal/mixed-only
+# builds do not compile or link BoringSSL and the certificate toolchain.
+tls_inbound = [
+    "dep:boring",
+    "dep:boring-sys",
+    "dep:chrono",
+    "dep:ocsp-stapler",
+    "dep:rasn",
+    "dep:rasn-ocsp",
+    "dep:rasn-pkix",
+    "dep:rcgen",
+    "dep:sha1",
+    "dep:tokio-boring",
+    "dep:x509-parser",
+]
+
 [dependencies]
 core-config   = { workspace = true }
-core-grpc     = { workspace = true }
+core-grpc     = { workspace = true, optional = true }
 core-route    = { workspace = true }
 core-resolver = { workspace = true }
 core-outbound = { workspace = true }
 core-smart    = { workspace = true }
 core-runtime  = { workspace = true }
 core-observe  = { workspace = true }
-core-reality  = { workspace = true }
+core-reality  = { workspace = true, optional = true }
 tokio         = { workspace = true }
 tokio-util    = { workspace = true }
 async-trait   = { workspace = true }
@@ -30,7 +58,7 @@ uuid          = { workspace = true }
 subtle        = "2.6"
 rand          = { workspace = true }
 url           = { workspace = true }
-shadowsocks   = { workspace = true }
+shadowsocks   = { workspace = true, optional = true }
 
 # XHTTP/SplitHTTP inbound: HTTP/1.1 + HTTP/2 over TCP/TLS and HTTP/3 over QUIC.
 http           = "1"
@@ -41,20 +69,20 @@ http-body-util = "0.1"
 rustls         = { workspace = true }
 tokio-rustls   = { workspace = true }
 rustls-pemfile = "2"
-boring         = { workspace = true }
-boring-sys     = { workspace = true }
-tokio-boring   = { workspace = true }
-quinn          = { workspace = true }
-h3             = { workspace = true }
-h3-quinn       = { workspace = true }
-rcgen          = { version = "=0.14.8", features = ["pem", "x509-parser"] }
-ocsp-stapler   = { version = "=0.4.9", default-features = false }
-chrono         = { version = "0.4", default-features = false, features = ["clock"] }
-rasn           = "=0.28.13"
-rasn-ocsp      = "=0.28.13"
-rasn-pkix      = "=0.28.13"
-sha1           = "0.11"
-x509-parser    = { version = "=0.18.1", features = ["verify-aws"] }
+boring         = { workspace = true, optional = true }
+boring-sys     = { workspace = true, optional = true }
+tokio-boring   = { workspace = true, optional = true }
+quinn          = { workspace = true, optional = true }
+h3             = { workspace = true, optional = true }
+h3-quinn       = { workspace = true, optional = true }
+rcgen          = { version = "=0.14.8", features = ["pem", "x509-parser"], optional = true }
+ocsp-stapler   = { version = "=0.4.9", default-features = false, optional = true }
+chrono         = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+rasn           = { version = "=0.28.13", optional = true }
+rasn-ocsp      = { version = "=0.28.13", optional = true }
+rasn-pkix      = { version = "=0.28.13", optional = true }
+sha1           = { version = "0.11", optional = true }
+x509-parser    = { version = "=0.18.1", features = ["verify-aws"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "freebsd"))'.dependencies]
 nix = { version = "0.31", features = ["user", "fs"] }

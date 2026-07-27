@@ -105,3 +105,8 @@ gh attestation verify .\wuther-core-0.4.0-windows-amd64-msvc.zip --repo MiChongs
 在 GitHub Actions 的 `Release` 工作流中选择 `Run workflow`，填写一个已经存在的标签。通常保持 `channel = auto`；显式选择 `prerelease` 或 `release` 时，选择必须与标签格式一致，否则工作流会拒绝执行。
 
 手动运行用于恢复失败的 Draft Release，不用于绕过版本、标签或 CI 校验。
+
+需要验证裁剪构建时，在 `CI` 或 `Build Matrix` 工作流中选择 `Run workflow`，
+并在 `tags` 中填写逗号分隔的组件标签，例如
+`with_quic,with_vless,with_grpc,with_utls`。留空执行标准组件集。标签含义、
+本地等价命令和许可边界见[构建脚本](../scripts/README.md#按组件标签编译)。

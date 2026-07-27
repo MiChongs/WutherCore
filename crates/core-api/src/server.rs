@@ -56,6 +56,7 @@ pub struct ApiServer {
     pub secret: Option<String>,
     pub clash_compat: bool,
     pub urltest: Arc<UrlTester>,
+    #[cfg(feature = "with_tun")]
     pub capture: Option<Arc<core_capture::CaptureSupervisor>>,
     /// 统一组网监督器；提供只读运行状态，不暴露认证材料。
     pub mesh: Option<Arc<core_mesh::MeshSupervisor>>,
@@ -77,6 +78,7 @@ impl ApiServer {
             started_at: std::time::Instant::now(),
             secret: self.secret.clone(),
             urltest: self.urltest.clone(),
+            #[cfg(feature = "with_tun")]
             capture: self.capture.clone(),
             mesh: self.mesh.clone(),
             feeds: self.feeds.clone(),

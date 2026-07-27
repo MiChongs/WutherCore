@@ -20,6 +20,10 @@
 .PARAMETER Profile
   cargo profile，默认 release。
 
+.PARAMETER Tags
+  精确编译进入二进制的组件标签，逗号或空格分隔。指定后自动传递
+  --no-default-features；留空使用 Cargo 默认的 standard 组件集。
+
 .PARAMETER NoArchive
   跳过打包步骤，仅产出二进制。
 
@@ -35,12 +39,14 @@
 .EXAMPLE
   pwsh -File scripts/build-all.ps1
   pwsh -File scripts/build-all.ps1 -Targets "x86_64-pc-windows-msvc"
+  pwsh -File scripts/build-all.ps1 -Tags "with_quic,with_vless,with_grpc" -Targets "x86_64-pc-windows-msvc"
   pwsh -File scripts/build-all.ps1 -Backend zigbuild -Targets "x86_64-unknown-linux-musl"
 #>
 [CmdletBinding()]
 param(
     [string]$Targets = "",
     [string]$Profile = "release",
+    [string]$Tags = "",
     [switch]$NoArchive,
     [switch]$SkipChecks,
     [switch]$Clean,
@@ -66,6 +72,22 @@ function Write-Step ($msg) { Write-Host "[$(Get-Date -Format HH:mm:ss)] >>> $msg
 function Write-Ok   ($msg) { Write-Host "[$(Get-Date -Format HH:mm:ss)]  OK $msg"  -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "[$(Get-Date -Format HH:mm:ss)] !!! $msg" -ForegroundColor Yellow }
 function Write-Err  ($msg) { Write-Host "[$(Get-Date -Format HH:mm:ss)] ERR $msg" -ForegroundColor Red }
+
+# ---------- 组件标签 ----------
+$ComponentTags = @(
+    $Tags -split '[,;\s]+' |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne "" } |
+        Select-Object -Unique
+)
+foreach ($tag in $ComponentTags) {
+    if ($tag -notmatch '^[A-Za-z0-9_-]+$') {
+        throw "invalid component tag '$tag' (allowed: letters, digits, _ and -)"
+    }
+}
+$CargoFeatures = $ComponentTags -join ","
+$BuildTagLabel = if ($CargoFeatures) { $CargoFeatures } else { "standard (default)" }
+Write-Step "组件标签: $BuildTagLabel"
 
 # ---------- 默认目标 ----------
 $DefaultTargets = @(
@@ -547,6 +569,9 @@ foreach ($target in $TargetList) {
                 $args = @("ndk", "--target", $abi, "--platform", "33", "build", "--$Profile", "-p", $BinaryName, "--target", $target, "--locked")
             }
         }
+        if ($CargoFeatures) {
+            $args += @("--no-default-features", "--features", $CargoFeatures)
+        }
         Write-Step "$cmd $($args -join ' ')"
         & $cmd @args
         if ($LASTEXITCODE -ne 0) { throw "$cmd build failed (exit $LASTEXITCODE)" }
@@ -564,6 +589,11 @@ foreach ($target in $TargetList) {
         Copy-Item (Join-Path $RepoRoot "README.md") $stageDir
         Copy-Item (Join-Path $RepoRoot "RP内核设计文档.md") $stageDir -ErrorAction SilentlyContinue
         Copy-Item (Join-Path $RepoRoot "examples") (Join-Path $stageDir "examples") -Recurse
+        @(
+            "version=$Version"
+            "target=$target"
+            "tags=$BuildTagLabel"
+        ) | Set-Content -Path (Join-Path $stageDir "BUILD-COMPONENTS.txt") -Encoding UTF8
 
         if (-not $NoArchive) {
             $archiveBase = "$BinaryName-$Version-$target"
@@ -591,6 +621,7 @@ foreach ($target in $TargetList) {
             $Summary += [pscustomobject]@{
                 Target  = $target
                 Backend = $useBackend
+                Tags    = $BuildTagLabel
                 Path    = $archive
                 SizeMB  = [math]::Round((Get-Item $archive).Length / 1MB, 2)
                 SHA256  = $sha
@@ -599,6 +630,7 @@ foreach ($target in $TargetList) {
             $Summary += [pscustomobject]@{
                 Target  = $target
                 Backend = $useBackend
+                Tags    = $BuildTagLabel
                 Path    = $stageDir
                 SizeMB  = [math]::Round($size / 1MB, 2)
                 SHA256  = ""
@@ -624,7 +656,7 @@ Android 推荐改用 cargo-ndk：
 Write-Host ""
 Write-Step "构建完成总结"
 if ($Summary.Count -gt 0) {
-    $Summary | Format-Table Target, Backend, Path, SizeMB, SHA256 -AutoSize
+    $Summary | Format-Table Target, Backend, Tags, Path, SizeMB, SHA256 -AutoSize
 } else {
     Write-Warn2 "没有成功构建的目标。"
 }

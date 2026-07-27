@@ -352,7 +352,7 @@ sha256sum -c SHA256SUMS
 gh attestation verify <archive.zip> --repo MiChongs/WutherCore
 ```
 
-Young 构建需要 Mozilla NSS 原生库。Naive 构建需要 `naive` feature、Cronet 动态库和相应许可处理。各平台构建方式见 [构建脚本](scripts/README.md) 和 [发版指南](docs/RELEASING.md)。
+Young 构建需要 Mozilla NSS 原生库。Naive 构建需要 `with_naive` feature、Cronet 动态库和相应许可处理。协议与传输组件可以通过 `with_*` 编译标签精确裁剪，本地构建和 GitHub CI 使用同一套标签。完整标签表及各平台构建方式见 [构建脚本](scripts/README.md) 和 [发版指南](docs/RELEASING.md)。
 
 ## 文档
 

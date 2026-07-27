@@ -90,7 +90,7 @@ mod windows_impl {
                 AF_UNSPEC as u16,
                 Some(route_callback),
                 ctx_ptr,
-                0,
+                false,
                 &mut route_handle,
             )
         };
@@ -99,7 +99,7 @@ mod windows_impl {
                 AF_UNSPEC as u16,
                 Some(iface_callback),
                 ctx_ptr,
-                0,
+                false,
                 &mut iface_handle,
             )
         };

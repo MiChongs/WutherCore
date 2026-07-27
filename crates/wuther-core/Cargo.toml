@@ -12,8 +12,79 @@ keywords = ["proxy", "networking", "tun", "dns", "rust"]
 categories = ["command-line-utilities", "network-programming"]
 
 [features]
-default = []
-naive = ["core-outbound/naive"]
+default = ["standard"]
+# Standard keeps the pre-feature behavior (everything except GPL-linked
+# Naive/Cronet). Passing --no-default-features plus explicit `with_*` tags
+# produces an exact component build.
+standard = [
+    "with_api",
+    "with_tun",
+    "with_anytls",
+    "with_grpc",
+    "with_hysteria",
+    "with_hysteria2",
+    "with_http",
+    "with_http_transport",
+    "with_mieru",
+    "with_quic",
+    "with_reality",
+    "with_shadowsocks",
+    "with_shadowsocksr",
+    "with_snell",
+    "with_socks",
+    "with_ssh",
+    "with_sudoku",
+    "with_trojan",
+    "with_trusttunnel",
+    "with_tuic",
+    "with_utls",
+    "with_vless",
+    "with_vmess",
+    "with_wireguard",
+    "with_ws",
+    "with_xhttp",
+    "with_young",
+]
+all_components = ["standard", "with_naive"]
+
+# Runtime components.
+with_api = ["dep:core-api"]
+with_tun = ["dep:core-capture", "core-api?/with_tun"]
+
+# Transport/capability tags.
+with_quic = ["core-outbound/with_quic"]
+with_grpc = ["core-inbound/with_grpc", "core-outbound/with_grpc"]
+with_reality = ["core-inbound/with_reality", "core-outbound/with_reality"]
+with_utls = ["core-outbound/with_utls"]
+with_ws = ["core-outbound/with_ws"]
+with_http_transport = ["core-outbound/with_http_transport"]
+with_xhttp = ["with_quic", "core-inbound/with_xhttp", "core-outbound/with_xhttp"]
+
+# Protocol tags.
+with_http = ["core-outbound/with_http"]
+with_socks = ["core-outbound/with_socks"]
+with_shadowsocks = ["core-inbound/with_shadowsocks", "core-outbound/with_shadowsocks"]
+with_shadowsocksr = ["core-outbound/with_shadowsocksr"]
+with_vmess = ["core-outbound/with_vmess"]
+with_vless = ["core-outbound/with_vless"]
+with_trojan = ["core-outbound/with_trojan"]
+with_naive = ["core-outbound/with_naive"]
+naive = ["with_naive"]
+with_snell = ["core-outbound/with_snell"]
+with_anytls = ["core-outbound/with_anytls"]
+with_ssh = ["core-outbound/with_ssh"]
+with_hysteria = ["with_quic", "core-outbound/with_hysteria"]
+with_hysteria2 = ["with_quic", "core-outbound/with_hysteria2"]
+with_tuic = ["with_quic", "core-outbound/with_tuic"]
+with_wireguard = ["with_tun", "core-outbound/with_wireguard"]
+with_mieru = ["core-outbound/with_mieru"]
+with_sudoku = ["core-outbound/with_sudoku"]
+with_trusttunnel = ["core-outbound/with_trusttunnel"]
+with_young = [
+    "dep:core-young",
+    "core-young/firefox-stack",
+    "core-outbound/with_young",
+]
 
 [[bin]]
 name = "wuther-core"
@@ -25,16 +96,16 @@ core-runtime  = { workspace = true }
 core-feeds    = { workspace = true }
 core-store    = { workspace = true }
 core-ruleset  = { workspace = true }
-core-inbound  = { workspace = true }
-core-outbound = { workspace = true }
+core-inbound  = { workspace = true, default-features = false }
+core-outbound = { workspace = true, default-features = false }
 core-route    = { workspace = true }
 core-resolver = { workspace = true }
 core-smart    = { workspace = true }
-core-api      = { workspace = true }
-core-capture  = { workspace = true }
+core-api      = { workspace = true, optional = true, default-features = false }
+core-capture  = { workspace = true, optional = true }
 core-mesh     = { workspace = true }
 core-observe  = { workspace = true }
-core-young    = { workspace = true, features = ["firefox-stack"] }
+core-young    = { workspace = true, optional = true }
 clap          = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }

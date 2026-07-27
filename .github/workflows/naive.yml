@@ -12,6 +12,12 @@ on:
       - "crates/core-outbound/**"
       - "crates/wuther-core/**"
   workflow_dispatch:
+    inputs:
+      tags:
+        description: Extra component tags to compile together with with_naive.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -59,9 +65,20 @@ jobs:
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cronet-sdk/lib" >> "$GITHUB_ENV"
 
       - name: Check Naive feature
-        run: cargo check -p wuther-core --features naive --all-targets --locked
+        shell: bash
+        env:
+          EXTRA_TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          normalized="$(tr ' ;' ',,' <<< "$EXTRA_TAGS" | sed -E 's/,+/,/g; s/^,//; s/,$//')"
+          if [ -n "$normalized" ] && [[ ! "$normalized" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::Component tags must be a comma/space-separated list of Cargo feature names."
+            exit 1
+          fi
+          tags="with_naive${normalized:+,$normalized}"
+          cargo check -p wuther-core --no-default-features --features "$tags" --all-targets --locked
 
       - name: Test Naive URI and native tunnel
         run: |
           cargo test -p core-config parse_naive_h2_and_quic_links --locked
-          cargo test -p core-outbound --features naive naive --locked
+          cargo test -p core-outbound --no-default-features --features with_naive naive --locked

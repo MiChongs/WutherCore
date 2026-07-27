@@ -42,6 +42,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct TlsTransport {
     pub options: TlsOptions,
     config: Arc<OnceCell<Arc<ClientConfig>>>,
+    #[cfg(feature = "with_utls")]
     boring_config: Arc<OnceCell<Arc<boring::ssl::SslConnector>>>,
 }
 
@@ -50,6 +51,7 @@ impl TlsTransport {
         Self {
             options,
             config: Arc::new(OnceCell::new()),
+            #[cfg(feature = "with_utls")]
             boring_config: Arc::new(OnceCell::new()),
         }
     }
@@ -723,6 +725,7 @@ impl TlsTransport {
         host: &str,
         port: u16,
     ) -> std::io::Result<(BoxedStream, Option<Vec<u8>>)> {
+        #[cfg(feature = "with_utls")]
         if super::boring_tls::is_required(&self.options) {
             let connector = self
                 .boring_config

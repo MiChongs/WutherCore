@@ -5,18 +5,79 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["standard"]
+# Compile-time component tags. `standard` preserves the historical default
+# binary while individual `with_*` tags allow consumers to build a smaller,
+# purpose-specific core.
+standard = [
+    "with_anytls",
+    "with_grpc",
+    "with_hysteria",
+    "with_hysteria2",
+    "with_http",
+    "with_http_transport",
+    "with_mieru",
+    "with_quic",
+    "with_reality",
+    "with_shadowsocks",
+    "with_shadowsocksr",
+    "with_snell",
+    "with_socks",
+    "with_ssh",
+    "with_sudoku",
+    "with_trojan",
+    "with_trusttunnel",
+    "with_tuic",
+    "with_utls",
+    "with_vless",
+    "with_vmess",
+    "with_wireguard",
+    "with_ws",
+    "with_xhttp",
+    "with_young",
+]
+all_components = ["standard", "with_naive"]
+
+# Transport/capability tags.
+with_quic = []
+with_grpc = []
+with_reality = []
+with_utls = ["dep:boring", "dep:boring-sys", "dep:tokio-boring"]
+with_ws = []
+with_http_transport = []
+with_xhttp = ["with_quic"]
+
+# Outbound protocol tags.
+with_http = []
+with_socks = []
+with_shadowsocks = []
+with_shadowsocksr = []
+with_vmess = []
+with_vless = []
+with_trojan = []
 # NaiveProxy depends on the separately distributed SagerNet Cronet native
 # library. Keep it opt-in so ordinary MIT builds do not silently acquire a
 # GPL-3.0 runtime dependency.
-naive = ["dep:cronet"]
+with_naive = ["dep:cronet"]
+naive = ["with_naive"]
+with_snell = []
+with_anytls = []
+with_ssh = []
+with_hysteria = ["with_quic"]
+with_hysteria2 = ["with_quic"]
+with_tuic = ["with_quic"]
+with_wireguard = []
+with_mieru = []
+with_sudoku = []
+with_trusttunnel = []
+with_young = ["dep:core-young", "core-young/firefox-stack"]
 
 [dependencies]
 core-config = { workspace = true }
 core-reality = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
-core-young   = { workspace = true, features = ["firefox-stack"] }
+core-young   = { workspace = true, optional = true }
 core-grpc   = { workspace = true }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
@@ -56,9 +117,9 @@ rustls-pki-types  = { workspace = true }
 webpki-roots      = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile     = "2"
-boring             = { workspace = true }
-boring-sys         = { workspace = true }
-tokio-boring       = { workspace = true }
+boring             = { workspace = true, optional = true }
+boring-sys         = { workspace = true, optional = true }
+tokio-boring       = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true }
 uuid              = { workspace = true }
 rand              = { workspace = true }
