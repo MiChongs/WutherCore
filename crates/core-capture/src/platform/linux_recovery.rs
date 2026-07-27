@@ -306,7 +306,7 @@ fn delete_all_matching_rules(
             args.extend(["blackhole", "default"]);
         }
         let output = command_output("ip", &args)?;
-        if output.status.success() {
+        if output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
             continue;
         }
         if is_absent(&output) {
@@ -349,6 +349,27 @@ fn flush_table(table: u32) {
     for family in ["-4", "-6"] {
         let _ = command_output("ip", &[family, "route", "flush", "table", &table]);
     }
+}
+
+fn delete_exact_ip_rule(family: &str, mark: &str, table: &str) {
+    // Some iproute2 environments (notably WSL) report a netlink permission
+    // error on stderr while still returning exit status 0. Treat diagnostics
+    // as failure and cap retries so crash recovery can never spin forever.
+    for _ in 0..MAX_PRIORITY_DELETES {
+        let Ok(output) = command_output(
+            "ip",
+            &["-f", family, "rule", "del", "fwmark", mark, "lookup", table],
+        ) else {
+            break;
+        };
+        if !output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            break;
+        }
+    }
+}
+
+fn flush_named_table(family: &str, table: &str) {
+    let _ = command_output("ip", &["-f", family, "route", "flush", "table", table]);
 }
 
 fn delete_nft_table(table: &str) {

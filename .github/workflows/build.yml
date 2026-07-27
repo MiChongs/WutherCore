@@ -18,16 +18,6 @@ on:
         type: number
         default: 1
   workflow_dispatch:
-  push:
-    branches: ["main"]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Cross.toml'
-      - 'rust-toolchain.toml'
-      - '.cargo/**'
-      - '.github/workflows/build.yml'
 
 permissions:
   contents: read

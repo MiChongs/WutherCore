@@ -16,8 +16,11 @@ use core_reality::{
     decode_short_id,
 };
 use core_runtime::Runtime;
-use tokio::net::TcpStream;
 use tokio::task::JoinSet;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -184,13 +187,16 @@ impl RealityListener {
     /// Authenticate one already-accepted TCP stream and return the reusable
     /// REALITY carrier. Higher transports such as gRPC and XHTTP consume this
     /// API before running their own framing.
-    pub async fn accept_carrier(
+    pub async fn accept_carrier<S>(
         &self,
-        stream: TcpStream,
+        stream: S,
         peer: SocketAddr,
         local: SocketAddr,
         cancellation: CancellationToken,
-    ) -> anyhow::Result<AcceptedRealityStream> {
+    ) -> anyhow::Result<AcceptedRealityStream>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let accepted = match &self.target {
             CamouflageTarget::Tcp(address) => {
                 let target = tokio::time::timeout(

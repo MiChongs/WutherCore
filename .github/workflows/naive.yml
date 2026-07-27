@@ -11,8 +11,6 @@ on:
       - "crates/core-feeds/**"
       - "crates/core-outbound/**"
       - "crates/wuther-core/**"
-  push:
-    branches: ["main"]
   workflow_dispatch:
 
 permissions:

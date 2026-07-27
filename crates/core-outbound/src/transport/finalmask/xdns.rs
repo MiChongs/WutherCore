@@ -567,12 +567,9 @@ fn encode_query(payload: &[u8], client_id: &[u8; 8], resolver: &Resolver) -> io:
     let prefix = Name::from_labels(encoded.as_bytes().chunks(63)).map_err(invalid)?;
     let query_name = prefix.append_name(&resolver.domain).map_err(invalid)?;
 
-    let mut message = Message::new();
-    message
-        .set_id(rand::random())
-        .set_message_type(MessageType::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(query_name, resolver.record_type));
+    let mut message = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(query_name, resolver.record_type));
     let mut edns = Edns::new();
     edns.set_max_payload(4096);
     message.set_edns(edns);
@@ -581,37 +578,41 @@ fn encode_query(payload: &[u8], client_id: &[u8; 8], resolver: &Resolver) -> io:
 
 fn decode_response(wire: &[u8], resolvers: &[Resolver]) -> io::Result<Vec<Vec<u8>>> {
     let message = Message::from_vec(wire).map_err(invalid)?;
-    if message.message_type() != MessageType::Response
-        || message.response_code() != ResponseCode::NoError
-        || message.answers().is_empty()
+    if message.metadata.message_type != MessageType::Response
+        || message.metadata.response_code != ResponseCode::NoError
+        || message.answers.is_empty()
     {
         return Err(invalid("xdns response flags or answers are invalid"));
     }
-    for answer in message.answers() {
+    for answer in &message.answers {
         if !resolvers
             .iter()
-            .any(|resolver| resolver.domain.zone_of(answer.name()))
+            .any(|resolver| resolver.domain.zone_of(&answer.name))
         {
             return Err(invalid(
                 "xdns response answer is outside configured domains",
             ));
         }
     }
-    let payload = decode_answer_payload(message.answers())?;
+    let payload = decode_answer_payload(&message.answers)?;
     decode_frames(&payload)
 }
 
 fn decode_answer_payload(answers: &[Record]) -> io::Result<Vec<u8>> {
-    let first = answers
+    let first = &answers
         .first()
-        .and_then(Record::data)
-        .ok_or_else(|| invalid("xdns answer has no rdata"))?;
+        .ok_or_else(|| invalid("xdns answer has no rdata"))?
+        .data;
     match first {
         RData::TXT(txt) => {
             if answers.len() != 1 {
                 return Err(invalid("xdns TXT response must contain one answer"));
             }
-            Ok(txt.iter().flat_map(|part| part.iter().copied()).collect())
+            Ok(txt
+                .txt_data
+                .iter()
+                .flat_map(|part| part.iter().copied())
+                .collect())
         }
         RData::A(_) => decode_ip_answers(answers, RecordType::A, 4),
         RData::AAAA(_) => decode_ip_answers(answers, RecordType::AAAA, 16),
@@ -632,9 +633,9 @@ fn decode_ip_answers(
         if answer.record_type() != record_type {
             return Err(invalid("xdns response mixes answer types"));
         }
-        let bytes = match answer.data() {
-            Some(RData::A(address)) => address.0.octets().to_vec(),
-            Some(RData::AAAA(address)) => address.0.octets().to_vec(),
+        let bytes = match &answer.data {
+            RData::A(address) => address.0.octets().to_vec(),
+            RData::AAAA(address) => address.0.octets().to_vec(),
             _ => return Err(invalid("xdns IP answer has invalid rdata")),
         };
         if bytes.len() != width {
@@ -704,23 +705,23 @@ pub(crate) fn decode_server_query(
 
 fn decode_server_request(wire: &[u8], domains: &[DomainSpec]) -> io::Result<ServerRequest> {
     let message = Message::from_vec(wire).map_err(invalid)?;
-    if message.message_type() != MessageType::Query {
+    if message.metadata.message_type != MessageType::Query {
         return Ok(ServerRequest::Drop);
     }
     if message.version() != 0 {
         return error_server_response(&message, false, ResponseCode::BADVERS);
     }
-    if message.queries().len() != 1 {
+    if message.queries.len() != 1 {
         return error_server_response(&message, false, ResponseCode::FormErr);
     }
-    let question = &message.queries()[0];
+    let question = &message.queries[0];
     let matched = domains
         .iter()
         .find(|domain| domain.domain.zone_of(question.name()));
     let Some(matched) = matched else {
         return error_server_response(&message, false, ResponseCode::NXDomain);
     };
-    if message.op_code() != OpCode::Query {
+    if message.metadata.op_code != OpCode::Query {
         return error_server_response(&message, true, ResponseCode::NotImp);
     }
     if !matches!(
@@ -769,14 +770,15 @@ fn error_server_response(
     authoritative: bool,
     response_code: ResponseCode,
 ) -> io::Result<ServerRequest> {
-    let mut response = Message::new();
-    response
-        .set_id(query.id())
-        .set_message_type(MessageType::Response)
-        .set_authoritative(authoritative)
-        .set_response_code(response_code)
-        .add_queries(query.queries().iter().cloned());
-    if query.extensions().is_some() {
+    let mut response = Message::new(
+        query.metadata.id,
+        MessageType::Response,
+        query.metadata.op_code,
+    );
+    response.metadata.authoritative = authoritative;
+    response.metadata.response_code = response_code;
+    response.add_queries(query.queries.iter().cloned());
+    if query.edns.is_some() {
         let mut edns = Edns::new();
         edns.set_max_payload(4096);
         response.set_edns(edns);
@@ -818,13 +820,14 @@ pub(crate) fn encode_server_response(
         payload.extend_from_slice(&length.to_be_bytes());
         payload.extend_from_slice(packet);
     }
-    let mut response = Message::new();
-    response
-        .set_id(query.message.id())
-        .set_message_type(MessageType::Response)
-        .set_authoritative(true)
-        .set_response_code(ResponseCode::NoError)
-        .add_query(query.message.queries()[0].clone());
+    let mut response = Message::new(
+        query.message.metadata.id,
+        MessageType::Response,
+        query.message.metadata.op_code,
+    );
+    response.metadata.authoritative = true;
+    response.metadata.response_code = ResponseCode::NoError;
+    response.add_query(query.message.queries[0].clone());
     let answers = encode_answers(query.question_name.clone(), query.record_type, &payload)?;
     response.add_answers(answers);
     let mut edns = Edns::new();
@@ -969,53 +972,53 @@ mod tests {
             Message::from_vec(&encode_query(b"ok", b"abcdefgh", &resolver).unwrap()).unwrap();
 
         let wrong_domain = classify_response(&valid, &["other.example"]);
-        assert_eq!(wrong_domain.response_code(), ResponseCode::NXDomain);
-        assert!(!wrong_domain.authoritative());
+        assert_eq!(wrong_domain.metadata.response_code, ResponseCode::NXDomain);
+        assert!(!wrong_domain.metadata.authoritative);
 
         let mut unsupported_opcode = valid.clone();
-        unsupported_opcode.set_op_code(OpCode::Status);
+        unsupported_opcode.metadata.op_code = OpCode::Status;
         let unsupported_opcode = classify_response(&unsupported_opcode, &["t.example:txt"]);
-        assert_eq!(unsupported_opcode.response_code(), ResponseCode::NotImp);
-        assert!(unsupported_opcode.authoritative());
+        assert_eq!(
+            unsupported_opcode.metadata.response_code,
+            ResponseCode::NotImp
+        );
+        assert!(unsupported_opcode.metadata.authoritative);
 
         let mut unsupported_type = valid.clone();
-        unsupported_type.queries_mut()[0].set_query_type(RecordType::MX);
+        unsupported_type.queries[0].set_query_type(RecordType::MX);
         let unsupported_type = classify_response(&unsupported_type, &["t.example"]);
-        assert_eq!(unsupported_type.response_code(), ResponseCode::NXDomain);
-        assert!(unsupported_type.authoritative());
+        assert_eq!(
+            unsupported_type.metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        assert!(unsupported_type.metadata.authoritative);
 
         let mut bad_version = valid.clone();
-        bad_version
-            .extensions_mut()
-            .as_mut()
-            .unwrap()
-            .set_version(1);
+        bad_version.edns.as_mut().unwrap().set_version(1);
         let bad_version = classify_response(&bad_version, &["t.example:txt"]);
         // Hickory names numeric RCODE 16 `BADSIG` when decoding because the
         // number is shared with BADVERS. An OPT response makes it BADVERS.
-        assert_eq!(u16::from(bad_version.response_code()), 16);
+        assert_eq!(u16::from(bad_version.metadata.response_code), 16);
         assert_eq!(
-            bad_version.extensions().as_ref().unwrap().rcode_high(),
+            bad_version.edns.as_ref().unwrap().rcode_high(),
             ResponseCode::BADVERS.high()
         );
-        assert!(!bad_version.authoritative());
+        assert!(!bad_version.metadata.authoritative);
         assert_eq!(bad_version.version(), 0);
 
         let mut undersized_edns = valid;
-        undersized_edns
-            .extensions_mut()
-            .as_mut()
-            .unwrap()
-            .set_max_payload(512);
+        undersized_edns.edns.as_mut().unwrap().set_max_payload(512);
         let undersized_edns = classify_response(&undersized_edns, &["t.example:txt"]);
-        assert_eq!(undersized_edns.response_code(), ResponseCode::FormErr);
-        assert!(undersized_edns.authoritative());
+        assert_eq!(
+            undersized_edns.metadata.response_code,
+            ResponseCode::FormErr
+        );
+        assert!(undersized_edns.metadata.authoritative);
 
-        let mut no_question = Message::new();
-        no_question.set_id(7).set_message_type(MessageType::Query);
+        let no_question = Message::new(7, MessageType::Query, OpCode::Query);
         let no_question = classify_response(&no_question, &["t.example"]);
-        assert_eq!(no_question.response_code(), ResponseCode::FormErr);
-        assert!(!no_question.authoritative());
+        assert_eq!(no_question.metadata.response_code, ResponseCode::FormErr);
+        assert!(!no_question.metadata.authoritative);
     }
 
     #[test]
