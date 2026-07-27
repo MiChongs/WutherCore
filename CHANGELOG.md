@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 本文件记录用户可见的重要变化。正式版本的发布说明由 GitHub Release 根据 `.github/release.yml` 分类生成，并补充兼容性、已知限制和升级方式。
 
@@ -6,15 +6,8 @@
 
 ### Security
 
-- Clash 兼容 `GET /configs` 的 `authentication` 只返回用户名，不再回传明文密码。
-
-### Fixed
-
-- Clash `PUT /configs` 的 `mode`（rule/global/direct）接入真实选路；
-- `allow-lan` / `tun.enable` 热切换改为 `501`，不再写成功假象。
-- 非本机管理面板（`listen.share: home|all` 或非 loopback `listen.panel`）在 `ui.secret` 为空时拒绝编译/启动。
-- `groups.*.choose: chain` 在配置编译期拒绝，避免静默退化为单跳第一节点。
-- `auto_route` / TPROXY / REDIRECT 下 capture 启动失败改为 fail-closed。
+- URLTest 与订阅/规则集 fetch 默认拒绝 loopback/私网/链路本地/云元数据目标（含 redirect 跳后复查）；
+- fetch 日志只记录 host，避免订阅 token 落入 debug/warn。
 
 ### Added
 
