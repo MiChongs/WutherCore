@@ -943,8 +943,6 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         Arc<WireGuardServer>,
         core_capture::NetstackDispatcherHandles,
     )> = Vec::new();
-<<<<<<< HEAD
-=======
 
     // WireGuard 服务端入站。WireGuardServer 负责 NoiseIK、cookie/MAC、重放保护、
     // roaming 与多 peer 路由；WireGuardTunIo 把认证后的裸 IP 包接入与系统 TUN
@@ -1038,101 +1036,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         );
         wireguard_inbounds.push((server, dispatcher_handles));
     }
->>>>>>> origin/main
     let mut young_server_handles = Vec::new();
-
-    // WireGuard 服务端入站。WireGuardServer 负责 NoiseIK、cookie/MAC、重放保护、
-    // roaming 与多 peer 路由；WireGuardTunIo 把认证后的裸 IP 包接入与系统 TUN
-    // 共用的 netstack dispatcher，因此 TCP 与 UDP 最终都经过同一 Runtime 路由。
-    for (index, listener) in plan.listen.wireguard.iter().enumerate() {
-        let peers = listener
-            .peers
-            .iter()
-            .map(|peer| WireGuardServerPeerConfig {
-                public_key: peer.public_key,
-                preshared_key: peer.preshared_key,
-                allowed_ips: peer.allowed_ips.clone(),
-                reserved: peer.reserved,
-                persistent_keepalive: peer.persistent_keepalive,
-            })
-            .collect();
-        let server = match WireGuardServer::bind(WireGuardServerConfig {
-            bind: listener.bind,
-            private_key: listener.private_key,
-            peers,
-            mtu: listener.mtu,
-            packet_queue: listener.packet_queue,
-            handshake_rate_limit: listener.handshake_rate_limit,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "bind WireGuard inbound listen.wireguard[{index}] at {}",
-                listener.bind
-            )
-        }) {
-            Ok(server) => Arc::new(server),
-            Err(error) => {
-                // A later listener can fail after earlier listeners already started their
-                // netstack tasks. Roll every subsystem back explicitly instead of relying
-                // on runtime teardown or detached Tokio task drops.
-                for (server, dispatcher) in wireguard_inbounds.drain(..) {
-                    dispatcher.stop();
-                    server.close().await;
-                }
-                if let Some(supervisor) = capture_handle.as_ref() {
-                    if let Err(cleanup_error) = supervisor.stop().await {
-                        warn!(
-                            target: "capture",
-                            error = %cleanup_error,
-                            "capture stop failed while rolling back WireGuard startup"
-                        );
-                    }
-                }
-                if let Err(cleanup_error) = mesh_supervisor.stop().await {
-                    warn!(
-                        target: "mesh",
-                        error = %cleanup_error,
-                        "mesh stop failed while rolling back WireGuard startup"
-                    );
-                }
-                feed_mgr_handle.stop();
-                runtime.shutdown().await;
-                return Err(error);
-            }
-        };
-        let mut dispatcher_plan = capture_plan.clone();
-        dispatcher_plan.mtu =
-            u32::try_from(listener.mtu).expect("validated WireGuard MTU always fits into u32");
-        dispatcher_plan.ipv6_enabled = plan.resolver.ipv6;
-        dispatcher_plan.allow_loopback_destination = true;
-        let fake_pool = runtime
-            .resolver
-            .fake_pool()
-            .unwrap_or_else(|| Arc::new(core_resolver::FakeIpPool::default()));
-        let dispatcher = Arc::new(core_capture::NetstackDispatcher::new(
-            dispatcher_plan.clone(),
-            Arc::new(core_capture::NatTable::default()),
-            Arc::new(core_capture::EimNatTable::new(dispatcher_plan.udp_timeout)),
-            fake_pool,
-            runtime.dns_service.clone(),
-            core_capture::noop_ipset_provider(),
-        ));
-        let device = Arc::new(core_capture::WireGuardTunIo::new(
-            server.clone(),
-            format!("wireguard-inbound-{index}"),
-            dispatcher_plan.mtu,
-        ));
-        let dispatcher_handles = dispatcher.start(device, runtime.clone());
-        info!(
-            target: "inbound::wireguard",
-            addr = %server.local_addr().unwrap_or(listener.bind),
-            peers = listener.peers.len(),
-            mtu = listener.mtu,
-            "WireGuard inbound ready (TCP+UDP)"
-        );
-        wireguard_inbounds.push((server, dispatcher_handles));
-    }
 
     // Standalone DNS server —— mihomo `dns.listen` 等价。
     // 与 mihomo `dns/server.go::ReCreateServer` 行为一致：空地址 / port=0 → disabled。

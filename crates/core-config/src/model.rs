@@ -2154,10 +2154,7 @@ fn default_localhost() -> String {
 fn default_reality_listen_host() -> String {
     "0.0.0.0".into()
 }
-<<<<<<< HEAD
-=======
 
->>>>>>> origin/main
 fn default_wireguard_listen_host() -> String {
     "0.0.0.0".into()
 }
