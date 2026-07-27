@@ -33,6 +33,7 @@ use crate::{
         vmess_legacy::VmessLegacyOutbound,
         wireguard::WireGuardOutbound,
         xhttp::Config as XhttpConfig,
+        young::YoungOutbound,
     },
     socks5::Socks5Outbound,
     stub::StubOutbound,
@@ -120,6 +121,7 @@ pub fn build_outbound(node: &ParsedNode) -> SharedOutbound {
         NodeProtocol::Mieru => build_mieru(node),
         NodeProtocol::Sudoku => build_sudoku(node),
         NodeProtocol::TrustTunnel => build_trusttunnel(node),
+        NodeProtocol::Young => build_young(node),
         ref other => StubOutbound::new(node.name.clone(), proto_static_name(other)),
     }
 }
@@ -957,6 +959,82 @@ fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
+fn build_young(node: &ParsedNode) -> SharedOutbound {
+    let encoded_key = node
+        .user
+        .as_deref()
+        .or(node.password.as_deref())
+        .unwrap_or_default();
+    let key = match core_young::YoungKey::parse_base64url(encoded_key) {
+        Ok(key) => key,
+        Err(_) => return StubOutbound::new(node.name.clone(), "young(invalid-key)"),
+    };
+    let encoded_pin = node
+        .params
+        .get("pin-sha256")
+        .or_else(|| node.params.get("pin_sha256"))
+        .or_else(|| node.params.get("pin"))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let pin = if encoded_pin.len() == 64 && encoded_pin.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        hex::decode(encoded_pin).ok()
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_pin)
+            .ok()
+    };
+    let Some(certificate_sha256) = pin.and_then(|pin| pin.try_into().ok()) else {
+        return StubOutbound::new(node.name.clone(), "young(invalid-certificate-pin)");
+    };
+    let server_name = node.sni.clone().unwrap_or_else(|| node.host.clone());
+    let authority = node
+        .params
+        .get("authority")
+        .cloned()
+        .unwrap_or_else(|| server_name.clone());
+    let padding_min = node
+        .params
+        .get("padding-min")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(64);
+    let padding_max = node
+        .params
+        .get("padding-max")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(512);
+    if padding_min > padding_max || usize::from(padding_max) > core_young::MAX_PADDING_BYTES {
+        return StubOutbound::new(node.name.clone(), "young(invalid-padding)");
+    }
+    let config = core_young::YoungClientConfig {
+        server: node.host.clone(),
+        port: node.port,
+        server_name,
+        authority,
+        path: node
+            .params
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "/assets".into()),
+        key,
+        certificate_sha256,
+        idle_timeout: std::time::Duration::from_secs(
+            node.params
+                .get("idle-secs")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        ),
+        max_streams: node
+            .params
+            .get("max-streams")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024),
+        padding_min,
+        padding_max,
+    };
+    Arc::new(YoungOutbound::new(&node.name, config))
+}
+
 fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     use base64::Engine;
     let v = base64::engine::general_purpose::STANDARD
@@ -988,6 +1066,7 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
         NodeProtocol::Mieru => "mieru",
         NodeProtocol::Sudoku => "sudoku",
         NodeProtocol::TrustTunnel => "trusttunnel",
+        NodeProtocol::Young => "young",
         _ => "stub",
     }
 }

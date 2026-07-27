@@ -31,6 +31,8 @@ use dashmap::DashMap;
 use ipnet::IpNet;
 use parking_lot::Mutex;
 
+use crate::group::GroupStrategy;
+
 /// per-query DNS 选项 —— 与 sing-box 字段一一对应。
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
@@ -40,6 +42,8 @@ pub struct QueryOptions {
     pub rewrite_ttl: Option<u32>,
     /// EDNS0 client_subnet 提示。
     pub client_subnet: Option<IpNet>,
+    /// 覆盖目标 group 的成员选择策略。None = 使用 group 自身配置。
+    pub strategy: Option<GroupStrategy>,
 }
 
 /// sing-box `reject.method`：默认返回 REFUSED；drop 不响应。
@@ -410,6 +414,10 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
     };
 
     // ---------- 选项 ----------
+    let strategy = match get_str("strategy") {
+        Some(value) => Some(GroupStrategy::parse(&value)?),
+        None => None,
+    };
     let opts = QueryOptions {
         disable_cache: get_bool("no_cache") || get_bool("disable_cache") || get_bool("nocache"),
         disable_optimistic_cache: get_bool("no_optimistic_cache")
@@ -426,6 +434,7 @@ pub fn parse_rule_value(v: &serde_yaml::Value) -> Option<PolicyRule> {
                     })
                 })
             }),
+        strategy,
     };
 
     // ---------- RHS（按优先级寻找第一个出现的动作字段） ----------
@@ -848,6 +857,11 @@ fn parse_opts(s: &str) -> QueryOptions {
                     }
                 }
             }
+            kv if kv.starts_with("strategy=") => {
+                o.strategy = kv
+                    .split_once('=')
+                    .and_then(|(_, value)| GroupStrategy::parse(value));
+            }
             _ => {}
         }
     }
@@ -944,7 +958,7 @@ mod tests {
     #[test]
     fn yaml_object_form_with_options() {
         let v: serde_yaml::Value = serde_yaml::from_str(
-            r#"{ set: cn-site, direct: cn-dns, ecs: 1.2.3.0/24, no_cache: true, ttl: 60 }"#,
+            r#"{ set: cn-site, direct: cn-dns, ecs: 1.2.3.0/24, no_cache: true, ttl: 60, strategy: random }"#,
         )
         .unwrap();
         let r = parse_rule_value(&v).unwrap();
@@ -958,6 +972,7 @@ mod tests {
                 assert!(opts.disable_cache);
                 assert_eq!(opts.rewrite_ttl, Some(60));
                 assert!(opts.client_subnet.is_some());
+                assert_eq!(opts.strategy, Some(GroupStrategy::Random));
             }
             _ => panic!(),
         }

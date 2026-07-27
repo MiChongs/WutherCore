@@ -1,8 +1,12 @@
-//! 系统 resolver —— `getaddrinfo` 包到 spawn_blocking。
+//! 系统 resolver：A/AAAA 使用 `getaddrinfo`，其余记录类型沿用系统 DNS 配置查询。
 
 use std::net::{IpAddr, ToSocketAddrs};
 
 use async_trait::async_trait;
+use hickory_resolver::{
+    TokioAsyncResolver,
+    proto::rr::{Record, RecordType},
+};
 
 use super::{DnsError, DnsUpstream};
 
@@ -43,6 +47,32 @@ impl DnsUpstream for SystemUpstream {
     async fn query_aaaa(&self, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         query_filtered(host, false).await
     }
+    async fn query_records(
+        &self,
+        host: &str,
+        record_type: RecordType,
+    ) -> Result<Vec<Record>, DnsError> {
+        match record_type {
+            RecordType::A => return records_from_ips(host, record_type, self.query_a(host).await?),
+            RecordType::AAAA => {
+                return records_from_ips(host, record_type, self.query_aaaa(host).await?);
+            }
+            _ => {}
+        }
+
+        let resolver = TokioAsyncResolver::tokio_from_system_conf()
+            .map_err(|e| DnsError::Failed(format!("读取系统 DNS 配置失败: {e}")))?;
+        let lookup = resolver
+            .lookup(host.trim_end_matches('.'), record_type)
+            .await
+            .map_err(|e| DnsError::Failed(e.to_string()))?;
+        let records = lookup.records().to_vec();
+        if records.is_empty() {
+            Err(DnsError::Empty)
+        } else {
+            Ok(records)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +108,36 @@ async fn query_filtered(host: &str, want_v4: bool) -> Result<Vec<IpAddr>, DnsErr
         Err(DnsError::Empty)
     } else {
         Ok(res)
+    }
+}
+
+fn records_from_ips(
+    host: &str,
+    record_type: RecordType,
+    ips: Vec<IpAddr>,
+) -> Result<Vec<Record>, DnsError> {
+    use hickory_resolver::proto::rr::{
+        Name, RData,
+        rdata::{A, AAAA},
+    };
+
+    let name = Name::from_ascii(host.trim_end_matches('.'))
+        .map_err(|e| DnsError::Failed(e.to_string()))?;
+    let records = ips
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) if record_type == RecordType::A => {
+                Some(Record::from_rdata(name.clone(), 60, RData::A(A(ip))))
+            }
+            IpAddr::V6(ip) if record_type == RecordType::AAAA => {
+                Some(Record::from_rdata(name.clone(), 60, RData::AAAA(AAAA(ip))))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        Err(DnsError::Empty)
+    } else {
+        Ok(records)
     }
 }

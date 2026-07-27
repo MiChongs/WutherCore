@@ -248,6 +248,13 @@ impl DnsUpstream for QuicDnsUpstream {
 }
 
 fn build_tls_config(skip_cert_verify: bool) -> rustls::ClientConfig {
+    build_tls_config_with_alpn(skip_cert_verify, DOQ_ALPN)
+}
+
+pub(super) fn build_tls_config_with_alpn(
+    skip_cert_verify: bool,
+    alpn: &[&[u8]],
+) -> rustls::ClientConfig {
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -255,7 +262,7 @@ fn build_tls_config(skip_cert_verify: bool) -> rustls::ClientConfig {
     .expect("rustls ring default protocols")
     .with_root_certificates(root_store())
     .with_no_client_auth();
-    config.alpn_protocols = DOQ_ALPN.iter().map(|a| a.to_vec()).collect();
+    config.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     if skip_cert_verify {
         config
             .dangerous()

@@ -936,6 +936,7 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     let mut handles = Vec::new();
+    let mut young_server_handles = Vec::new();
 
     // Standalone DNS server —— mihomo `dns.listen` 等价。
     // 与 mihomo `dns/server.go::ReCreateServer` 行为一致：空地址 / port=0 → disabled。
@@ -970,6 +971,41 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
     // 防止编译器优化掉 handle —— drop 时取消两个后台 task。
     let _dns_listener_keepalive = dns_listener_handle;
+
+    // Young 原生入站：每个监听器由独立 current-thread runtime 驱动 Mozilla Neqo。
+    // handle 持有关闭通道，必须存活到全局 shutdown。
+    for listener in &plan.listen.young {
+        let listen = listener
+            .socket_addr()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let keys = listener
+            .users
+            .iter()
+            .map(|key| core_young::YoungKey::parse_base64url(key))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let server = core_young::YoungServerHandle::start(core_young::YoungServerConfig {
+            listen,
+            nss_database: PathBuf::from(&listener.nss_database),
+            certificate_nickname: listener.certificate_nickname.clone(),
+            authority: listener.authority.clone(),
+            path: listener.path.clone(),
+            keys: core_young::KeyRing::new(keys)?,
+            clock_skew: listener.clock_skew,
+            idle_timeout: listener.idle_timeout,
+            max_streams: listener.max_streams,
+            max_sessions: listener.max_sessions,
+            max_flows_per_session: listener.max_flows_per_session,
+            decoy_status: listener.decoy_status,
+            decoy_body: listener.decoy_body.as_bytes().to_vec(),
+        })?;
+        info!(
+            addr = %server.local_addr(),
+            authority = %listener.authority,
+            carrier = "mozilla-neqo-h3-webtransport",
+            "Young inbound ready"
+        );
+        young_server_handles.push(server);
+    }
 
     // Mixed 入站
     if let Some(mixed) = &plan.listen.mixed {
@@ -1054,6 +1090,11 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
     feed_mgr_handle.stop();
     runtime.shutdown().await;
+    for server in &young_server_handles {
+        if let Err(error) = server.shutdown() {
+            warn!(target: "young", %error, "Young server shutdown failed");
+        }
+    }
     for h in handles {
         h.abort();
     }
