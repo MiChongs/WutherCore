@@ -119,7 +119,7 @@ tokio-boring      = { version = "=4.19.0" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 uuid              = { version = "1", features = ["v4"] }
 aes               = "0.8"
-ctr               = "0.9"
+ctr               = "0.10"
 cfb-mode          = "0.8"
 crc32fast         = "1"
 fnv               = "1"
