@@ -4,7 +4,7 @@
 //! ## 流水
 //! 1. NAT 表登记（仅记账，不参与决策）；
 //! 2. **DNS hijack**：53 + `hijack_dns=true` → 用 `fakeip_dns::synthesize` 内联应答；
-//! 3. **5-tuple 命中既有 session** → 复用 outbound socket，仅 send + 续 last_seen；
+//! 3. 按对称 NAT 或 EIM key 命中 association → 复用 outbound socket；
 //! 4. **首包**：fake-IP 反查 / 路由策略 → `ListenerHandler.new_packet` 拨号 →
 //!    注册 session → 发首包 → spawn reverse loop（外网回包改写成 IP UDP 写回 TUN）。
 //!
@@ -26,7 +26,10 @@ use crate::{
     nat::{NatEntry, NatTable},
     tun_inbound::{TunDropReason, TunInbound, build_inbound_metadata},
     tun_io::TunIo,
-    udp_session::{PendingUdpSession, UDP_PENDING_QUEUE_CAPACITY},
+    udp_session::{
+        PendingUdpSession, UDP_PENDING_QUEUE_CAPACITY, UDP_SESSION_QUEUE_CAPACITY, UdpDatagram,
+        UdpNatKey, UdpSessionReservation,
+    },
 };
 
 /// 跨 dispatcher 的 UDP 派发上下文（克隆开销 = 几个 `Arc::clone`）。
@@ -37,6 +40,7 @@ pub struct UdpDispatchCtx {
     pub inbound: Arc<TunInbound>,
     pub dns_service: Arc<DnsService>,
     pub frame_formats: Arc<TunFrameFormatCache>,
+    pub endpoint_independent_nat: bool,
 }
 
 /// 处理一帧 TUN UDP 包：DNS hijack / session 复用 / 首包拨号 + reverse loop。
@@ -85,160 +89,232 @@ pub async fn handle_udp_packet(
         return;
     }
 
-    // [2] 5-tuple 命中既有 session → 复用
-    let key = crate::udp_session::UdpFlowKey {
-        src: inner_src,
-        dst: outer_dst,
-    };
-    if let Some(session) = ctx.udp_sessions.lookup(&key) {
-        let n = payload.len();
-        match session
-            .socket
-            .send_to(&payload, &session.target_host, session.target_port)
-            .await
-        {
-            Ok(_) => {
-                handler.record_upload(&session.guard, n as u64);
-                session.touch();
-                trace!(
-                    target: "capture::traffic",
-                    conn_id = session.guard.id,
-                    network = "udp",
-                    src = %inner_src,
-                    dst = %outer_dst,
-                    target_host = %session.target_host,
-                    target_port = session.target_port,
-                    upload = n,
-                    "udp session upload"
-                );
-            }
-            Err(e) => {
-                debug!(target: "capture::udp", error = %e, "reuse send failed; remove session");
-                ctx.udp_sessions.remove(&key);
-            }
+    let key = UdpNatKey::new(inner_src, outer_dst, ctx.endpoint_independent_nat);
+    let reservation = ctx.udp_sessions.reserve(key, UDP_PENDING_QUEUE_CAPACITY);
+    match reservation {
+        UdpSessionReservation::Established(session) => {
+            queue_established(ctx, key, session, inner_src, outer_dst, payload);
+            return;
         }
-        return;
-    }
-
-    // [2.5] flow 已在拨号中：只入队，不阻塞 TUN pump。
-    if let Some(pending) = ctx.udp_sessions.lookup_pending(&key) {
-        match pending.try_send(payload) {
-            Ok(()) => {
-                trace!(
-                    target: "capture::traffic",
-                    network = "udp",
-                    src = %inner_src,
-                    dst = %outer_dst,
-                    "udp pending packet queued"
-                );
+        UdpSessionReservation::Pending(pending) => {
+            match pending.try_send(UdpDatagram { outer_dst, payload }) {
+                Ok(()) => {
+                    trace!(
+                        target: "capture::traffic",
+                        network = "udp",
+                        src = %inner_src,
+                        dst = %outer_dst,
+                        "udp pending packet queued"
+                    );
+                }
+                Err(TrySendError::Full(_)) => {
+                    warn!(
+                        target: "capture::udp",
+                        network = "udp",
+                        src = %inner_src,
+                        dst = %outer_dst,
+                        capacity = UDP_PENDING_QUEUE_CAPACITY,
+                        "udp pending queue full; drop packet"
+                    );
+                }
+                Err(TrySendError::Closed(_)) => {
+                    debug!(
+                        target: "capture::udp",
+                        network = "udp",
+                        src = %inner_src,
+                        dst = %outer_dst,
+                        "udp pending queue closed"
+                    );
+                    ctx.udp_sessions.remove_pending_if(key, &pending);
+                }
             }
-            Err(TrySendError::Full(_)) => {
+            return;
+        }
+        UdpSessionReservation::Created { pending, receiver } => {
+            if let Err(error) = pending.try_send(UdpDatagram { outer_dst, payload }) {
                 warn!(
                     target: "capture::udp",
-                    network = "udp",
+                    %error,
                     src = %inner_src,
                     dst = %outer_dst,
-                    capacity = UDP_PENDING_QUEUE_CAPACITY,
-                    "udp pending queue full; drop packet"
+                    "udp pending first packet enqueue failed"
                 );
+                ctx.udp_sessions.remove_pending_if(key, &pending);
+                return;
             }
-            Err(TrySendError::Closed(_)) => {
-                debug!(
-                    target: "capture::udp",
-                    network = "udp",
-                    src = %inner_src,
-                    dst = %outer_dst,
-                    "udp pending queue closed; remove pending flow"
-                );
-                ctx.udp_sessions.remove_pending(&key);
-            }
+            let session_meta = match resolve_udp_session(ctx, inner_src, outer_dst) {
+                Some(session) => session,
+                None => {
+                    ctx.udp_sessions.remove_pending_if(key, &pending);
+                    return;
+                }
+            };
+            debug!(
+                target: "capture::traffic",
+                network = "udp",
+                src = %inner_src,
+                dst = %outer_dst,
+                host = %session_meta.target.host,
+                port = session_meta.target.original_dst_port,
+                dns_mode = session_meta.target.dns_mode.as_str(),
+                bypass = ?session_meta.bypass,
+                eim = ctx.endpoint_independent_nat,
+                "udp new NAT association -> ListenerHandler.NewPacket"
+            );
+            let worker_ctx = ctx.clone();
+            let dev = device.clone();
+            let worker_handler = (*handler).clone();
+            tokio::spawn(async move {
+                run_udp_dial_worker(
+                    worker_ctx,
+                    dev,
+                    worker_handler,
+                    key,
+                    pending,
+                    session_meta,
+                    receiver,
+                    inner_src,
+                    outer_dst,
+                )
+                .await;
+            });
         }
-        return;
     }
+}
 
-    // [3] 首包：先 fake-IP 反查 / 路由策略，payload 入 pending queue 后异步 dial。
-    let session_meta = match ctx
+fn resolve_udp_session(
+    ctx: &UdpDispatchCtx,
+    inner_src: SocketAddr,
+    outer_dst: SocketAddr,
+) -> Option<crate::tun_inbound::TunSession> {
+    match ctx
         .inbound
         .resolve_session("udp", inner_src, outer_dst, None)
     {
-        Ok(s) => s,
+        Ok(session) => Some(session),
         Err(TunDropReason::FakeDnsMissing) => {
             warn!(
                 target: "capture::udp",
                 ip = %outer_dst.ip(),
                 port = outer_dst.port(),
-                "udp fake DNS record missing; drop (与 mihomo 一致)"
+                "udp fake DNS record missing; drop"
             );
-            return;
+            None
         }
         Err(reason) => {
-            debug!(
-                target: "capture::udp",
-                ?reason,
-                %outer_dst,
-                "udp session rejected"
-            );
-            return;
+            debug!(target: "capture::udp", ?reason, %outer_dst, "udp session rejected");
+            None
         }
-    };
-    debug!(
-        target: "capture::traffic",
-        network = "udp",
-        src = %inner_src,
-        dst = %outer_dst,
-        host = %session_meta.target.host,
-        port = session_meta.target.original_dst_port,
-        dns_mode = session_meta.target.dns_mode.as_str(),
-        bypass = ?session_meta.bypass,
-        payload_len = payload.len(),
-        "udp new packet -> ListenerHandler.NewPacket"
-    );
-    let (pending, rx) = PendingUdpSession::new(UDP_PENDING_QUEUE_CAPACITY);
-    if let Err(e) = pending.try_send(payload) {
-        warn!(
+    }
+}
+
+fn queue_established(
+    ctx: &UdpDispatchCtx,
+    key: UdpNatKey,
+    session: Arc<crate::udp_session::UdpSession>,
+    inner_src: SocketAddr,
+    outer_dst: SocketAddr,
+    payload: Vec<u8>,
+) {
+    match session.try_send(UdpDatagram { outer_dst, payload }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            warn!(
+                target: "capture::udp",
+                src = %inner_src,
+                dst = %outer_dst,
+                capacity = UDP_SESSION_QUEUE_CAPACITY,
+                "UDP association send queue full; drop datagram"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            ctx.udp_sessions.remove_session_if(key, &session);
+        }
+    }
+}
+
+async fn transmit_datagram(
+    ctx: &UdpDispatchCtx,
+    handler: &ListenerHandler,
+    key: UdpNatKey,
+    session: &Arc<crate::udp_session::UdpSession>,
+    inner_src: SocketAddr,
+    outer_dst: SocketAddr,
+    payload: Vec<u8>,
+) -> bool {
+    let (target_host, target_port, is_new_destination) =
+        if let Some((host, port)) = session.destination(outer_dst) {
+            (host, port, false)
+        } else {
+            let Some(meta) = resolve_udp_session(ctx, inner_src, outer_dst) else {
+                return false;
+            };
+            (
+                meta.target.host.to_string(),
+                meta.target.original_dst_port,
+                true,
+            )
+        };
+    let length = payload.len();
+    if is_new_destination && !session.socket.supports_multi_target() {
+        debug!(
             target: "capture::udp",
-            error = %e,
             src = %inner_src,
             dst = %outer_dst,
-            "udp pending first packet enqueue failed"
+            "outbound UDP carrier is target-bound; rotate EIM association"
         );
-        return;
+        ctx.udp_sessions.remove_session_if(key, session);
+        return false;
     }
-    ctx.udp_sessions.insert_pending(key, pending);
-    trace!(
-        target: "capture::traffic",
-        network = "udp",
-        src = %inner_src,
-        dst = %outer_dst,
-        capacity = UDP_PENDING_QUEUE_CAPACITY,
-        "udp pending session created"
-    );
-
-    let worker_ctx = ctx.clone();
-    let dev = device.clone();
-    let worker_handler = (*handler).clone();
-    tokio::spawn(async move {
-        run_udp_dial_worker(
-            worker_ctx,
-            dev,
-            worker_handler,
-            key,
-            session_meta,
-            rx,
-            inner_src,
-            outer_dst,
-        )
-        .await;
-    });
+    if is_new_destination
+        && !session.register_destination(outer_dst, target_host.clone(), target_port)
+    {
+        warn!(
+            target: "capture::udp",
+            src = %inner_src,
+            limit = crate::udp_session::UDP_EIM_DESTINATION_LIMIT,
+            "EIM destination limit reached; drop datagram"
+        );
+        return true;
+    }
+    match session
+        .socket
+        .send_to(&payload, &target_host, target_port)
+        .await
+    {
+        Ok(_) => {
+            handler.record_upload(&session.guard, length as u64);
+            session.touch();
+            trace!(
+                target: "capture::traffic",
+                conn_id = session.guard.id,
+                network = "udp",
+                src = %inner_src,
+                dst = %outer_dst,
+                %target_host,
+                target_port,
+                eim_destinations = session.destination_count(),
+                upload = length,
+                "udp NAT association upload"
+            );
+        }
+        Err(error) => {
+            debug!(target: "capture::udp", %error, "UDP association send failed; remove session");
+            ctx.udp_sessions.remove_session_if(key, session);
+            return false;
+        }
+    }
+    true
 }
 
 async fn run_udp_dial_worker(
     ctx: UdpDispatchCtx,
     device: Arc<dyn TunIo>,
     handler: ListenerHandler,
-    key: crate::udp_session::UdpFlowKey,
+    key: UdpNatKey,
+    pending: Arc<PendingUdpSession>,
     session_meta: crate::tun_inbound::TunSession,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<UdpDatagram>,
     inner_src: SocketAddr,
     outer_dst: SocketAddr,
 ) {
@@ -260,24 +336,33 @@ async fn run_udp_dial_worker(
             let host = session_meta.target.host.clone();
             let port = session_meta.target.original_dst_port;
             debug!(target: "capture::udp", "[UDP] dial {host}:{port} failed: {e}");
-            ctx.udp_sessions.remove_pending(&key);
+            ctx.udp_sessions.remove_pending_if(key, &pending);
             return;
         }
     };
-    let session = Arc::new(crate::udp_session::UdpSession {
-        socket: prepared.socket,
-        guard: prepared.guard,
-        target_host: prepared.target_host,
-        target_port: prepared.target_port,
-        last_seen: parking_lot::Mutex::new(Instant::now()),
-    });
-    ctx.udp_sessions.insert(key, session.clone());
-    ctx.udp_sessions.remove_pending(&key);
+    let (session, mut send_rx) = crate::udp_session::UdpSession::new(
+        prepared.socket,
+        prepared.guard,
+        outer_dst,
+        prepared.target_host,
+        prepared.target_port,
+        key.is_endpoint_independent(),
+        UDP_SESSION_QUEUE_CAPACITY,
+    );
+    let session = Arc::new(session);
+    if !ctx.udp_sessions.promote(key, &pending, session.clone()) {
+        session.cancel();
+        return;
+    }
+    // Promotion removed the pending sender from the table. Drop the worker's
+    // last sender so the receiver closes after draining the queued burst.
+    drop(pending);
     {
         let id = session.guard.id;
         let src = inner_src.to_string();
-        let host = &session.target_host;
-        let port = session.target_port;
+        let (host, port) = session
+            .destination(outer_dst)
+            .expect("initial UDP destination must be registered");
         if let Some(b) = session_meta.bypass {
             info!(target: "capture::traffic", "[UDP] #{id} {src} --> {host}:{port} (bypass: {b:?})");
         } else {
@@ -292,38 +377,49 @@ async fn run_udp_dial_worker(
         session.clone(),
         key,
         inner_src,
-        outer_dst,
         handler.runtime().metrics.clone(),
     );
 
-    while let Some(payload) = rx.recv().await {
-        let n = payload.len();
-        match session
-            .socket
-            .send_to(&payload, &session.target_host, session.target_port)
-            .await
+    while let Some(datagram) = rx.recv().await {
+        let destination = datagram.outer_dst;
+        if !transmit_datagram(
+            &ctx,
+            &handler,
+            key,
+            &session,
+            inner_src,
+            destination,
+            datagram.payload,
+        )
+        .await
         {
-            Ok(_) => {
-                handler.record_upload(&session.guard, n as u64);
-                session.touch();
-                trace!(
-                    target: "capture::traffic",
-                    conn_id = session.guard.id,
-                    network = "udp",
-                    upload = n,
-                    "udp pending payload sent"
-                );
-            }
-            Err(e) => {
-                debug!(
-                    target: "capture::udp",
-                    host = %session.target_host,
-                    port = session.target_port,
-                    error = %e,
-                    "udp pending payload send failed"
-                );
-                ctx.udp_sessions.remove(&key);
-                break;
+            return;
+        }
+    }
+    let mut cancel = session.cancel_receiver();
+    loop {
+        if *cancel.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    break;
+                }
+            },
+            datagram = send_rx.recv() => {
+                let Some(datagram) = datagram else { break };
+                if !transmit_datagram(
+                    &ctx,
+                    &handler,
+                    key,
+                    &session,
+                    inner_src,
+                    datagram.outer_dst,
+                    datagram.payload,
+                ).await {
+                    break;
+                }
             }
         }
     }
@@ -334,23 +430,40 @@ fn spawn_udp_reverse_loop(
     frame_formats: Arc<TunFrameFormatCache>,
     sessions: Arc<crate::udp_session::UdpSessionTable>,
     session_for_loop: Arc<crate::udp_session::UdpSession>,
-    key: crate::udp_session::UdpFlowKey,
+    key: UdpNatKey,
     inner_src: SocketAddr,
-    outer_dst: SocketAddr,
     metrics: Arc<core_observe::Metrics>,
 ) {
     tokio::spawn(async move {
         metrics.inc_connection();
-        let cancel = session_for_loop.guard.cancel.clone();
+        let mut cancel = session_for_loop.cancel_receiver();
         let mut buf = vec![0u8; 65535];
         loop {
+            if *cancel.borrow() {
+                break;
+            }
             tokio::select! {
-                _ = cancel.notified() => break,
-                r = session_for_loop.socket.recv_from(&mut buf) => {
-                    let n = match r { Ok(n) => n, Err(_) => break };
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                },
+                r = session_for_loop.socket.recv_from_endpoint(&mut buf) => {
+                    let (n, transport_source) = match r { Ok(value) => value, Err(_) => break };
                     if n == 0 { break }
+                    let Some(logical_source) =
+                        session_for_loop.logical_response_source(transport_source)
+                    else {
+                        debug!(
+                            target: "capture::udp",
+                            ?transport_source,
+                            destinations = session_for_loop.destination_count(),
+                            "drop ambiguous endpoint-independent UDP response"
+                        );
+                        continue;
+                    };
                     let pkt = match crate::udp_forwarder::build_udp_ip_packet(
-                        outer_dst, inner_src, &buf[..n],
+                        logical_source, inner_src, &buf[..n],
                     ) {
                         Some(b) => b,
                         None => continue,
@@ -377,7 +490,7 @@ fn spawn_udp_reverse_loop(
         let up = session_for_loop.guard.up.load(Ordering::Relaxed);
         let down = session_for_loop.guard.down.load(Ordering::Relaxed);
         let id = session_for_loop.guard.id;
-        sessions.remove(&key);
+        sessions.remove_session_if(key, &session_for_loop);
         metrics.dec_connection();
         let up_s = crate::tun_pump::format_bytes(up);
         let down_s = crate::tun_pump::format_bytes(down);

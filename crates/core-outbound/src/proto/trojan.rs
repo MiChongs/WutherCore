@@ -339,8 +339,15 @@ impl UdpSocketLike for TrojanUdp {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.recv_from_endpoint(buf).await.map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Option<std::net::SocketAddr>)> {
         let mut read = self.read.lock().await;
-        let _ = read_socks_addr_async(&mut *read).await?;
+        let (host, port) = read_socks_addr_async(&mut *read).await?;
         let mut len = [0u8; 2];
         read.read_exact(&mut len).await?;
         let total = u16::from_be_bytes(len) as usize;
@@ -355,13 +362,21 @@ impl UdpSocketLike for TrojanUdp {
         }
         let copy_len = total.min(buf.len());
         buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        Ok(copy_len)
+        let endpoint = host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|address| std::net::SocketAddr::new(address, port));
+        Ok((copy_len, endpoint))
     }
 
     async fn close(&self) -> std::io::Result<()> {
         let mut write = self.write.lock().await;
         let _ = write.shutdown().await;
         Ok(())
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
     }
 }
 

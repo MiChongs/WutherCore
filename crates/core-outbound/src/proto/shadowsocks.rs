@@ -239,18 +239,26 @@ impl UdpSocketLike for ShadowsocksUdp {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_from_endpoint(buf).await.map(|(length, _)| length)
+    }
+
+    async fn recv_from_endpoint(&self, buf: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
         // The encrypted datagram is larger than the caller's plaintext
         // buffer. Always receive into a full UDP packet buffer first, then
         // apply ordinary datagram truncation semantics to the destination.
         let mut packet = self.recv_buf.lock().await;
-        let (payload_len, _, _) = self
+        let (payload_len, source, _) = self
             .socket
             .recv(&mut packet)
             .await
             .map_err(io::Error::other)?;
         let copied = payload_len.min(buf.len());
         buf[..copied].copy_from_slice(&packet[..copied]);
-        Ok(copied)
+        let endpoint = match source {
+            Address::SocketAddress(address) => Some(address),
+            Address::DomainNameAddress(_, _) => None,
+        };
+        Ok((copied, endpoint))
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
@@ -260,6 +268,10 @@ impl UdpSocketLike for ShadowsocksUdp {
     async fn close(&self) -> io::Result<()> {
         let _ = &self.loopback_guard;
         Ok(())
+    }
+
+    fn supports_multi_target(&self) -> bool {
+        true
     }
 }
 

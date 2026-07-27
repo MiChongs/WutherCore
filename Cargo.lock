@@ -1322,6 +1322,7 @@ dependencies = [
  "cronet",
  "ctr",
  "curve25519-dalek",
+ "dashmap",
  "data-encoding",
  "flate2",
  "fnv",

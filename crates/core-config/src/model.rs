@@ -4856,10 +4856,14 @@ pub struct TunInboundOptions {
 
     /* ---- NAT / 性能 ---- */
     /// `endpoint_independent_nat` —— 全锥 NAT；UDP 打洞场景需开。
-    #[serde(default)]
+    #[serde(default, alias = "endpoint-independent-nat")]
     pub endpoint_independent_nat: bool,
     /// `udp_timeout` —— UDP NAT 老化（默认 5m）。
-    #[serde(default = "default_udp_timeout", with = "humantime_serde")]
+    #[serde(
+        default = "default_udp_timeout",
+        alias = "udp-timeout",
+        with = "humantime_serde"
+    )]
     pub udp_timeout: Duration,
     /// `exclude_mptcp` —— 透传 MPTCP 不接管。
     #[serde(default)]
@@ -5359,6 +5363,14 @@ fn default_tailscale_mode() -> TailscaleMode {
 #[cfg(test)]
 mod xhttp_config_tests {
     use super::*;
+
+    #[test]
+    fn tun_accepts_mihomo_kebab_case_nat_fields() {
+        let tun: TunInboundOptions =
+            serde_yaml::from_str("endpoint-independent-nat: true\nudp-timeout: 45s\n").unwrap();
+        assert!(tun.endpoint_independent_nat);
+        assert_eq!(tun.udp_timeout, Duration::from_secs(45));
+    }
 
     const FULL_XHTTP_YAML: &str = r#"
 host: cdn.example.com

@@ -450,6 +450,7 @@ pub struct CaptureCapabilities {
     pub dns_hijack: bool,
     pub transparent_tcp: bool,
     pub transparent_udp: bool,
+    pub endpoint_independent_nat: bool,
     pub native_route_api: bool,
     pub crash_recovery: bool,
     pub network_rebind: bool,
@@ -482,6 +483,7 @@ impl CaptureCapabilities {
             dns_hijack: plan.kind != EngineKind::None && plan.hijack_dns,
             transparent_tcp: transparent,
             transparent_udp: plan.kind == EngineKind::Tproxy,
+            endpoint_independent_nat: plan.kind == EngineKind::Tun && plan.endpoint_independent_nat,
             native_route_api: cfg!(any(
                 target_os = "linux",
                 target_os = "android",
@@ -671,7 +673,7 @@ mod tests {
         c.tun.auto_redirect_nfqueue = Some(100);
         c.tun.auto_redirect_iproute2_fallback_rule_index = Some(32768);
         c.tun.strict_route = true;
-        c.tun.endpoint_independent_nat = false;
+        c.tun.endpoint_independent_nat = true;
         c.tun.udp_timeout = Duration::from_secs(300);
         c.tun.route_address = vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()];
         c.tun.route_exclude_address = vec!["192.168.0.0/16".into(), "fc00::/7".into()];
@@ -707,6 +709,8 @@ mod tests {
         assert_eq!(plan.auto_redirect_marks.reset, Some(0x2025));
         assert_eq!(plan.auto_redirect_marks.nfqueue, Some(100));
         assert!(plan.strict_route);
+        assert!(plan.endpoint_independent_nat);
+        assert!(CaptureCapabilities::for_plan(&plan).endpoint_independent_nat);
         assert_eq!(plan.udp_timeout, Duration::from_secs(300));
         assert_eq!(plan.route_addresses.len(), 2);
         assert_eq!(plan.route_exclude_addresses.len(), 2);

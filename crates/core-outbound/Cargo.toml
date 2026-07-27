@@ -21,6 +21,7 @@ core-grpc   = { workspace = true }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
+dashmap     = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }

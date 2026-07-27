@@ -95,5 +95,5 @@ pub use tun_dispatch::{TunDispatcher, TunDispatcherHandles};
 pub use tun_inbound::{TunDropReason, TunInbound, TunOutboundMeta, TunPacket, TunSession};
 pub use tun_io::{TunIo, TunIoError, open_tun_device};
 pub use udp_forwarder::{UdpForwarderConfig, run_return_loop, send_one as udp_send_one};
-pub use udp_session::{UdpFlowKey, UdpSession, UdpSessionTable};
+pub use udp_session::{UdpFlowKey, UdpNatKey, UdpSession, UdpSessionTable};
 pub use wireguard_tun::WireGuardTunIo;
