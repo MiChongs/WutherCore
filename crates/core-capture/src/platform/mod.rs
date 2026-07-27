@@ -95,7 +95,8 @@ pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, Capture
     }
     #[cfg(target_os = "android")]
     {
-        // Tun → Linux engine（带真实 TunIo）；Tproxy/Redirect → AndroidCapture（4-tier nft）
+        // Android shares the complete TUN/TPROXY/REDIRECT data plane with
+        // Linux; the TUN opener additionally supports an injected VpnService fd.
         return android::build_engine(plan);
     }
     #[cfg(not(any(

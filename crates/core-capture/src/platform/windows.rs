@@ -149,7 +149,7 @@ impl CaptureEngine for WindowsTun {
                         dest,
                         gateway: None,
                         interface: self.plan.interface_name.clone(),
-                        metric: 0,
+                        metric: 1,
                         table: None,
                     })
                     .map_err(CaptureError::Route)?;
@@ -612,8 +612,10 @@ mod tests {
         assert_eq!(
             crate::resource_claims::windows_tun_route_nets(&route_plan(true, true)),
             [
-                "0.0.0.0/0".parse::<ipnet::IpNet>().unwrap(),
-                "::/0".parse::<ipnet::IpNet>().unwrap(),
+                "0.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "128.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "::/1".parse::<ipnet::IpNet>().unwrap(),
+                "8000::/1".parse::<ipnet::IpNet>().unwrap(),
             ]
         );
 
@@ -621,7 +623,10 @@ mod tests {
         ipv4_only.ipv6_enabled = false;
         assert_eq!(
             crate::resource_claims::windows_tun_route_nets(&ipv4_only),
-            ["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()]
+            [
+                "0.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+                "128.0.0.0/1".parse::<ipnet::IpNet>().unwrap(),
+            ]
         );
 
         let mut explicit = route_plan(true, true);

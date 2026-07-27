@@ -1,17 +1,14 @@
-//! Android 后端：root 模式完整透明代理能力。
+//! Android capture platform selection.
 //!
-//! 行为：
-//! 1. [`detect_capability`] 通过 `su -c` 执行多个探测命令收集 [`AndroidCapability`]；
-//! 2. [`AndroidCapability::select_tier`] 选最高可用 root Tier；
-//! 3. [`AndroidCapture::start`] 调用对应 Tier 的 install_rules：
-//!    - **NftablesFull**：`nft add table inet wuthercore` + 双栈 TPROXY chain
-//!    - **IptablesV4V6Tproxy**：`iptables` + `ip6tables` 双栈 TPROXY
-//!    - **IptablesV4V6Redirect**：`iptables -t nat REDIRECT` + `ip6tables -t nat REDIRECT`
-//!    - **IptablesV4Only**：仅 v4 NAT REDIRECT
-//! 4. [`AndroidCapture::stop`] 严格按 Tier 卸载规则，恢复路由表。
+//! Production Android uses the shared Linux data plane:
+//! - `Tun`: root `/dev/net/tun`, with an injected `VpnService` fd fallback.
+//! - explicit `Tproxy`: dual-stack TCP+UDP transparent listeners plus the
+//!   transactional policy/firewall rule ledger.
+//! - explicit `Redirect`: TCP `SO_ORIGINAL_DST` listeners plus an atomic nft
+//!   ruleset.
 //!
-//! 跨平台编译：本文件在所有平台都参与构建，但 `su -c` 命令调用使用 `cfg(target_os = "android")` 守护；
-//! 其它平台下 `detect_capability()` 返回空能力，`install_rules` 仅写日志。
+//! The legacy tier implementation remains available only as a cross-platform
+//! capability-reporting stub; [`build_engine`] never selects it on Android.
 
 use std::sync::Arc;
 
@@ -40,13 +37,19 @@ pub fn list_interfaces() -> Vec<String> {
 
 pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, CaptureError> {
     match plan.kind {
-        // Tun → 走 Linux engine 拿真实 TunIo（root /dev/net/tun 优先；VpnService fd fallback）。
+        // Android shares the packet/socket implementation with Linux:
+        // - TUN opens root /dev/net/tun first, then the injected VpnService fd.
+        // - Explicit TPROXY/REDIRECT is intended for a daemon launched as root;
+        //   it must own real listeners as well as firewall rules.
         #[cfg(target_os = "android")]
-        EngineKind::Tun => crate::platform::linux::build_engine(plan),
-        // 非 Android 主机调试编译时，Tun 走 stub AndroidCapture（不会真正生效）。
+        EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
+            crate::platform::linux::build_engine(plan)
+        }
+        // 非 Android 主机调试编译时走 stub（不会真正生效）。
         #[cfg(not(target_os = "android"))]
-        EngineKind::Tun => Ok(Arc::new(AndroidCapture::new(plan))),
-        EngineKind::Tproxy | EngineKind::Redirect => Ok(Arc::new(AndroidCapture::new(plan))),
+        EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
+            Ok(Arc::new(AndroidCapture::new(plan)))
+        }
         EngineKind::None => Err(CaptureError::Unsupported("kind=None".into())),
     }
 }

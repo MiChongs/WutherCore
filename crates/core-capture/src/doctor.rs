@@ -66,9 +66,9 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
     }
 
     // sing-box 字段一致性检查
-    if plan.auto_redirect && !cfg!(any(target_os = "linux", target_os = "android")) {
+    if plan.auto_redirect && !cfg!(target_os = "linux") {
         warnings.push(format!(
-            "auto_redirect 仅在 Linux/Android 生效（当前 {}）",
+            "auto_redirect 当前仅在 root-managed Linux TUN 生效（当前 {}）",
             std::env::consts::OS
         ));
     }
@@ -103,16 +103,37 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
 
     // 平台特定 doctor
     match plan.kind {
-        EngineKind::Tproxy | EngineKind::Redirect => {
+        EngineKind::Tproxy => {
             if !cfg!(target_os = "linux") && !cfg!(target_os = "android") {
-                blockers.push(format!("{:?} 仅 Linux/Android", plan.kind));
-            } else {
-                if !has_tool("nft") && !has_tool("iptables") {
-                    blockers.push(
-                        "缺少 nft 或 iptables —— OpenWrt 请安装 kmod-nft-tproxy 或 iptables-mod-tproxy"
-                            .into(),
-                    );
-                }
+                blockers.push("Tproxy 仅 Linux/Android".into());
+            } else if !has_tool("iptables") {
+                blockers.push(
+                    "TPROXY 需要 iptables mangle/TPROXY（OpenWrt 请安装 iptables-mod-tproxy）"
+                        .into(),
+                );
+            } else if plan.ipv6_enabled && !has_tool("ip6tables") {
+                blockers.push("IPv6 TPROXY 已启用但缺少 ip6tables".into());
+            }
+            #[cfg(target_os = "android")]
+            if !nix::unistd::Uid::effective().is_root() {
+                blockers.push(
+                    "Android 显式 tproxy 必须以 root 启动 native daemon；普通 App 请使用 method=auto/virtual_nic + VpnService"
+                        .into(),
+                );
+            }
+        }
+        EngineKind::Redirect => {
+            if !cfg!(target_os = "linux") && !cfg!(target_os = "android") {
+                blockers.push("Redirect 仅 Linux/Android".into());
+            } else if !has_tool("nft") {
+                blockers.push("Redirect 需要 nftables，以保证规则原子安装和精确回滚".into());
+            }
+            #[cfg(target_os = "android")]
+            if !nix::unistd::Uid::effective().is_root() {
+                blockers.push(
+                    "Android 显式 redirect 必须以 root 启动 native daemon；普通 App 请使用 method=auto/virtual_nic + VpnService"
+                        .into(),
+                );
             }
         }
         EngineKind::Tun => {

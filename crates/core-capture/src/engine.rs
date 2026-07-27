@@ -435,13 +435,20 @@ fn default_iface_name() -> String {
 }
 
 fn decide_kind(c: &Capture) -> Result<EngineKind, CaptureError> {
+    decide_kind_for_os(c, std::env::consts::OS)
+}
+
+fn decide_kind_for_os(c: &Capture, os: &str) -> Result<EngineKind, CaptureError> {
     if !c.on {
         return Ok(EngineKind::None);
     }
-    let os = std::env::consts::OS;
     let kind = match c.method {
         CaptureMethod::Auto => match os {
-            "linux" | "android" => EngineKind::Tproxy,
+            "linux" => EngineKind::Tproxy,
+            // Android applications normally do not run with CAP_NET_ADMIN.
+            // VpnService is the platform-native, non-root interception path;
+            // explicit tproxy/redirect remain available to root-run daemons.
+            "android" => EngineKind::Tun,
             "windows" | "macos" | "ios" => EngineKind::Tun,
             other => return Err(CaptureError::Unsupported(other.into())),
         },
@@ -556,6 +563,25 @@ mod tests {
                 ..TunInboundOptions::default()
             },
         }
+    }
+
+    #[test]
+    fn auto_uses_vpn_tun_on_android_and_native_backends_elsewhere() {
+        let mut capture = base();
+        capture.method = CaptureMethod::Auto;
+
+        assert_eq!(
+            decide_kind_for_os(&capture, "android").unwrap(),
+            EngineKind::Tun
+        );
+        assert_eq!(
+            decide_kind_for_os(&capture, "linux").unwrap(),
+            EngineKind::Tproxy
+        );
+        assert_eq!(
+            decide_kind_for_os(&capture, "windows").unwrap(),
+            EngineKind::Tun
+        );
     }
 
     #[test]

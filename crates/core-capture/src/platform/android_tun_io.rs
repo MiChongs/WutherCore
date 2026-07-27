@@ -25,16 +25,39 @@ use crate::{
 static INJECTED_FD: Mutex<Option<RawFd>> = Mutex::new(None);
 
 /// 由 JNI 调用：注入 VpnService 创建的 fd（dup 后所有权交本进程）。
-/// 多次调用以最后一次为准。
+/// 多次调用以最后一次为准；尚未消费的旧 fd 会立即关闭，避免 VPN 重建泄漏。
 #[cfg(target_os = "android")]
 pub fn set_vpn_fd(fd: RawFd) {
-    *INJECTED_FD.lock() = Some(fd);
+    if fd < 0 {
+        return;
+    }
+    let old = INJECTED_FD.lock().replace(fd);
+    if let Some(old) = old
+        && old != fd
+    {
+        // SAFETY: set_vpn_fd's API contract transfers ownership to this
+        // module. The fd is still pending and has not been wrapped elsewhere.
+        unsafe {
+            libc::close(old);
+        }
+    }
 }
 
 /// 取出 VpnService fd（take 语义，只能取一次）。
 #[cfg(target_os = "android")]
 pub fn take_injected_fd() -> Option<RawFd> {
     INJECTED_FD.lock().take()
+}
+
+/// 丢弃尚未被 native TUN 消费的 VpnService fd。
+#[cfg(target_os = "android")]
+pub fn clear_vpn_fd() {
+    if let Some(fd) = INJECTED_FD.lock().take() {
+        // SAFETY: pending injected descriptors are exclusively owned here.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 #[cfg(target_os = "android")]

@@ -16,6 +16,10 @@ use crate::engine::{CaptureFilters, CapturePlan, EngineKind};
 
 pub(crate) const DEFAULT_ROUTE_V4: &str = "0.0.0.0/0";
 pub(crate) const DEFAULT_ROUTE_V6: &str = "::/0";
+pub(crate) const SPLIT_DEFAULT_ROUTE_V4_LOW: &str = "0.0.0.0/1";
+pub(crate) const SPLIT_DEFAULT_ROUTE_V4_HIGH: &str = "128.0.0.0/1";
+pub(crate) const SPLIT_DEFAULT_ROUTE_V6_LOW: &str = "::/1";
+pub(crate) const SPLIT_DEFAULT_ROUTE_V6_HIGH: &str = "8000::/1";
 pub(crate) const LINUX_TUN_SPLIT_DEFAULT_V4: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 pub(crate) const LINUX_TUN_SPLIT_DEFAULT_V6: [&str; 2] = ["::/1", "8000::/1"];
 
@@ -32,9 +36,9 @@ pub(crate) const LINUX_TUN_SPLIT_DEFAULT_V6: [&str; 2] = ["::/1", "8000::/1"];
 /// All claims are exclusive, sorted, and deduplicated. Android declarations
 /// never execute capability probes: TUN declares the conservative union of the
 /// root Linux path and the framework-preconfigured VpnService fallback, while
-/// transparent capture declares the fail-closed union of every runtime tier.
-/// Linux auto-redirect is likewise a fail-closed union because its
-/// nftables/TPROXY/NAT fallback is selected only while installing rules.
+/// explicit root transparent modes declare the same resources as their shared
+/// Linux implementations. Linux auto-redirect is likewise fail-closed because
+/// its backend is selected only while installing rules.
 pub fn host_resource_claims(plan: &CapturePlan) -> Vec<ResourceClaim> {
     // Keep this guard ahead of even compile-time platform selection. More
     // importantly, Android capability detection is intentionally absent from
@@ -111,8 +115,12 @@ fn claims_for_platform(plan: &CapturePlan, platform: HostPlatform) -> Vec<Resour
             claim(&mut claims, SystemResource::FirewallManager);
             true
         }
-        (HostPlatform::Android, EngineKind::Tproxy | EngineKind::Redirect) => {
-            android_transparent_claims(&mut claims);
+        (HostPlatform::Android, EngineKind::Tproxy) => {
+            linux_tproxy_claims(plan, &mut claims);
+            true
+        }
+        (HostPlatform::Android, EngineKind::Redirect) => {
+            claim(&mut claims, SystemResource::FirewallManager);
             true
         }
         (HostPlatform::Windows, EngineKind::Tun) => {
@@ -156,15 +164,13 @@ fn windows_tun_claims(plan: &CapturePlan, claims: &mut BTreeSet<ResourceClaim>) 
     }
     for prefix in routes {
         route_prefix_net(claims, None, prefix);
-        if prefix.prefix_len() == 0 {
-            claim(
-                claims,
-                if prefix.addr().is_ipv4() {
-                    SystemResource::DefaultRouteV4
-                } else {
-                    SystemResource::DefaultRouteV6
-                },
-            );
+    }
+    if plan.auto_route && (plan.route_addresses.is_empty() || !plan.route_address_set.is_empty()) {
+        // Split /1 routes still own the effective catch-all namespace even
+        // though neither concrete kernel object is a /0.
+        claim(claims, SystemResource::DefaultRouteV4);
+        if plan.ipv6_enabled && plan.tun_v6_cidr.is_some() {
+            claim(claims, SystemResource::DefaultRouteV6);
         }
     }
 }
@@ -311,27 +317,6 @@ fn linux_tproxy_claims(plan: &CapturePlan, claims: &mut BTreeSet<ResourceClaim>)
     }
 }
 
-fn android_transparent_claims(claims: &mut BTreeSet<ResourceClaim>) {
-    // Runtime capability selection happens only after mesh preflight and may
-    // load nf_tproxy modules. A read-only snapshot cannot prove that currently
-    // absent modules are not loadable, so reserve the union of all tiers:
-    // REDIRECT owns only the firewall, while either TPROXY tier additionally
-    // owns both policy-route families, table 100, and mark 1.
-    claim(claims, SystemResource::FirewallManager);
-    android_tproxy_route_claims(claims);
-    claim(claims, SystemResource::DefaultRouteV4);
-    claim(claims, SystemResource::DefaultRouteV6);
-}
-
-fn android_tproxy_route_claims(claims: &mut BTreeSet<ResourceClaim>) {
-    let table = crate::platform::android::TRANSPARENT_ROUTE_TABLE;
-    claim(claims, SystemResource::RouteManager);
-    claim(claims, SystemResource::RouteTable { table });
-    route_prefix(claims, Some(table), DEFAULT_ROUTE_V4);
-    route_prefix(claims, Some(table), DEFAULT_ROUTE_V6);
-    fwmark(claims, crate::platform::android::TRANSPARENT_FWMARK);
-}
-
 fn interface_and_addresses(plan: &CapturePlan, claims: &mut BTreeSet<ResourceClaim>) {
     claim(
         claims,
@@ -425,17 +410,26 @@ pub(crate) fn windows_tun_route_nets(plan: &CapturePlan) -> Vec<ipnet::IpNet> {
     }
 
     let mut routes = if plan.route_addresses.is_empty() || !plan.route_address_set.is_empty() {
+        // Split defaults are more robust on Windows than replacing 0/0:
+        // they win by prefix length while preserving the physical default
+        // route used by protected/bound outbound sockets.
         let mut defaults = vec![
-            DEFAULT_ROUTE_V4
+            SPLIT_DEFAULT_ROUTE_V4_LOW
                 .parse()
-                .expect("constant IPv4 default route"),
+                .expect("constant IPv4 split-default route"),
+            SPLIT_DEFAULT_ROUTE_V4_HIGH
+                .parse()
+                .expect("constant IPv4 split-default route"),
         ];
         if plan.ipv6_enabled && plan.tun_v6_cidr.is_some() {
-            defaults.push(
-                DEFAULT_ROUTE_V6
+            defaults.extend([
+                SPLIT_DEFAULT_ROUTE_V6_LOW
                     .parse()
-                    .expect("constant IPv6 default route"),
-            );
+                    .expect("constant IPv6 split-default route"),
+                SPLIT_DEFAULT_ROUTE_V6_HIGH
+                    .parse()
+                    .expect("constant IPv6 split-default route"),
+            ]);
         }
         defaults
     } else {
@@ -745,57 +739,23 @@ mod tests {
     }
 
     #[test]
-    fn android_transparent_preflight_is_pure_fail_closed_union() {
-        for kind in [EngineKind::Tproxy, EngineKind::Redirect] {
-            // HostPlatform::Android carries no detected capability. This pure
-            // boundary therefore cannot run su/modprobe, and the result still
-            // covers a TPROXY tier that runtime activation may unlock later.
-            let mut plan = plan(kind);
-            plan.iproute2_table_index = 9999;
-            let resources = resources(&plan, HostPlatform::Android);
-            let table = crate::platform::android::TRANSPARENT_ROUTE_TABLE;
-
-            assert!(resources.contains(&SystemResource::FirewallManager));
-            assert!(resources.contains(&SystemResource::RouteTable { table }));
-            assert!(!resources.contains(&SystemResource::RouteTable { table: 9999 }));
-            assert!(contains_prefix(&resources, Some(table), DEFAULT_ROUTE_V4));
-            assert!(contains_prefix(&resources, Some(table), DEFAULT_ROUTE_V6));
-            assert!(resources.contains(&SystemResource::DefaultRouteV4));
-            assert!(resources.contains(&SystemResource::DefaultRouteV6));
-            assert!(
-                resources.contains(&SystemResource::FwmarkRange {
-                    range: FwmarkRange::new(
-                        crate::platform::android::TRANSPARENT_FWMARK,
-                        crate::platform::android::TRANSPARENT_FWMARK,
-                    )
-                    .unwrap()
-                })
-            );
-        }
+    fn android_root_tproxy_claims_match_shared_linux_engine() {
+        let plan = plan(EngineKind::Tproxy);
+        assert_eq!(
+            resources(&plan, HostPlatform::Android),
+            resources(&plan, HostPlatform::Linux)
+        );
     }
 
     #[test]
-    fn android_transparent_uses_shared_runtime_table_and_mark_constants() {
-        let mut plan = plan(EngineKind::Redirect);
-        plan.iproute2_table_index = 9999;
+    fn android_root_redirect_claims_only_its_atomic_firewall_table() {
+        let plan = plan(EngineKind::Redirect);
         let resources = resources(&plan, HostPlatform::Android);
-        let table = crate::platform::android::TRANSPARENT_ROUTE_TABLE;
 
-        assert!(resources.contains(&SystemResource::RouteTable { table }));
-        assert!(!resources.contains(&SystemResource::RouteTable { table: 9999 }));
-        assert!(contains_prefix(&resources, Some(table), DEFAULT_ROUTE_V4));
-        assert!(contains_prefix(&resources, Some(table), DEFAULT_ROUTE_V6));
-        assert!(resources.contains(&SystemResource::DefaultRouteV4));
-        assert!(resources.contains(&SystemResource::DefaultRouteV6));
-        assert!(
-            resources.contains(&SystemResource::FwmarkRange {
-                range: FwmarkRange::new(
-                    crate::platform::android::TRANSPARENT_FWMARK,
-                    crate::platform::android::TRANSPARENT_FWMARK,
-                )
-                .unwrap()
-            })
-        );
+        assert!(resources.contains(&SystemResource::FirewallManager));
+        assert!(!resources.contains(&SystemResource::RouteManager));
+        assert!(!resources.contains(&SystemResource::DefaultRouteV4));
+        assert!(!resources.contains(&SystemResource::DefaultRouteV6));
     }
 
     #[test]
@@ -816,20 +776,46 @@ mod tests {
     }
 
     #[test]
-    fn windows_tun_claims_the_shared_default_route_set_with_ipv6_gates() {
+    fn windows_tun_claims_split_defaults_with_ipv6_gates() {
         let mut dual_stack = plan(EngineKind::Tun);
         dual_stack.auto_route = true;
         dual_stack.ipv6_enabled = true;
         let dual_resources = resources(&dual_stack, HostPlatform::Windows);
-        assert!(contains_prefix(&dual_resources, None, DEFAULT_ROUTE_V4));
-        assert!(contains_prefix(&dual_resources, None, DEFAULT_ROUTE_V6));
+        assert!(contains_prefix(
+            &dual_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V4_LOW
+        ));
+        assert!(contains_prefix(
+            &dual_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V4_HIGH
+        ));
+        assert!(contains_prefix(
+            &dual_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V6_LOW
+        ));
+        assert!(contains_prefix(
+            &dual_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V6_HIGH
+        ));
         assert!(dual_resources.contains(&SystemResource::DefaultRouteV4));
         assert!(dual_resources.contains(&SystemResource::DefaultRouteV6));
 
         dual_stack.ipv6_enabled = false;
         let ipv4_resources = resources(&dual_stack, HostPlatform::Windows);
-        assert!(contains_prefix(&ipv4_resources, None, DEFAULT_ROUTE_V4));
-        assert!(!contains_prefix(&ipv4_resources, None, DEFAULT_ROUTE_V6));
+        assert!(contains_prefix(
+            &ipv4_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V4_LOW
+        ));
+        assert!(!contains_prefix(
+            &ipv4_resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V6_LOW
+        ));
         assert!(!ipv4_resources.contains(&SystemResource::DefaultRouteV6));
 
         dual_stack.ipv6_enabled = true;
@@ -838,7 +824,7 @@ mod tests {
         assert!(!contains_prefix(
             &no_tun_v6_resources,
             None,
-            DEFAULT_ROUTE_V6
+            SPLIT_DEFAULT_ROUTE_V6_LOW
         ));
         assert!(!no_tun_v6_resources.contains(&SystemResource::DefaultRouteV6));
     }
@@ -871,8 +857,26 @@ mod tests {
         plan.route_address_set = vec!["geoip-cn".into()];
         let resources = resources(&plan, HostPlatform::Windows);
 
-        assert!(contains_prefix(&resources, None, DEFAULT_ROUTE_V4));
-        assert!(contains_prefix(&resources, None, DEFAULT_ROUTE_V6));
+        assert!(contains_prefix(
+            &resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V4_LOW
+        ));
+        assert!(contains_prefix(
+            &resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V4_HIGH
+        ));
+        assert!(contains_prefix(
+            &resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V6_LOW
+        ));
+        assert!(contains_prefix(
+            &resources,
+            None,
+            SPLIT_DEFAULT_ROUTE_V6_HIGH
+        ));
         assert!(!contains_prefix(&resources, None, "203.0.113.0/24"));
         assert!(resources.contains(&SystemResource::DefaultRouteV4));
         assert!(resources.contains(&SystemResource::DefaultRouteV6));

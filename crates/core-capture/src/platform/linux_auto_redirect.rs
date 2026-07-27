@@ -349,9 +349,12 @@ fn validate_plan(plan: &CapturePlan, ports: RedirectPorts) -> Result<(), Capture
     if ports.ipv4 == 0 || ports.ipv6 == Some(0) {
         return Err(nat_error("REDIRECT 监听端口必须是已绑定的非零端口"));
     }
-    if ports.ipv6.is_some() && (!plan.ipv6_enabled || plan.tun_v6_cidr.is_none()) {
+    if ports.ipv6.is_some()
+        && (!plan.ipv6_enabled
+            || (plan.kind == crate::engine::EngineKind::Tun && plan.tun_v6_cidr.is_none()))
+    {
         return Err(nat_error(
-            "提供了 IPv6 REDIRECT 端口，但当前 TUN 计划没有启用 IPv6",
+            "提供了 IPv6 REDIRECT 端口，但当前 capture 计划没有可用的 IPv6 数据面",
         ));
     }
     if !plan.route_address_set.is_empty() || !plan.route_exclude_address_set.is_empty() {
@@ -2054,6 +2057,15 @@ mod tests {
         v4_only.ipv6_enabled = false;
         v4_only.tun_v6_cidr = None;
         assert!(build_nft_script(&v4_only, RedirectPorts::new(12_345, Some(23_456))).is_err());
+    }
+
+    #[test]
+    fn explicit_redirect_ipv6_does_not_require_a_tun_prefix() {
+        let mut plan = base_plan(CaptureTraffic::System);
+        plan.kind = crate::engine::EngineKind::Redirect;
+        plan.tun_v6_cidr = None;
+
+        assert!(build_nft_script(&plan, dual_ports()).is_ok());
     }
 
     #[test]
