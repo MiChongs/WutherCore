@@ -424,10 +424,10 @@ pub(crate) fn windows_tun_route_nets(plan: &CapturePlan) -> Vec<ipnet::IpNet> {
         if plan.ipv6_enabled && plan.tun_v6_cidr.is_some() {
             defaults.extend([
                 SPLIT_DEFAULT_ROUTE_V6_LOW
-                    .parse()
+                    .parse::<ipnet::IpNet>()
                     .expect("constant IPv6 split-default route"),
                 SPLIT_DEFAULT_ROUTE_V6_HIGH
-                    .parse()
+                    .parse::<ipnet::IpNet>()
                     .expect("constant IPv6 split-default route"),
             ]);
         }

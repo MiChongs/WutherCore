@@ -16,7 +16,7 @@
 
 use std::{net::IpAddr, sync::Arc};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use std::process::Command;
 
 use ipnet::IpNet;
