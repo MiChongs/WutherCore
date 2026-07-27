@@ -44,36 +44,8 @@ pub struct ListenPlan {
     pub reality: Vec<RealityListen>,
     pub panel: Option<PanelListen>,
     pub xhttp: Vec<XhttpListenPlan>,
-    pub snell: Vec<SnellListenPlan>,
     pub share: Share,
     pub auth: Vec<UserPass>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnellListenPlan {
-    pub enabled: bool,
-    pub address: String,
-    pub port: u16,
-    pub psk: String,
-    pub version: u8,
-    pub udp: bool,
-    pub obfs: Option<SnellObfsListen>,
-    pub handshake_timeout: Duration,
-    pub max_connections: usize,
-    pub tag: String,
-}
-
-impl SnellListenPlan {
-    pub fn socket_addr(&self) -> ConfigResult<SocketAddr> {
-        format!("{}:{}", self.address, self.port)
-            .parse()
-            .map_err(|_| {
-                ConfigError::invalid(format!(
-                    "非法 Snell 监听地址: {}:{}",
-                    self.address, self.port
-                ))
-            })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,7 +273,6 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         local: None,
         panel: None,
         xhttp: None,
-        snell: None,
         share: None,
         auth: vec![],
         reality: vec![],
@@ -370,7 +341,6 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
     }
 
     let xhttp = compile_xhttp_listeners(listen.xhttp)?;
-    let snell = compile_snell_listeners(listen.snell)?;
 
     let auth = listen
         .auth
@@ -390,98 +360,9 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         reality,
         panel,
         xhttp,
-        snell,
         share,
         auth,
     })
-}
-
-fn compile_snell_listeners(
-    listeners: Option<SnellListenSet>,
-) -> ConfigResult<Vec<SnellListenPlan>> {
-    let listeners = listeners.map(SnellListenSet::into_vec).unwrap_or_default();
-    let mut plans = Vec::with_capacity(listeners.len());
-    let mut tags = std::collections::HashSet::new();
-    let mut sockets = std::collections::HashSet::new();
-    for (index, listener) in listeners.into_iter().enumerate() {
-        let path = format!("listen.snell[{index}]");
-        if listener.enabled {
-            if listener.port == 0 {
-                return Err(ConfigError::invalid(format!("{path}.port 不能为 0")));
-            }
-            if listener.psk.is_empty() {
-                return Err(ConfigError::invalid(format!("{path}.psk 不能为空")));
-            }
-            if !(1..=5).contains(&listener.version) {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.version 只支持 1、2、3、4、5"
-                )));
-            }
-            if listener.udp && listener.version < 3 {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.udp 需要 Snell version 3、4 或 5"
-                )));
-            }
-            if listener.handshake_timeout.is_zero() {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.handshake-timeout 必须大于 0"
-                )));
-            }
-            if listener.max_connections == 0 || listener.max_connections > 65_535 {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.max-connections 必须在 1..=65535"
-                )));
-            }
-        }
-        if let Some(obfs) = &listener.obfs_opts {
-            if !matches!(obfs.mode.to_ascii_lowercase().as_str(), "http" | "tls") {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.obfs-opts.mode 只支持 http 或 tls"
-                )));
-            }
-            if obfs.host.trim().is_empty() {
-                return Err(ConfigError::invalid(format!(
-                    "{path}.obfs-opts.host 不能为空"
-                )));
-            }
-        }
-        let tag = listener
-            .tag
-            .unwrap_or_else(|| format!("snell-{}", index + 1));
-        if !tags.insert(tag.clone()) {
-            return Err(ConfigError::invalid(format!(
-                "{path}.tag `{tag}` 与其它 Snell 监听重复"
-            )));
-        }
-        if listener.enabled {
-            let socket = format!("{}:{}", listener.address, listener.port)
-                .parse::<SocketAddr>()
-                .map_err(|_| {
-                    ConfigError::invalid(format!(
-                        "{path} 监听地址非法: {}:{}",
-                        listener.address, listener.port
-                    ))
-                })?;
-            if !sockets.insert(socket) {
-                return Err(ConfigError::invalid(format!(
-                    "{path} 与其它 Snell 监听占用相同地址 {socket}"
-                )));
-            }
-        }
-        plans.push(SnellListenPlan {
-            enabled: listener.enabled,
-            address: listener.address,
-            port: listener.port,
-            psk: listener.psk,
-            version: listener.version,
-            udp: listener.udp,
-            obfs: listener.obfs_opts,
-            handshake_timeout: listener.handshake_timeout,
-            max_connections: listener.max_connections,
-            tag,
-        });
-    }
-    Ok(plans)
 }
 
 fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
@@ -4696,81 +4577,5 @@ route:
             .unwrap_err()
             .to_string();
         assert!(error.contains("循环链"), "error={error}");
-    }
-
-    #[test]
-    fn snell_listener_single_and_array_forms_preserve_all_fields() {
-        let plan = compile_cfg(
-            r#"
-version: 1
-profile: server
-listen:
-  panel: false
-  snell:
-    - address: 127.0.0.1
-      port: 8388
-      psk: first-secret
-      version: 3
-      udp: true
-      handshake-timeout: 7s
-      max-connections: 128
-      tag: snell-v3
-    - address: 127.0.0.1
-      port: 8389
-      psk: second-secret
-      version: 5
-      udp: true
-      obfs-opts: {mode: tls, host: cdn.example.com}
-      tag: snell-v5
-route: {preset: direct, final: direct}
-"#,
-        );
-        assert_eq!(plan.listen.snell.len(), 2);
-        assert_eq!(plan.listen.snell[0].version, 3);
-        assert_eq!(plan.listen.snell[0].handshake_timeout.as_secs(), 7);
-        assert_eq!(plan.listen.snell[0].max_connections, 128);
-        let obfs = plan.listen.snell[1].obfs.as_ref().unwrap();
-        assert_eq!(obfs.mode, "tls");
-        assert_eq!(obfs.host, "cdn.example.com");
-
-        let plan = compile_cfg(
-            r#"
-version: 1
-profile: server
-listen:
-  panel: false
-  snell:
-    port: 8390
-    psk: single-secret
-    version: 4
-route: {preset: direct, final: direct}
-"#,
-        );
-        assert_eq!(plan.listen.snell.len(), 1);
-        assert_eq!(plan.listen.snell[0].tag, "snell-1");
-    }
-
-    #[test]
-    fn snell_listener_rejects_invalid_feature_combinations() {
-        for (fragment, expected) in [
-            (
-                "port: 8388\n    psk: secret\n    version: 2\n    udp: true",
-                "udp",
-            ),
-            ("port: 8388\n    psk: secret\n    version: 6", "version"),
-            (
-                "port: 8388\n    psk: secret\n    obfs-opts: {mode: websocket}",
-                "obfs-opts.mode",
-            ),
-            ("port: 8388\n    psk: ''", "psk"),
-        ] {
-            let yaml = format!(
-                "version: 1\nprofile: server\nlisten:\n  panel: false\n  snell:\n    {fragment}\nroute: {{preset: direct, final: direct}}\n"
-            );
-            let mut config: UserConfig = serde_yaml::from_str(&yaml).unwrap();
-            apply_defaults(&mut config);
-            let error = compile(config).unwrap_err().to_string();
-            assert!(error.contains(expected), "error={error}");
-        }
     }
 }

@@ -212,9 +212,6 @@ pub struct Listen {
         alias = "splithttp"
     )]
     pub xhttp: Option<XhttpListenSet>,
-    /// Snell v1-v5 服务端监听。既接受单个对象，也接受对象数组。
-    #[serde(default)]
-    pub snell: Option<SnellListenSet>,
     #[serde(default)]
     pub share: Option<Share>,
     #[serde(default)]
@@ -223,78 +220,6 @@ pub struct Listen {
     /// `protocol` 指定的内层代理协议。
     #[serde(default, alias = "reality-inbounds", alias = "reality_inbounds")]
     pub reality: Vec<RealityListen>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SnellListenSet {
-    One(SnellListen),
-    Many(Vec<SnellListen>),
-}
-
-impl SnellListenSet {
-    pub fn into_vec(self) -> Vec<SnellListen> {
-        match self {
-            Self::One(listener) => vec![listener],
-            Self::Many(listeners) => listeners,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnellListen {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_snell_listen_address", alias = "host")]
-    pub address: String,
-    pub port: u16,
-    pub psk: String,
-    #[serde(default = "default_snell_inbound_version")]
-    pub version: u8,
-    #[serde(default)]
-    pub udp: bool,
-    #[serde(default, rename = "obfs-opts", alias = "obfs_opts")]
-    pub obfs_opts: Option<SnellObfsListen>,
-    #[serde(
-        default = "default_snell_handshake_timeout",
-        rename = "handshake-timeout",
-        alias = "handshake_timeout",
-        with = "humantime_serde"
-    )]
-    pub handshake_timeout: Duration,
-    #[serde(
-        default = "default_snell_max_connections",
-        rename = "max-connections",
-        alias = "max_connections"
-    )]
-    pub max_connections: usize,
-    #[serde(default)]
-    pub tag: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SnellObfsListen {
-    pub mode: String,
-    #[serde(default)]
-    pub host: String,
-}
-
-fn default_snell_listen_address() -> String {
-    "127.0.0.1".into()
-}
-
-fn default_snell_inbound_version() -> u8 {
-    4
-}
-
-fn default_snell_handshake_timeout() -> Duration {
-    Duration::from_secs(10)
-}
-
-fn default_snell_max_connections() -> usize {
-    4096
 }
 
 /// Xray REALITY 服务端监听配置。

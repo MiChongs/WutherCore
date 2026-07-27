@@ -40,12 +40,12 @@
 | Shadowsocks | Shadowsocks、Shadowsocks 2022、SSR | 包含多种 AEAD/流加密与 SSR 组件 |
 | 经典 TLS | Trojan、VLESS、VMess | 支持对应 TLS、UUID 与安全参数 |
 | 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC | 包含 TLS/QUIC 路径与协议参数 |
-| 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | Snell v1–v5 含 TCP、v3+ UDP、复用和 HTTP/TLS simple-obfs；其余按各自握手、加密和复用模型实现 |
+| 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | 按各自握手、加密和复用模型实现 |
 | 系统隧道 | WireGuard、SSH | 密钥或主机校验需要单独配置 |
 
 ## 传输与解析
 
-代码中包含 TCP、TLS、WebSocket、HTTP、HTTP/2、gRPC 与 XHTTP 等传输配置路径。XHTTP 的客户端、服务端、TLS/ECH 和完整字段说明见 [XHTTP / SplitHTTP 配置](XHTTP.md)，Snell 的版本、UDP、复用、混淆和服务端字段见 [Snell 配置](SNELL.md)。可用组合由具体协议、节点字段和服务端实现共同决定；不要假设任意协议都能与任意传输组合。
+代码中包含 TCP、TLS、WebSocket、HTTP、HTTP/2、gRPC 与 XHTTP 等传输配置路径。XHTTP 的客户端、服务端、TLS/ECH 和完整字段说明见 [XHTTP / SplitHTTP 配置](XHTTP.md)。可用组合由具体协议、节点字段和服务端实现共同决定；不要假设任意协议都能与任意传输组合。
 
 节点来源支持：
 

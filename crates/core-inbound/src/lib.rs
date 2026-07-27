@@ -10,7 +10,6 @@ pub mod listener;
 pub mod mixed;
 pub mod privilege;
 pub mod reality;
-pub mod snell;
 pub mod vless;
 pub mod xhttp;
 mod xhttp_body_budget;
@@ -24,7 +23,6 @@ pub use privilege::{
     PrivilegeLevel, PrivilegeReport, ensure_best_effort_privilege, try_request_root_android,
 };
 pub use reality::{RealityListener, run_reality};
-pub use snell::{SnellListenerHandle, start_snell_listener, start_snell_listeners};
 pub use vless::{VlessConnectionContext, VlessInboundConfig, serve_vless_stream};
 pub use xhttp_listener::{XhttpListenerHandle, start_xhttp_listener, start_xhttp_listeners};
 pub use xhttp_tls::{XrayServerTlsAcceptor, XrayServerTlsCarrier, XrayServerTlsStream};

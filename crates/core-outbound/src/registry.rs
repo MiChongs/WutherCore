@@ -26,7 +26,7 @@ use crate::{
         hysteria2::Hysteria2Outbound,
         mieru::{MieruCipher, MieruOutbound},
         shadowsocks::{ShadowsocksOutbound, SsCipher},
-        snell::SnellOutbound,
+        snell::{SnellCipher, SnellOutbound},
         ss2022::{Ss22Cipher, Ss2022Outbound},
         ssh::SshOutbound,
         ssr::{SsrCipher, SsrObfs, SsrOutbound, SsrProtocol},
@@ -1398,6 +1398,11 @@ fn build_trojan(node: &ParsedNode) -> Result<TrojanOutbound, String> {
 }
 
 fn build_snell(node: &ParsedNode) -> Result<SharedOutbound, String> {
+    let cipher = match node.params.get("cipher").or_else(|| node.method.as_ref()) {
+        Some(value) => SnellCipher::parse(value)
+            .ok_or_else(|| format!("unsupported Snell cipher `{value}`"))?,
+        None => SnellCipher::Aes128Gcm,
+    };
     let pwd = node
         .password
         .as_deref()
@@ -1406,65 +1411,22 @@ fn build_snell(node: &ParsedNode) -> Result<SharedOutbound, String> {
     if pwd.is_empty() {
         return Err("Snell PSK must not be empty".into());
     }
-    let version = node
-        .params
-        .get("version")
-        .map(|value| {
-            value
-                .parse::<u8>()
-                .map_err(|_| format!("invalid Snell version `{value}`"))
-        })
-        .transpose()?
-        .unwrap_or(1);
-    let mut ob =
-        SnellOutbound::new(&node.name, &node.host, node.port, pwd).with_version(version)?;
-    if let Some(cipher) = node.params.get("cipher").or_else(|| node.method.as_ref()) {
-        let expected = if version == 1 {
-            "chacha20-poly1305"
-        } else {
-            "aes-128-gcm"
-        };
-        let normalized = cipher.to_ascii_lowercase();
-        let matches = if version == 1 {
-            matches!(
-                normalized.as_str(),
-                "chacha20-poly1305" | "chacha20-ietf-poly1305"
-            )
-        } else {
-            matches!(normalized.as_str(), "aes-128-gcm" | "aes128gcm")
-        };
-        if !matches {
-            return Err(format!(
-                "unsupported Snell cipher `{cipher}`: v{version} uses fixed cipher `{expected}`"
-            ));
-        }
+    let mut ob = SnellOutbound::new(&node.name, &node.host, node.port, cipher, pwd);
+    ob.udp = node.udp;
+    if let Some(value) = node.params.get("version") {
+        ob.version = value
+            .parse::<u8>()
+            .map_err(|_| format!("invalid Snell version `{value}`"))?;
     }
-    ob = ob.with_udp(node.udp)?;
-    let reuse = node
-        .params
-        .get("reuse")
-        .map(|value| match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(format!("invalid Snell reuse boolean `{value}`")),
-        })
-        .transpose()?
-        .unwrap_or(false);
-    ob = ob.with_reuse(reuse)?;
-    if let Some(obfs_type) = node
-        .params
-        .get("obfs")
-        .or_else(|| node.params.get("obfs-mode"))
-        .map(String::as_str)
-    {
+    if let Some(obfs_type) = node.params.get("obfs").map(|s| s.as_str()) {
         let obfs_host = node
             .params
             .get("obfs-host")
             .cloned()
             .unwrap_or_else(|| node.host.clone());
         match obfs_type {
-            "http" => ob = ob.with_obfs_http(obfs_host)?,
-            "tls" => ob = ob.with_obfs_tls(obfs_host)?,
+            "http" => ob = ob.with_obfs_http(obfs_host),
+            "tls" => ob = ob.with_obfs_tls(obfs_host),
             other => return Err(format!("unsupported Snell obfs `{other}`")),
         }
     }
@@ -2132,33 +2094,6 @@ mod tests {
             build_outbound(&node).err().as_deref(),
             Some("tuic(invalid-udp-relay-mode)")
         );
-    }
-
-    #[test]
-    fn snell_registry_validates_and_registers_all_native_options() {
-        let mut snell = node(NodeProtocol::Snell);
-        snell.params.insert("psk".into(), "secret".into());
-        snell.params.insert("version".into(), "4".into());
-        snell.params.insert("reuse".into(), "true".into());
-        snell.params.insert("obfs-mode".into(), "tls".into());
-        snell
-            .params
-            .insert("obfs-host".into(), "cdn.example.com".into());
-        snell.udp = true;
-        let outbound = build_outbound(&snell).unwrap();
-        assert_eq!(outbound.protocol(), "snell");
-        assert!(outbound.capabilities().tcp);
-        assert!(outbound.capabilities().udp);
-        assert!(outbound.capabilities().multiplex);
-
-        snell.params.insert("reuse".into(), "perhaps".into());
-        assert!(build_error(&snell).contains("reuse boolean"));
-        snell.params.insert("reuse".into(), "true".into());
-        snell.params.insert("version".into(), "2".into());
-        assert!(build_error(&snell).contains("does not support UDP"));
-        snell.udp = false;
-        snell.params.insert("obfs-mode".into(), "websocket".into());
-        assert!(build_error(&snell).contains("unsupported Snell obfs"));
     }
 
     #[test]

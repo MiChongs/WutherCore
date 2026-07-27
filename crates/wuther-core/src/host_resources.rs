@@ -42,21 +42,6 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
         ));
     }
 
-    for snell in plan.listen.snell.iter().filter(|listener| listener.enabled) {
-        let address = snell
-            .socket_addr()
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        ensure!(
-            address.port() != 0,
-            "Snell listener port 0 cannot be reserved"
-        );
-        claims.insert(socket_claim(
-            host_owner("wuther.snell"),
-            SocketTransport::Tcp,
-            address,
-        ));
-    }
-
     if plan.ui.on {
         if let Some(panel) = &plan.listen.panel {
             let address = panel
@@ -273,31 +258,6 @@ ui:
         );
 
         assert!(listener_resource_claims(&plan).unwrap().is_empty());
-    }
-
-    #[test]
-    fn enabled_snell_listeners_are_reserved_as_tcp_resources() {
-        let plan = plan(
-            r#"
-version: 1
-profile: server
-listen:
-  panel: false
-  snell:
-    - {address: 127.0.0.1, port: 8388, psk: one, tag: one}
-    - {enabled: false, address: 127.0.0.1, port: 8389, psk: two, tag: two}
-route:
-  preset: direct
-"#,
-        );
-        assert_eq!(
-            sockets(&listener_resource_claims(&plan).unwrap()),
-            BTreeSet::from([(
-                "wuther.snell".to_owned(),
-                SocketTransport::Tcp,
-                "127.0.0.1:8388".parse().unwrap(),
-            )])
-        );
     }
 
     #[test]
