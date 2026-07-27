@@ -9,12 +9,15 @@
 //! |---------|-------------------------------------------------------|-----------------------------------------|
 //! | Linux   | `ip route add <dest> dev <iface> [via <gw>] metric N` | `ip route del <dest> ...`               |
 //! | macOS   | `route -n add -net <dest> -interface <iface>`         | `route -n delete -net <dest>`           |
-//! | Windows | `route ADD <dest> MASK <mask> <gw> METRIC N IF <idx>` | `route DELETE <dest>`                   |
+//! | Windows | IP Helper `CreateIpForwardEntry2`                    | `DeleteIpForwardEntry2`                 |
 //!
 //! 添加失败会返回给调用方，且不会写入回滚账本；调用方可自行决定是否降级。
 //! 撤销已成功添加的路由时尽力回滚（best-effort）。
 
-use std::{net::IpAddr, process::Command, sync::Arc};
+use std::{net::IpAddr, sync::Arc};
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+use std::process::Command;
 
 use ipnet::IpNet;
 use parking_lot::Mutex;
@@ -257,82 +260,44 @@ fn platform_del(r: &ManagedRoute) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn platform_add(r: &ManagedRoute) -> Result<(), String> {
-    // Windows 的 route 命令接受 IPv4 dotted mask；IPv6 用 netsh。
-    if r.dest.addr().is_ipv6() {
-        if r.gateway.is_some_and(|gateway| gateway.is_ipv4()) {
-            return Err("IPv6 route cannot use an IPv4 next hop".into());
-        }
-        let args = windows_ipv6_route_args(r, true);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cmd("netsh", &refs)
-    } else {
-        let interface_index = if_index_from_name(&r.interface)?;
-        let args = windows_ipv4_route_args(r, interface_index, true);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cmd("route", &refs)
-    }
+    let route = windows_native_route(r)?;
+    let mut manager = route_manager::RouteManager::new()
+        .map_err(|error| format!("open Windows IP Helper route manager: {error}"))?;
+    manager
+        .add(&route)
+        .map_err(|error| format!("CreateIpForwardEntry2 for {}: {error}", r.dest))
 }
 
 #[cfg(target_os = "windows")]
 fn platform_del(r: &ManagedRoute) -> Result<(), String> {
-    if r.dest.addr().is_ipv6() {
-        if r.gateway.is_some_and(|gateway| gateway.is_ipv4()) {
-            return Err("IPv6 route cannot use an IPv4 next hop".into());
-        }
-        let args = windows_ipv6_route_args(r, false);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cmd("netsh", &refs)
-    } else {
-        let interface_index = if_index_from_name(&r.interface)?;
-        let args = windows_ipv4_route_args(r, interface_index, false);
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cmd("route", &refs)
-    }
+    let route = windows_native_route(r)?;
+    let mut manager = route_manager::RouteManager::new()
+        .map_err(|error| format!("open Windows IP Helper route manager: {error}"))?;
+    manager
+        .delete(&route)
+        .map_err(|error| format!("DeleteIpForwardEntry2 for {}: {error}", r.dest))
 }
 
 #[cfg(target_os = "windows")]
-fn windows_ipv4_route_args(route: &ManagedRoute, interface_index: u32, add: bool) -> Vec<String> {
-    let mut args = vec![
-        if add { "ADD" } else { "DELETE" }.into(),
-        route.dest.network().to_string(),
-        "MASK".into(),
-        ipv4_mask(route.dest.prefix_len()),
-        route
-            .gateway
-            .map(|gateway| gateway.to_string())
-            .unwrap_or_else(|| "0.0.0.0".into()),
-    ];
-    if add {
-        args.extend(["METRIC".into(), route.metric.to_string()]);
+fn windows_native_route(r: &ManagedRoute) -> Result<route_manager::Route, String> {
+    if r.table.is_some() {
+        return Err("Windows routes do not support Linux policy table IDs".into());
     }
-    args.extend(["IF".into(), interface_index.to_string()]);
-    args
-}
-
-#[cfg(target_os = "windows")]
-fn windows_ipv6_route_args(route: &ManagedRoute, add: bool) -> Vec<String> {
-    let mut args = vec![
-        "interface".into(),
-        "ipv6".into(),
-        if add { "add" } else { "delete" }.into(),
-        "route".into(),
-        format!("prefix={}", route.dest),
-        format!("interface={}", route.interface),
-        format!(
-            "nexthop={}",
-            route
-                .gateway
-                .map(|gateway| gateway.to_string())
-                .unwrap_or_else(|| "::".into())
-        ),
-    ];
-    if add {
-        args.push(format!("metric={}", route.metric));
+    if let Some(gateway) = r.gateway
+        && gateway.is_ipv4() != r.dest.addr().is_ipv4()
+    {
+        return Err(format!(
+            "route {} cannot use next hop {gateway} from another address family",
+            r.dest
+        ));
     }
-    // netsh defaults route mutations to PersistentStore. Capture routes must
-    // never survive a crash or reboot.
-    args.push("store=active".into());
-    args
+    let mut route = route_manager::Route::new(r.dest.network(), r.dest.prefix_len())
+        .with_if_name(r.interface.clone())
+        .with_metric(r.metric);
+    if let Some(gateway) = r.gateway {
+        route = route.with_gateway(gateway);
+    }
+    Ok(route)
 }
 
 #[cfg(not(any(
@@ -355,59 +320,7 @@ fn platform_del(_r: &ManagedRoute) -> Result<(), String> {
     Err("unsupported platform".into())
 }
 
-#[cfg(target_os = "windows")]
-fn ipv4_mask(prefix: u8) -> String {
-    let mask: u32 = if prefix == 0 {
-        0
-    } else {
-        (!0u32) << (32 - prefix.min(32))
-    };
-    std::net::Ipv4Addr::from(mask).to_string()
-}
-
-#[cfg(target_os = "windows")]
-fn if_index_from_name(name: &str) -> Result<u32, String> {
-    // `netsh interface show interface` 的输出第 4 列是接口名；用 `netsh
-    // interface ipv4 show interfaces` 拿索引（idx 在第 1 列）。
-    let output = std::process::Command::new("netsh")
-        .args(["interface", "ipv4", "show", "interfaces"])
-        .output()
-        .map_err(|error| format!("spawn netsh while resolving interface {name:?}: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(format!(
-            "netsh interface lookup failed (status={:?}): {detail}",
-            output.status.code()
-        ));
-    }
-    let txt = String::from_utf8_lossy(&output.stdout);
-    for line in txt.lines().skip(3) {
-        // 行格式：Idx     Met         MTU          State                Name
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        let if_name = parts[4..].join(" ");
-        if if_name.eq_ignore_ascii_case(name) {
-            return parts[0].parse::<u32>().map_err(|error| {
-                format!(
-                    "invalid interface index {:?} for {name:?}: {error}",
-                    parts[0]
-                )
-            });
-        }
-    }
-    Err(format!(
-        "Windows interface {name:?} was not present in netsh interface list"
-    ))
-}
-
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(), String> {
     debug!(target: "capture::route", cmd = %prog, ?args, "exec");
     // 用 output() 捕获 stderr 不外泄到终端 —— 错误内容只走 tracing。
@@ -444,6 +357,7 @@ fn is_expected_route_delete_absence(error: &str) -> bool {
         "no such process",
         "not in table",
         "element not found",
+        "(os error 1168)",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -654,67 +568,68 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_ipv4_delete_targets_only_the_managed_interface() {
+    fn windows_native_route_preserves_interface_metric_and_prefix() {
         let route = ManagedRoute {
-            dest: "0.0.0.0/0".parse().unwrap(),
+            dest: "128.0.0.0/1".parse().unwrap(),
             gateway: None,
             interface: "WutherCoreTun".into(),
-            metric: 0,
+            metric: 1,
             table: None,
         };
+        let native = windows_native_route(&route).unwrap();
 
-        assert_eq!(
-            windows_ipv4_route_args(&route, 42, false),
-            [
-                "DELETE", "0.0.0.0", "MASK", "0.0.0.0", "0.0.0.0", "IF", "42",
-            ]
-        );
+        assert_eq!(native.destination(), "128.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(native.prefix(), 1);
+        assert_eq!(native.if_name().map(String::as_str), Some("WutherCoreTun"));
+        assert_eq!(native.metric(), Some(1));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_ipv6_routes_are_exact_and_active_only() {
+    fn windows_native_route_preserves_ipv6_gateway() {
         let route = ManagedRoute {
-            dest: "::/0".parse().unwrap(),
+            dest: "8000::/1".parse().unwrap(),
             gateway: Some("fe80::1".parse().unwrap()),
             interface: "WutherCoreTun".into(),
             metric: 7,
             table: None,
         };
+        let native = windows_native_route(&route).unwrap();
 
-        assert_eq!(
-            windows_ipv6_route_args(&route, true),
-            [
-                "interface",
-                "ipv6",
-                "add",
-                "route",
-                "prefix=::/0",
-                "interface=WutherCoreTun",
-                "nexthop=fe80::1",
-                "metric=7",
-                "store=active",
-            ]
-        );
-        assert_eq!(
-            windows_ipv6_route_args(&route, false),
-            [
-                "interface",
-                "ipv6",
-                "delete",
-                "route",
-                "prefix=::/0",
-                "interface=WutherCoreTun",
-                "nexthop=fe80::1",
-                "store=active",
-            ]
-        );
+        assert_eq!(native.destination(), "8000::".parse::<IpAddr>().unwrap());
+        assert_eq!(native.prefix(), 1);
+        assert_eq!(native.gateway(), Some("fe80::1".parse().unwrap()));
+        assert_eq!(native.metric(), Some(7));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_route_rejects_policy_tables_and_mixed_families() {
+        let mut route = ManagedRoute {
+            dest: "0.0.0.0/1".parse().unwrap(),
+            gateway: None,
+            interface: "WutherCoreTun".into(),
+            metric: 1,
+            table: Some(2022),
+        };
+        assert!(windows_native_route(&route).is_err());
+
+        route.table = None;
+        route.gateway = Some("fe80::1".parse().unwrap());
+        assert!(windows_native_route(&route).is_err());
     }
 
     #[test]
     fn linux_route_delete_no_such_process_is_expected_absence() {
         assert!(is_expected_route_delete_absence(
             "ip failed (status=Some(2)): RTNETLINK answers: No such process",
+        ));
+    }
+
+    #[test]
+    fn windows_ip_helper_element_not_found_is_expected_absence() {
+        assert!(is_expected_route_delete_absence(
+            "DeleteIpForwardEntry2 for 0.0.0.0/1: Element not found. (os error 1168)",
         ));
     }
 

@@ -13,6 +13,8 @@ use crate::engine::{CaptureEngine, CaptureError, CapturePlan};
 // Linux 与 Android 共享 /dev/net/tun + nftables 路径。
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod linux;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod linux_caps;
 // Linux TUN auto_redirect 的规则生成器在测试构建中也参与编译，便于在
 // 非 Linux 主机验证命令账本；真实安装入口仅由 Linux/Android 后端调用。
 #[cfg(any(test, target_os = "linux", target_os = "android"))]

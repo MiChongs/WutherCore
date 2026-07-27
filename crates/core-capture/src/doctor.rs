@@ -114,12 +114,9 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
             } else if plan.ipv6_enabled && !has_tool("ip6tables") {
                 blockers.push("IPv6 TPROXY 已启用但缺少 ip6tables".into());
             }
-            #[cfg(target_os = "android")]
-            if !nix::unistd::Uid::effective().is_root() {
-                blockers.push(
-                    "Android 显式 tproxy 必须以 root 启动 native daemon；普通 App 请使用 method=auto/virtual_nic + VpnService"
-                        .into(),
-                );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Err(error) = crate::platform::linux_caps::require_net_admin("TPROXY capture") {
+                blockers.push(error);
             }
         }
         EngineKind::Redirect => {
@@ -128,12 +125,9 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
             } else if !has_tool("nft") {
                 blockers.push("Redirect 需要 nftables，以保证规则原子安装和精确回滚".into());
             }
-            #[cfg(target_os = "android")]
-            if !nix::unistd::Uid::effective().is_root() {
-                blockers.push(
-                    "Android 显式 redirect 必须以 root 启动 native daemon；普通 App 请使用 method=auto/virtual_nic + VpnService"
-                        .into(),
-                );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Err(error) = crate::platform::linux_caps::require_net_admin("REDIRECT capture") {
+                blockers.push(error);
             }
         }
         EngineKind::Tun => {
@@ -146,7 +140,10 @@ pub fn diagnose(c: &Capture, mesh: &Mesh) -> Result<DoctorReport, CaptureError> 
             #[cfg(target_os = "windows")]
             {
                 if !has_tool("netsh") {
-                    warnings.push("未找到 netsh；可能无法自动写路由表".into());
+                    warnings.push(
+                        "未找到 netsh；路由已使用 IP Helper API，但 DNS 快照/恢复仍可能不可用"
+                            .into(),
+                    );
                 }
             }
             #[cfg(target_os = "macos")]

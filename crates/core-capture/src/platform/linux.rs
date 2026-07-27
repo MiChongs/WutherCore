@@ -2579,6 +2579,8 @@ impl CaptureEngine for LinuxTproxy {
         if g.on {
             return Ok(());
         }
+        crate::platform::linux_caps::require_net_admin("TPROXY capture")
+            .map_err(CaptureError::Doctor)?;
         let outbound_mark = self
             .plan
             .auto_redirect_marks
@@ -2722,6 +2724,8 @@ impl CaptureEngine for LinuxRedirect {
         if g.on {
             return Ok(());
         }
+        crate::platform::linux_caps::require_net_admin("REDIRECT capture")
+            .map_err(CaptureError::Doctor)?;
         if g.backend.is_some() || g.listener_tasks.is_some() {
             return Err(CaptureError::Nat(
                 "redirect has a partial activation ledger; stop must clean it before retry".into(),

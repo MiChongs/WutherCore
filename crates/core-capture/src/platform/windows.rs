@@ -1,8 +1,8 @@
 //! Windows 后端：Wintun + 系统路由表。
 //!
-//! Startup is transactional: a real tun-rs device must exist, every netsh
-//! mutation must succeed, and partial DNS/route state is rolled back before an
-//! error reaches the supervisor.
+//! Startup is transactional: a real tun-rs device must exist, native IP Helper
+//! route mutations and DNS changes are recorded, and partial state is rolled
+//! back before an error reaches the supervisor.
 
 use std::{collections::HashSet, net::IpAddr, process::Command, sync::Arc};
 

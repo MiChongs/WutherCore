@@ -154,6 +154,8 @@ rand = "0.8"
 hex = "0.4"
 tempfile = "3"
 libc = "0.2"
+caps = "0.5.6"
+route_manager = "0.2.12"
 
 # 内部 crate
 core-config   = { path = "crates/core-config" }

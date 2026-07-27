@@ -719,6 +719,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "caps"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd1ddba47aba30b6a889298ad0109c3b8dcb0e8fc993b459daa7067d46f865e0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1041,6 +1050,7 @@ dependencies = [
  "blake3",
  "boringtun",
  "bytes",
+ "caps",
  "compact_str",
  "core-config",
  "core-mesh",
@@ -1058,6 +1068,7 @@ dependencies = [
  "nix 0.29.0",
  "once_cell",
  "parking_lot",
+ "route_manager",
  "serde",
  "serde_json",
  "smoltcp 0.11.0",

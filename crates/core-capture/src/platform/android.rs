@@ -6,6 +6,8 @@
 //!   transactional policy/firewall rule ledger.
 //! - explicit `Redirect`: TCP `SO_ORIGINAL_DST` listeners plus an atomic nft
 //!   ruleset.
+//! Transparent modes require effective `CAP_NET_ADMIN`; the process does not
+//! need UID 0 when the capability is delegated explicitly.
 //!
 //! The legacy tier implementation remains available only as a cross-platform
 //! capability-reporting stub; [`build_engine`] never selects it on Android.
@@ -39,8 +41,8 @@ pub fn build_engine(plan: CapturePlan) -> Result<Arc<dyn CaptureEngine>, Capture
     match plan.kind {
         // Android shares the packet/socket implementation with Linux:
         // - TUN opens root /dev/net/tun first, then the injected VpnService fd.
-        // - Explicit TPROXY/REDIRECT is intended for a daemon launched as root;
-        //   it must own real listeners as well as firewall rules.
+        // - Explicit TPROXY/REDIRECT is intended for a daemon with
+        //   CAP_NET_ADMIN; it must own real listeners as well as firewall rules.
         #[cfg(target_os = "android")]
         EngineKind::Tun | EngineKind::Tproxy | EngineKind::Redirect => {
             crate::platform::linux::build_engine(plan)
