@@ -939,11 +939,11 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     }
 
     let mut handles = Vec::new();
-<<<<<<< HEAD
     let mut wireguard_inbounds: Vec<(
         Arc<WireGuardServer>,
         core_capture::NetstackDispatcherHandles,
     )> = Vec::new();
+    let mut young_server_handles = Vec::new();
 
     // WireGuard 服务端入站。WireGuardServer 负责 NoiseIK、cookie/MAC、重放保护、
     // roaming 与多 peer 路由；WireGuardTunIo 把认证后的裸 IP 包接入与系统 TUN
@@ -1037,9 +1037,6 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         );
         wireguard_inbounds.push((server, dispatcher_handles));
     }
-=======
-    let mut young_server_handles = Vec::new();
->>>>>>> origin/main
 
     // Standalone DNS server —— mihomo `dns.listen` 等价。
     // 与 mihomo `dns/server.go::ReCreateServer` 行为一致：空地址 / port=0 → disabled。

@@ -42,13 +42,14 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
         ));
     }
 
-<<<<<<< HEAD
     for listener in &plan.listen.wireguard {
         claims.insert(socket_claim(
             host_owner("wuther.wireguard"),
             SocketTransport::Udp,
             listener.bind,
-=======
+        ));
+    }
+
     for young in &plan.listen.young {
         let address = young
             .socket_addr()
@@ -61,7 +62,6 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
             host_owner("wuther.young"),
             SocketTransport::Udp,
             address,
->>>>>>> origin/main
         ));
     }
 
