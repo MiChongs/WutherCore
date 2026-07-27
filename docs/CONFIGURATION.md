@@ -24,7 +24,7 @@ wuther-core run -c config.yaml
 | `profile` | `desktop`、`router`、`server` 或 `mobile` 默认值 |
 | `name` | 配置显示名称 |
 | `log` | 日志级别、过滤器和文件输出 |
-| `listen` | Mixed 入站、管理面板、共享和认证 |
+| `listen` | Mixed、XHTTP、Snell 等入站、管理面板、共享和认证 |
 | `feeds` | 订阅源 |
 | `nodes` | 手动节点 |
 | `groups` | 节点选择策略 |
@@ -155,6 +155,12 @@ ui:
 策略组 `choose: chain`（多跳 relay）尚未实现，配置编译期会拒绝，不会静默退化为单跳。
 
 端点和鉴权方式见 [管理 API](API.md)。
+
+## Snell 入站与节点
+
+Snell v1–v5 可同时作为出站节点和服务端监听使用。`listen.snell` 支持单个
+对象或数组，并在启动前预绑定端口；版本、UDP、连接复用、HTTP/TLS
+simple-obfs 和所有服务端资源字段见 [Snell 配置](SNELL.md)。
 
 ## 迁移与升级
 

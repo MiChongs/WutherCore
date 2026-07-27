@@ -26,6 +26,7 @@ pub mod hysteria2;
 pub mod mieru;
 pub mod shadowsocks;
 pub mod snell;
+pub mod snell_codec;
 pub mod ss2022;
 pub mod ssh;
 pub mod ssr;

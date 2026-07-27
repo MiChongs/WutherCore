@@ -32,6 +32,7 @@ regex       = { workspace = true }
 # 协议层依赖
 aes-gcm           = { workspace = true }
 chacha20poly1305  = { workspace = true }
+argon2            = { workspace = true }
 hkdf              = { workspace = true }
 sha1              = "0.10"
 sha2              = { workspace = true }

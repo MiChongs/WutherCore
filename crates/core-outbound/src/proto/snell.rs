@@ -1,102 +1,105 @@
-//! Snell v3 出站 —— 完整实现，与 mihomo / Surge 互通。
+//! Snell v1-v5 client protocol.
 //!
-//! Snell 是 Surge 设计的轻量协议。本实现覆盖 v2 / v3 / v4 完整命令集与 UDP 转发。
-//!
-//! ## 加密
-//! * 流上密：`AES-128-GCM` / `ChaCha20-Poly1305` + HKDF-SHA1（与 SS AEAD 一致）
-//! * 客户端首次发送随机 salt（PSK 等长），双方按 HKDF 派生 subkey
-//!
-//! ## 命令字（version=0x03/0x04）
-//! ```text
-//! version(1) || cmd(1) || ...
-//! ```
-//! cmd 取值：
-//! * `0x00` Ping        —— 客户端心跳（v4+）
-//! * `0x01` Connect     —— TCP CONNECT：cmd_payload = client_id_len(1) || client_id || host_len(1) || host || port(2 BE)
-//! * `0x02` UDPForward  —— UDP relay：第一帧之后双向走 UDPPacket
-//! * `0x03` UDPStream   —— UDP stream（v4+）
-//! * `0x05` Pong        —— 客户端 -> 服务器
-//! * `0x06` Tunnel      —— 服务器 -> 客户端 OK
-//! * `0x07` Error       —— 服务器响应错误
-//!
-//! ## 服务器响应
-//! ```text
-//! status(1) || (status_specific...)
-//! status=0x00 Tunnel OK
-//! status=0x01 Pong
-//! status=0x02 Error: errno(1) || msg_len(1) || msg(N)
-//! ```
-//!
-//! ## UDP 包格式（双向）
-//! ```text
-//! chunk_size(2 BE) || addr(SOCKS5) || udp_payload
-//! ```
-//! 通过同一条 AEAD 加密的 TCP 流转发。
+//! The authenticated record layer lives in [`super::snell_codec`]. This module
+//! implements the official command header, TCP tunnel acknowledgement, and
+//! Snell's non-SOCKS UDP address format used by Mihomo and Surge.
 
 use std::{
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
-use aes_gcm::{
-    Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit},
-};
 use async_trait::async_trait;
-use bytes::{Buf, BufMut, BytesMut};
-use chacha20poly1305::ChaCha20Poly1305;
-use hkdf::Hkdf;
-use md5::{Digest, Md5};
-use pin_project_lite::pin_project;
-use rand::RngCore;
-use sha1::Sha1;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
-    sync::Mutex as AsyncMutex,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::Mutex,
 };
 
 use crate::{
     adapter::{BoxedStream, BoxedUdp, Capabilities, DialContext, OutboundAdapter, UdpSocketLike},
-    proto::addr::encode_socks_addr,
-    transport::{Transport, tcp::TcpTransport},
+    proto::snell_codec::{
+        MAX_FRAME_LENGTH, SnellReadHalf, SnellReadStatus, SnellStream, SnellVersion, SnellWriteHalf,
+    },
+    transport::{
+        Transport,
+        simple_obfs::{SimpleObfsMode, SimpleObfsStream},
+        tcp::TcpTransport,
+    },
 };
 
-const PAYLOAD_MAX: usize = 0x3fff;
+const PROTOCOL_VERSION: u8 = 1;
+const COMMAND_CONNECT: u8 = 1;
+const COMMAND_CONNECT_V2: u8 = 5;
+const COMMAND_UDP: u8 = 6;
+const COMMAND_UDP_FORWARD: u8 = 1;
+const REPLY_TUNNEL: u8 = 0;
+const REPLY_PONG: u8 = 1;
+const REPLY_ERROR: u8 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnellCipher {
-    Aes128Gcm,
-    Chacha20Poly1305,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnellObfs {
+    None,
+    Http { host: String },
+    Tls { host: String },
 }
 
-impl SnellCipher {
-    pub fn key_len(self) -> usize {
-        match self {
-            Self::Aes128Gcm => 16,
-            Self::Chacha20Poly1305 => 32,
+const REUSE_POOL_SIZE: usize = 10;
+const REUSE_POOL_IDLE: Duration = Duration::from_secs(15);
+
+struct PooledSnell {
+    stream: SnellStream,
+    idle_since: Instant,
+}
+
+struct SnellPool {
+    streams: Mutex<Vec<PooledSnell>>,
+}
+
+impl SnellPool {
+    fn new() -> Self {
+        Self {
+            streams: Mutex::new(Vec::new()),
         }
     }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "aes-128-gcm" | "aes128gcm" => Some(Self::Aes128Gcm),
-            "chacha20-poly1305" | "chacha20-ietf-poly1305" => Some(Self::Chacha20Poly1305),
-            _ => None,
+
+    async fn take(&self) -> Option<SnellStream> {
+        let now = Instant::now();
+        let mut streams = self.streams.lock().await;
+        streams.retain(|entry| now.duration_since(entry.idle_since) <= REUSE_POOL_IDLE);
+        streams.pop().map(|entry| entry.stream)
+    }
+
+    fn put(self: &Arc<Self>, stream: SnellStream) {
+        let entry = PooledSnell {
+            stream,
+            idle_since: Instant::now(),
+        };
+        if let Ok(mut streams) = self.streams.try_lock() {
+            if streams.len() < REUSE_POOL_SIZE {
+                streams.push(entry);
+            }
+            return;
+        }
+        let pool = Arc::clone(self);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut streams = pool.streams.lock().await;
+                if streams.len() < REUSE_POOL_SIZE {
+                    streams.push(entry);
+                }
+            });
         }
     }
 }
 
-/// Snell 命令字
-#[allow(dead_code)]
-pub mod cmd {
-    pub const PING: u8 = 0x00;
-    pub const CONNECT: u8 = 0x01;
-    pub const UDP_FORWARD: u8 = 0x02;
-    pub const UDP_STREAM: u8 = 0x03;
-    pub const PONG: u8 = 0x05;
-    pub const TUNNEL: u8 = 0x00;
-    pub const PONG_RESPONSE: u8 = 0x01;
-    pub const ERROR: u8 = 0x02;
+impl fmt::Debug for SnellPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SnellPool")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,24 +107,12 @@ pub struct SnellOutbound {
     pub name: String,
     pub host: String,
     pub port: u16,
-    pub cipher: SnellCipher,
-    pub key: Arc<[u8]>,
-    pub version: u8,
+    pub password: Arc<[u8]>,
+    pub version: SnellVersion,
     pub udp: bool,
+    pub reuse: bool,
     pub obfs: SnellObfs,
-}
-
-#[derive(Debug, Clone)]
-pub enum SnellObfs {
-    None,
-    /// HTTP 单字节随机 obfs；与 mihomo `obfs=http` 兼容
-    Http {
-        host: String,
-    },
-    /// TLS 1.2 ServerHello 模拟；与 mihomo `obfs=tls` 兼容
-    Tls {
-        host: String,
-    },
+    pool: Arc<SnellPool>,
 }
 
 impl SnellOutbound {
@@ -129,30 +120,211 @@ impl SnellOutbound {
         name: impl Into<String>,
         host: impl Into<String>,
         port: u16,
-        cipher: SnellCipher,
         password: &str,
     ) -> Self {
-        let key = evp_bytes_to_key(password.as_bytes(), cipher.key_len());
         Self {
             name: name.into(),
             host: host.into(),
             port,
-            cipher,
-            key: Arc::from(key.into_boxed_slice()),
-            version: 4,
-            udp: true,
+            password: Arc::from(password.as_bytes()),
+            version: SnellVersion::V1,
+            udp: false,
+            reuse: false,
             obfs: SnellObfs::None,
+            pool: Arc::new(SnellPool::new()),
         }
     }
 
-    pub fn with_obfs_http(mut self, host: impl Into<String>) -> Self {
-        self.obfs = SnellObfs::Http { host: host.into() };
-        self
+    pub fn with_version(mut self, version: u8) -> Result<Self, String> {
+        self.version = SnellVersion::parse(version)?;
+        Ok(self)
     }
 
-    pub fn with_obfs_tls(mut self, host: impl Into<String>) -> Self {
-        self.obfs = SnellObfs::Tls { host: host.into() };
-        self
+    pub fn with_udp(mut self, enabled: bool) -> Result<Self, String> {
+        if enabled && !self.version.supports_udp() {
+            return Err(format!(
+                "Snell v{} does not support UDP; use version 3, 4 or 5",
+                self.version.number()
+            ));
+        }
+        self.udp = enabled;
+        Ok(self)
+    }
+
+    pub fn with_reuse(mut self, enabled: bool) -> Result<Self, String> {
+        if enabled && !self.version.supports_reuse() {
+            return Err(format!(
+                "Snell reuse requires version 4 or 5, got v{}",
+                self.version.number()
+            ));
+        }
+        self.reuse = enabled;
+        Ok(self)
+    }
+
+    pub fn with_obfs_http(mut self, host: impl Into<String>) -> Result<Self, String> {
+        let host = host.into();
+        if host.trim().is_empty() {
+            return Err("Snell HTTP obfs host must not be empty".into());
+        }
+        self.obfs = SnellObfs::Http { host };
+        Ok(self)
+    }
+
+    pub fn with_obfs_tls(mut self, host: impl Into<String>) -> Result<Self, String> {
+        let host = host.into();
+        if host.trim().is_empty() {
+            return Err("Snell TLS obfs host must not be empty".into());
+        }
+        self.obfs = SnellObfs::Tls { host };
+        Ok(self)
+    }
+
+    async fn connect_stream(&self, expect_reply: bool) -> io::Result<SnellStream> {
+        let stream = TcpTransport::default()
+            .connect(&self.host, self.port)
+            .await?;
+        let stream: BoxedStream = match &self.obfs {
+            SnellObfs::None => stream,
+            SnellObfs::Http { host } => Box::pin(SimpleObfsStream::client(
+                stream,
+                SimpleObfsMode::Http {
+                    host: host.clone(),
+                    port: self.port,
+                },
+            )),
+            SnellObfs::Tls { host } => Box::pin(SimpleObfsStream::client(
+                stream,
+                SimpleObfsMode::Tls { host: host.clone() },
+            )),
+        };
+        SnellStream::new(stream, self.password.clone(), self.version, expect_reply)
+    }
+
+    fn reuse_enabled(&self) -> bool {
+        self.version == SnellVersion::V2 || self.reuse
+    }
+
+    async fn reusable_stream(&self) -> io::Result<SnellStream> {
+        if let Some(stream) = self.pool.take().await {
+            Ok(stream)
+        } else {
+            self.connect_stream(true).await
+        }
+    }
+}
+
+struct ReusableSnellStream {
+    stream: Option<SnellStream>,
+    pool: Arc<SnellPool>,
+    read_ended: bool,
+    write_ended: bool,
+    reusable: bool,
+}
+
+impl ReusableSnellStream {
+    fn new(stream: SnellStream, pool: Arc<SnellPool>) -> Self {
+        Self {
+            stream: Some(stream),
+            pool,
+            read_ended: false,
+            write_ended: false,
+            reusable: true,
+        }
+    }
+
+    fn finish_if_ready(&mut self) {
+        if self.reusable && self.read_ended && self.write_ended {
+            if let Some(stream) = self.stream.take() {
+                self.pool.put(stream);
+            }
+        }
+    }
+}
+
+impl Drop for ReusableSnellStream {
+    fn drop(&mut self) {
+        self.finish_if_ready();
+    }
+}
+
+impl AsyncRead for ReusableSnellStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.read_ended {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match stream.poll_session_read(cx, output) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.reusable = false;
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok(SnellReadStatus::Data)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(SnellReadStatus::End)) => {
+                self.read_ended = true;
+                self.finish_if_ready();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(SnellReadStatus::TransportEof)) => {
+                self.read_ended = true;
+                self.reusable = false;
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ReusableSnellStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.write_ended {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Snell logical stream is half-closed",
+            )));
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Err(io::ErrorKind::NotConnected.into()));
+        };
+        Pin::new(stream).poll_write(cx, input)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_ended {
+            return Poll::Ready(Ok(()));
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match stream.poll_write_end(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.reusable = false;
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok(())) => {
+                self.write_ended = true;
+                self.finish_if_ready();
+                Poll::Ready(Ok(()))
+            }
+        }
     }
 }
 
@@ -161,576 +333,506 @@ impl OutboundAdapter for SnellOutbound {
     fn name(&self) -> &str {
         &self.name
     }
+
     fn protocol(&self) -> &'static str {
         "snell"
     }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tcp: true,
             udp: self.udp,
             ipv6: true,
-            multiplex: false,
+            multiplex: self.reuse_enabled(),
         }
     }
 
-    async fn dial_tcp(&self, ctx: DialContext) -> std::io::Result<BoxedStream> {
-        let mut stream = TcpTransport::default()
-            .connect(&self.host, self.port)
-            .await?;
-
-        // 1) salt
-        let salt_len = self.cipher.key_len();
-        let mut salt = vec![0u8; salt_len];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        stream.write_all(&salt).await?;
-
-        // 2) 派生 subkey
-        let send_key = hkdf_subkey(&self.key, &salt, salt_len, b"snell-subkey");
-
-        // 3) 选择 cmd —— TCP 走 CONNECT；UDP 走 UDP_FORWARD（v4 用 UDP_STREAM）
-        let is_udp = ctx.network == "udp";
-        let cmd_byte = if is_udp {
-            if self.version >= 4 {
-                cmd::UDP_STREAM
-            } else {
-                cmd::UDP_FORWARD
-            }
+    async fn dial_tcp(&self, ctx: DialContext) -> io::Result<BoxedStream> {
+        let reusable = self.reuse_enabled();
+        let mut stream = if reusable {
+            self.reusable_stream().await?
         } else {
-            cmd::CONNECT
+            self.connect_stream(true).await?
         };
-
-        // 4) cmd payload：v3+ 都是 client_id_len(1)=0 || host_len(1) || host || port(2 BE)
-        let mut cmd_payload = Vec::with_capacity(8 + ctx.host.len());
-        cmd_payload.put_u8(self.version);
-        cmd_payload.put_u8(cmd_byte);
-        cmd_payload.put_u8(0x00); // client_id_len = 0
-        cmd_payload.put_u8(ctx.host.len().min(255) as u8);
-        cmd_payload.extend_from_slice(ctx.host.as_bytes());
-        cmd_payload.put_u16(ctx.port);
-
-        // 5) 写出第一帧
-        let mut send = SnellCryptor::new(self.cipher, &send_key);
-        let pkt = send.encrypt_chunk(&cmd_payload)?;
-        stream.write_all(&pkt).await?;
+        let command = if self.version == SnellVersion::V2 || reusable {
+            COMMAND_CONNECT_V2
+        } else {
+            COMMAND_CONNECT
+        };
+        let header = encode_tcp_request(command, &ctx.host, ctx.port)?;
+        stream.write_frame(&header).await?;
         tracing::info!(
             target: "dial::snell",
             id = ctx.dial_id,
             proxy = %self.name,
+            version = self.version.number(),
+            reuse = self.reuse,
             server = %format!("{}:{}", self.host, self.port),
-            target = %format!("{}:{}", ctx.host, ctx.port),
-            network = ctx.network,
-            "request command sent",
+            destination = %format!("{}:{}", ctx.host, ctx.port),
+            "Snell TCP command sent",
         );
-
-        Ok(Box::pin(SnellStream {
-            inner: stream,
-            send,
-            recv_state: RecvState::WaitSalt,
-            master: self.key.clone(),
-            cipher: self.cipher,
-            cipher_buf: BytesMut::with_capacity(16 * 1024),
-            plain_buf: BytesMut::with_capacity(16 * 1024),
-            response_state: ResponseState::WaitStatus,
-        }))
+        if reusable {
+            Ok(Box::pin(ReusableSnellStream::new(
+                stream,
+                Arc::clone(&self.pool),
+            )))
+        } else {
+            Ok(Box::pin(stream))
+        }
     }
 
-    async fn dial_udp(&self, mut ctx: DialContext) -> std::io::Result<BoxedUdp> {
+    async fn dial_udp(&self, ctx: DialContext) -> io::Result<BoxedUdp> {
         if !self.udp {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("outbound `{}`/snell udp disabled by config", self.name),
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("outbound `{}`/snell UDP disabled by config", self.name),
             ));
         }
-        ctx.network = "udp";
-        let stream = self.dial_tcp(ctx.clone()).await?;
-        let (read, write) = tokio::io::split(stream);
-        tracing::info!(
-            target: "dial::snell",
-            id = ctx.dial_id,
-            proxy = %self.name,
-            target = %format!("{}:{}", ctx.host, ctx.port),
-            "udp stream ok",
-        );
+        if !self.version.supports_udp() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Snell v{} does not support UDP", self.version.number()),
+            ));
+        }
+        let mut stream = self.connect_stream(self.version.uses_v4_records()).await?;
+        stream
+            .write_frame(&[PROTOCOL_VERSION, COMMAND_UDP, 0])
+            .await?;
+        let (read, write) = stream.into_split();
         Ok(Box::new(SnellUdp {
-            read: AsyncMutex::new(read),
-            write: AsyncMutex::new(write),
+            read: Mutex::new(read),
+            write: Mutex::new(write),
+            target_host: ctx.host,
+            target_port: ctx.port,
         }))
     }
 }
 
+fn encode_tcp_request(command: u8, host: &str, port: u16) -> io::Result<Vec<u8>> {
+    let host = host.as_bytes();
+    let host_length = u8::try_from(host.len())
+        .map_err(|_| invalid_input("Snell destination hostname exceeds 255 bytes"))?;
+    let mut header = Vec::with_capacity(6 + host.len());
+    header.extend_from_slice(&[PROTOCOL_VERSION, command, 0, host_length]);
+    header.extend_from_slice(host);
+    header.extend_from_slice(&port.to_be_bytes());
+    Ok(header)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnellRequest {
+    Ping,
+    Tcp {
+        host: String,
+        port: u16,
+        reuse: bool,
+    },
+    Udp,
+}
+
+pub fn parse_request_header(frame: &[u8]) -> io::Result<SnellRequest> {
+    if frame.len() < 3 || frame[0] != PROTOCOL_VERSION {
+        return Err(invalid_data("invalid Snell command header"));
+    }
+    let command = frame[1];
+    let client_id_length = frame[2] as usize;
+    let mut offset = 3usize
+        .checked_add(client_id_length)
+        .ok_or_else(|| invalid_data("Snell client ID length overflow"))?;
+    if frame.len() < offset {
+        return Err(invalid_data("truncated Snell client ID"));
+    }
+    match command {
+        0 => Ok(SnellRequest::Ping),
+        COMMAND_UDP => {
+            if frame.len() != offset {
+                return Err(invalid_data("Snell UDP header contains trailing bytes"));
+            }
+            Ok(SnellRequest::Udp)
+        }
+        COMMAND_CONNECT | COMMAND_CONNECT_V2 => {
+            let host_length = *frame
+                .get(offset)
+                .ok_or_else(|| invalid_data("Snell TCP header has no hostname length"))?
+                as usize;
+            offset += 1;
+            if frame.len() != offset + host_length + 2 {
+                return Err(invalid_data("truncated or extended Snell TCP header"));
+            }
+            let host = std::str::from_utf8(&frame[offset..offset + host_length])
+                .map_err(|_| invalid_data("Snell destination hostname is not UTF-8"))?
+                .to_owned();
+            if host.is_empty() {
+                return Err(invalid_data("Snell destination hostname is empty"));
+            }
+            offset += host_length;
+            let port = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
+            if port == 0 {
+                return Err(invalid_data("Snell destination port is zero"));
+            }
+            Ok(SnellRequest::Tcp {
+                host,
+                port,
+                reuse: command == COMMAND_CONNECT_V2,
+            })
+        }
+        command => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported Snell command {command}"),
+        )),
+    }
+}
+
+pub fn tunnel_reply() -> [u8; 1] {
+    [REPLY_TUNNEL]
+}
+
+pub fn pong_reply() -> [u8; 1] {
+    [REPLY_PONG]
+}
+
+pub fn error_reply(code: u8, message: &str) -> Vec<u8> {
+    let message = message.as_bytes();
+    let length = message.len().min(u8::MAX as usize);
+    let mut reply = Vec::with_capacity(3 + length);
+    reply.extend_from_slice(&[REPLY_ERROR, code, length as u8]);
+    reply.extend_from_slice(&message[..length]);
+    reply
+}
+
 struct SnellUdp {
-    read: AsyncMutex<ReadHalf<BoxedStream>>,
-    write: AsyncMutex<WriteHalf<BoxedStream>>,
+    read: Mutex<SnellReadHalf>,
+    write: Mutex<SnellWriteHalf>,
+    target_host: String,
+    target_port: u16,
 }
 
 #[async_trait]
 impl UdpSocketLike for SnellUdp {
-    async fn send_to(&self, buf: &[u8], target: &str, port: u16) -> std::io::Result<usize> {
-        let addr = encode_socks_addr(target, port);
-        let packet = encode_udp_packet(&addr, buf);
-        let mut write = self.write.lock().await;
-        write.write_all(&packet).await?;
-        Ok(buf.len())
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut read = self.read.lock().await;
-        let mut len = [0u8; 2];
-        read.read_exact(&mut len).await?;
-        let body_len = u16::from_be_bytes(len) as usize;
-        let mut packet = Vec::with_capacity(2 + body_len);
-        packet.extend_from_slice(&len);
-        packet.resize(2 + body_len, 0);
-        if body_len > 0 {
-            read.read_exact(&mut packet[2..]).await?;
+    async fn send_to(&self, payload: &[u8], target: &str, port: u16) -> io::Result<usize> {
+        if target != self.target_host || port != self.target_port {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Snell UDP association is pinned to {}:{}, got {target}:{port}",
+                    self.target_host, self.target_port
+                ),
+            ));
         }
-        let (_, _, payload) = decode_udp_packet(&packet)?;
-        let copy_len = payload.len().min(buf.len());
-        buf[..copy_len].copy_from_slice(&payload[..copy_len]);
-        Ok(copy_len)
+        let packet = encode_udp_request(target, port, payload)?;
+        self.write.lock().await.write_frame(&packet).await?;
+        Ok(payload.len())
     }
 
-    async fn close(&self) -> std::io::Result<()> {
-        let mut write = self.write.lock().await;
-        let _ = write.shutdown().await;
-        Ok(())
+    async fn recv_from(&self, output: &mut [u8]) -> io::Result<usize> {
+        let frame = self.read.lock().await.read_frame().await?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Snell UDP stream ended")
+        })?;
+        let (_, _, payload) = parse_udp_response(&frame)?;
+        if payload.len() > output.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Snell UDP response is {} bytes but caller buffer is {} bytes",
+                    payload.len(),
+                    output.len()
+                ),
+            ));
+        }
+        output[..payload.len()].copy_from_slice(payload);
+        Ok(payload.len())
+    }
+
+    async fn close(&self) -> io::Result<()> {
+        let mut writer = self.write.lock().await;
+        writer.write_end().await?;
+        writer.shutdown().await
     }
 }
 
-enum SnellAead {
-    Aes128(Aes128Gcm),
-    Chacha(ChaCha20Poly1305),
+pub fn encode_udp_request(host: &str, port: u16, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(24 + payload.len());
+    output.push(COMMAND_UDP_FORWARD);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            output.extend_from_slice(&[0, 4]);
+            output.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            output.extend_from_slice(&[0, 6]);
+            output.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            let host = host.as_bytes();
+            let length = u8::try_from(host.len())
+                .map_err(|_| invalid_input("Snell UDP hostname exceeds 255 bytes"))?;
+            if length == 0 {
+                return Err(invalid_input("Snell UDP hostname is empty"));
+            }
+            output.push(length);
+            output.extend_from_slice(host);
+        }
+    }
+    output.extend_from_slice(&port.to_be_bytes());
+    if output.len() + payload.len() > MAX_FRAME_LENGTH {
+        return Err(invalid_input("Snell UDP request exceeds 0x3fff bytes"));
+    }
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
-struct SnellCryptor {
-    aead: SnellAead,
-    nonce: [u8; 12],
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnellUdpRequest<'a> {
+    pub host: String,
+    pub port: u16,
+    pub payload: &'a [u8],
 }
 
-impl SnellCryptor {
-    fn new(cipher: SnellCipher, key: &[u8]) -> Self {
-        let aead = match cipher {
-            SnellCipher::Aes128Gcm => {
-                SnellAead::Aes128(Aes128Gcm::new_from_slice(key).expect("len"))
-            }
-            SnellCipher::Chacha20Poly1305 => {
-                SnellAead::Chacha(ChaCha20Poly1305::new_from_slice(key).expect("len"))
-            }
-        };
-        Self {
-            aead,
-            nonce: [0u8; 12],
+pub fn parse_udp_request(packet: &[u8]) -> io::Result<SnellUdpRequest<'_>> {
+    if packet.len() < 4 || packet[0] != COMMAND_UDP_FORWARD {
+        return Err(invalid_data("invalid Snell UDP request"));
+    }
+    let address_length = packet[1] as usize;
+    if address_length != 0 {
+        let address_end = 2 + address_length;
+        if packet.len() <= address_end + 2 {
+            return Err(invalid_data("truncated Snell UDP domain request"));
         }
+        let host = std::str::from_utf8(&packet[2..address_end])
+            .map_err(|_| invalid_data("Snell UDP hostname is not UTF-8"))?
+            .to_owned();
+        let port = u16::from_be_bytes([packet[address_end], packet[address_end + 1]]);
+        return Ok(SnellUdpRequest {
+            host,
+            port,
+            payload: &packet[address_end + 2..],
+        });
     }
-
-    fn next_nonce(&mut self) -> [u8; 12] {
-        let n = self.nonce;
-        for b in self.nonce.iter_mut() {
-            let (v, c) = b.overflowing_add(1);
-            *b = v;
-            if !c {
-                break;
-            }
+    let family = *packet
+        .get(2)
+        .ok_or_else(|| invalid_data("Snell UDP IP family is missing"))?;
+    let (host, offset) = match family {
+        4 if packet.len() >= 9 => (
+            Ipv4Addr::new(packet[3], packet[4], packet[5], packet[6]).to_string(),
+            7,
+        ),
+        6 if packet.len() >= 21 => {
+            let octets: [u8; 16] = packet[3..19].try_into().expect("checked IPv6 length");
+            (Ipv6Addr::from(octets).to_string(), 19)
         }
-        n
-    }
-
-    fn encrypt(&mut self, msg: &[u8]) -> std::io::Result<Vec<u8>> {
-        let n = self.next_nonce();
-        match &self.aead {
-            SnellAead::Aes128(c) => c
-                .encrypt(Nonce::from_slice(&n), msg)
-                .map_err(|_| io_err("snell encrypt aes")),
-            SnellAead::Chacha(c) => c
-                .encrypt(chacha20poly1305::Nonce::from_slice(&n), msg)
-                .map_err(|_| io_err("snell encrypt chacha")),
-        }
-    }
-
-    fn decrypt(&mut self, ct: &[u8]) -> std::io::Result<Vec<u8>> {
-        let n = self.next_nonce();
-        match &self.aead {
-            SnellAead::Aes128(c) => c
-                .decrypt(Nonce::from_slice(&n), ct)
-                .map_err(|_| io_err("snell decrypt aes")),
-            SnellAead::Chacha(c) => c
-                .decrypt(chacha20poly1305::Nonce::from_slice(&n), ct)
-                .map_err(|_| io_err("snell decrypt chacha")),
-        }
-    }
-
-    fn encrypt_chunk(&mut self, data: &[u8]) -> std::io::Result<Vec<u8>> {
-        let chunk = &data[..data.len().min(PAYLOAD_MAX)];
-        let len_be = (chunk.len() as u16).to_be_bytes();
-        let mut out = Vec::with_capacity(2 + 16 + chunk.len() + 16);
-        out.extend(self.encrypt(&len_be)?);
-        out.extend(self.encrypt(chunk)?);
-        Ok(out)
-    }
-}
-
-enum RecvState {
-    WaitSalt,
-    Ready {
-        recv: SnellCryptor,
-        expecting_len: Option<usize>,
-    },
-}
-
-#[derive(Debug)]
-enum ResponseState {
-    /// 等待第一字节状态码
-    WaitStatus,
-    /// 已收到 OK，进入 payload 透传
-    Payload,
-    /// 收到 Pong（保活）—— 继续等下一帧
-    PongReceived,
-    /// 错误状态：errno + msg
-    Error { remaining: usize, errno: u8 },
-}
-
-pin_project! {
-    struct SnellStream {
-        #[pin]
-        inner: BoxedStream,
-        send: SnellCryptor,
-        recv_state: RecvState,
-        master: Arc<[u8]>,
-        cipher: SnellCipher,
-        cipher_buf: BytesMut,
-        plain_buf: BytesMut,
-        response_state: ResponseState,
-    }
-}
-
-impl AsyncRead for SnellStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut this = self.project();
-        loop {
-            if !this.plain_buf.is_empty() {
-                let n = std::cmp::min(buf.remaining(), this.plain_buf.len());
-                buf.put_slice(&this.plain_buf[..n]);
-                this.plain_buf.advance(n);
-                return Poll::Ready(Ok(()));
-            }
-
-            let progress: std::io::Result<bool> = (|| -> std::io::Result<bool> {
-                match this.recv_state {
-                    RecvState::WaitSalt => {
-                        let salt_len = this.cipher.key_len();
-                        if this.cipher_buf.len() < salt_len {
-                            return Ok(false);
-                        }
-                        let salt = this.cipher_buf.split_to(salt_len);
-                        let subkey = hkdf_subkey(this.master, &salt, salt_len, b"snell-subkey");
-                        *this.recv_state = RecvState::Ready {
-                            recv: SnellCryptor::new(*this.cipher, &subkey),
-                            expecting_len: None,
-                        };
-                        Ok(true)
-                    }
-                    RecvState::Ready {
-                        recv,
-                        expecting_len,
-                    } => {
-                        let tag = 16;
-                        if expecting_len.is_none() {
-                            if this.cipher_buf.len() < 2 + tag {
-                                return Ok(false);
-                            }
-                            let chunk = this.cipher_buf.split_to(2 + tag).to_vec();
-                            let dec = recv.decrypt(&chunk)?;
-                            let length = u16::from_be_bytes([dec[0], dec[1]]) as usize;
-                            *expecting_len = Some(length);
-                            Ok(true)
-                        } else {
-                            let length = expecting_len.unwrap();
-                            if this.cipher_buf.len() < length + tag {
-                                return Ok(false);
-                            }
-                            let chunk = this.cipher_buf.split_to(length + tag).to_vec();
-                            let dec = recv.decrypt(&chunk)?;
-                            *expecting_len = None;
-                            // 根据 response_state 分发
-                            handle_payload(&mut *this.response_state, &dec, this.plain_buf)?;
-                            Ok(true)
-                        }
-                    }
-                }
-            })();
-            match progress {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-
-            let mut tmp = [0u8; 16 * 1024];
-            let mut rb = ReadBuf::new(&mut tmp);
-            match this.inner.as_mut().poll_read(cx, &mut rb) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {
-                    let filled = rb.filled().len();
-                    if filled == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.cipher_buf.extend_from_slice(rb.filled());
-                }
-            }
-        }
-    }
-}
-
-fn handle_payload(
-    state: &mut ResponseState,
-    dec: &[u8],
-    plain_buf: &mut BytesMut,
-) -> std::io::Result<()> {
-    match state {
-        ResponseState::WaitStatus => {
-            if dec.is_empty() {
-                return Err(io_err("snell empty response"));
-            }
-            match dec[0] {
-                0x00 => {
-                    // Tunnel OK
-                    *state = ResponseState::Payload;
-                    if dec.len() > 1 {
-                        plain_buf.extend_from_slice(&dec[1..]);
-                    }
-                }
-                0x01 => {
-                    // Pong (服务器返回 Pong)
-                    *state = ResponseState::PongReceived;
-                    // 继续等下一个 status 字节
-                    *state = ResponseState::WaitStatus;
-                }
-                0x02 => {
-                    // Error
-                    if dec.len() < 3 {
-                        return Err(io_err("snell error frame too short"));
-                    }
-                    let errno = dec[1];
-                    let msg_len = dec[2] as usize;
-                    if dec.len() >= 3 + msg_len {
-                        let msg = String::from_utf8_lossy(&dec[3..3 + msg_len]);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            format!("snell error errno={errno}: {msg}"),
-                        ));
-                    }
-                    *state = ResponseState::Error {
-                        remaining: 3 + msg_len - dec.len(),
-                        errno,
-                    };
-                }
-                other => {
-                    return Err(io_err_owned(format!(
-                        "snell unknown status byte 0x{other:02x}"
-                    )));
-                }
-            }
-        }
-        ResponseState::Payload => {
-            plain_buf.extend_from_slice(dec);
-        }
-        ResponseState::PongReceived => {
-            // 不应该走到，回到 WaitStatus
-            *state = ResponseState::WaitStatus;
-        }
-        ResponseState::Error { remaining, errno } => {
-            // 继续读 error msg
-            let take = (*remaining).min(dec.len());
-            *remaining -= take;
-            if *remaining == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("snell error errno={errno}"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-impl AsyncWrite for SnellStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut this = self.project();
-        let chunk = &data[..data.len().min(PAYLOAD_MAX)];
-        let pkt = match this.send.encrypt_chunk(chunk) {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        let mut written = 0;
-        while written < pkt.len() {
-            match this.inner.as_mut().poll_write(cx, &pkt[written..]) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
-                }
-                Poll::Ready(Ok(n)) => written += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(chunk.len()))
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
-    }
-}
-
-/// Snell UDP 包编码（双向）：`size_be(2) || addr(SOCKS5) || payload`
-pub fn encode_udp_packet(addr_socks: &[u8], payload: &[u8]) -> Vec<u8> {
-    let body_len = addr_socks.len() + payload.len();
-    let mut out = Vec::with_capacity(2 + body_len);
-    out.put_u16(body_len as u16);
-    out.extend_from_slice(addr_socks);
-    out.extend_from_slice(payload);
-    out
-}
-
-pub fn decode_udp_packet(buf: &[u8]) -> std::io::Result<(usize, &[u8], &[u8])> {
-    if buf.len() < 2 {
-        return Err(io_err("udp pkt too short"));
-    }
-    let body_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    if buf.len() < 2 + body_len {
-        return Err(io_err("udp pkt body truncated"));
-    }
-    let body = &buf[2..2 + body_len];
-    if body.is_empty() {
-        return Err(io_err("udp pkt empty body"));
-    }
-    let atyp = body[0];
-    let (addr_len, _) = match atyp {
-        0x01 => (1 + 4 + 2, "v4"),
-        0x03 => {
-            if body.len() < 2 {
-                return Err(io_err("udp pkt domain trunc"));
-            }
-            (1 + 1 + body[1] as usize + 2, "domain")
-        }
-        0x04 => (1 + 16 + 2, "v6"),
-        _ => return Err(io_err("udp pkt unknown atyp")),
+        4 | 6 => return Err(invalid_data("truncated Snell UDP IP request")),
+        _ => return Err(invalid_data("invalid Snell UDP IP family")),
     };
-    if body.len() < addr_len {
-        return Err(io_err("udp pkt addr trunc"));
+    let port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+    Ok(SnellUdpRequest {
+        host,
+        port,
+        payload: &packet[offset + 2..],
+    })
+}
+
+pub fn encode_udp_response(source: IpAddr, port: u16, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(19 + payload.len());
+    match source {
+        IpAddr::V4(address) => {
+            output.push(4);
+            output.extend_from_slice(&address.octets());
+        }
+        IpAddr::V6(address) => {
+            output.push(6);
+            output.extend_from_slice(&address.octets());
+        }
     }
-    Ok((2 + body_len, &body[..addr_len], &body[addr_len..]))
-}
-
-fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
-    let mut key = Vec::with_capacity(key_len);
-    let mut prev: Vec<u8> = Vec::new();
-    while key.len() < key_len {
-        let mut h = Md5::new();
-        h.update(&prev);
-        h.update(password);
-        let digest = h.finalize();
-        prev = digest.to_vec();
-        key.extend_from_slice(&prev);
+    output.extend_from_slice(&port.to_be_bytes());
+    if output.len() + payload.len() > MAX_FRAME_LENGTH {
+        return Err(invalid_input("Snell UDP response exceeds 0x3fff bytes"));
     }
-    key.truncate(key_len);
-    key
+    output.extend_from_slice(payload);
+    Ok(output)
 }
 
-fn hkdf_subkey(master: &[u8], salt: &[u8], len: usize, info: &[u8]) -> Vec<u8> {
-    let hk = Hkdf::<Sha1>::new(Some(salt), master);
-    let mut okm = vec![0u8; len];
-    hk.expand(info, &mut okm).expect("hkdf");
-    okm
+pub fn parse_udp_response(packet: &[u8]) -> io::Result<(IpAddr, u16, &[u8])> {
+    let family = *packet
+        .first()
+        .ok_or_else(|| invalid_data("empty Snell UDP response"))?;
+    match family {
+        4 if packet.len() >= 7 => Ok((
+            IpAddr::V4(Ipv4Addr::new(packet[1], packet[2], packet[3], packet[4])),
+            u16::from_be_bytes([packet[5], packet[6]]),
+            &packet[7..],
+        )),
+        6 if packet.len() >= 19 => {
+            let octets: [u8; 16] = packet[1..17].try_into().expect("checked IPv6 length");
+            Ok((
+                IpAddr::V6(Ipv6Addr::from(octets)),
+                u16::from_be_bytes([packet[17], packet[18]]),
+                &packet[19..],
+            ))
+        }
+        4 | 6 => Err(invalid_data("truncated Snell UDP response")),
+        _ => Err(invalid_data("invalid Snell UDP response IP family")),
+    }
 }
 
-fn io_err(s: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, s)
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn io_err_owned(s: String) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, s)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
 
     #[test]
-    fn cipher_parse() {
+    fn official_tcp_headers_are_version_one_for_every_generation() {
         assert_eq!(
-            SnellCipher::parse("aes-128-gcm"),
-            Some(SnellCipher::Aes128Gcm)
+            encode_tcp_request(COMMAND_CONNECT, "example.com", 443).unwrap(),
+            b"\x01\x01\x00\x0bexample.com\x01\xbb"
         );
         assert_eq!(
-            SnellCipher::parse("chacha20-poly1305"),
-            Some(SnellCipher::Chacha20Poly1305)
+            encode_tcp_request(COMMAND_CONNECT_V2, "a", 80).unwrap(),
+            b"\x01\x05\x00\x01a\x00\x50"
         );
-        assert_eq!(SnellCipher::parse("rc4"), None);
     }
 
     #[test]
-    fn key_len_correct() {
-        assert_eq!(SnellCipher::Aes128Gcm.key_len(), 16);
-        assert_eq!(SnellCipher::Chacha20Poly1305.key_len(), 32);
+    fn request_parser_accepts_tcp_udp_and_reuse() {
+        assert_eq!(
+            parse_request_header(b"\x01\x01\x00\x03dns\x00\x35").unwrap(),
+            SnellRequest::Tcp {
+                host: "dns".into(),
+                port: 53,
+                reuse: false,
+            }
+        );
+        assert_eq!(
+            parse_request_header(b"\x01\x05\x00\x01a\x00\x50").unwrap(),
+            SnellRequest::Tcp {
+                host: "a".into(),
+                port: 80,
+                reuse: true,
+            }
+        );
+        assert_eq!(
+            parse_request_header(b"\x01\x06\x00").unwrap(),
+            SnellRequest::Udp
+        );
     }
 
     #[test]
-    fn round_trip_chunk() {
-        let key = vec![0xa1u8; 16];
-        let mut send = SnellCryptor::new(SnellCipher::Aes128Gcm, &key);
-        let mut recv = SnellCryptor::new(SnellCipher::Aes128Gcm, &key);
-        let pkt = send.encrypt_chunk(b"hello snell").unwrap();
-        let len_dec = recv.decrypt(&pkt[..2 + 16]).unwrap();
-        let length = u16::from_be_bytes([len_dec[0], len_dec[1]]) as usize;
-        assert_eq!(length, 11);
-        let payload = recv.decrypt(&pkt[2 + 16..]).unwrap();
-        assert_eq!(payload, b"hello snell");
-    }
-
-    #[test]
-    fn udp_packet_round_trip_v4() {
-        let addr = b"\x01\x01\x02\x03\x04\x00\x50";
-        let payload = b"payload-bytes";
-        let pkt = encode_udp_packet(addr, payload);
-        let (consumed, decoded_addr, decoded_payload) = decode_udp_packet(&pkt).unwrap();
-        assert_eq!(consumed, pkt.len());
-        assert_eq!(decoded_addr, addr);
-        assert_eq!(decoded_payload, payload);
-    }
-
-    #[test]
-    fn udp_packet_round_trip_domain() {
-        let mut addr = vec![0x03, 9];
-        addr.extend_from_slice(b"localhost");
-        addr.extend_from_slice(&53u16.to_be_bytes());
-        let pkt = encode_udp_packet(&addr, b"dns-query");
-        let (_, da, dp) = decode_udp_packet(&pkt).unwrap();
-        assert_eq!(da, &addr[..]);
-        assert_eq!(dp, b"dns-query");
-    }
-
-    #[test]
-    fn snell_obfs_construct() {
-        let ob = SnellOutbound::new("s", "1.2.3.4", 8388, SnellCipher::Aes128Gcm, "p")
-            .with_obfs_http("example.com");
-        match ob.obfs {
-            SnellObfs::Http { ref host } => assert_eq!(host, "example.com"),
-            _ => panic!(),
+    fn udp_request_round_trips_domain_ipv4_and_ipv6() {
+        for host in ["example.com", "192.0.2.1", "2001:db8::1"] {
+            let encoded = encode_udp_request(host, 5353, b"dns").unwrap();
+            let decoded = parse_udp_request(&encoded).unwrap();
+            assert_eq!(decoded.host, host);
+            assert_eq!(decoded.port, 5353);
+            assert_eq!(decoded.payload, b"dns");
         }
     }
 
     #[test]
-    fn udp_capability_is_declared_when_enabled() {
-        let ob = SnellOutbound::new("s", "1.2.3.4", 8388, SnellCipher::Aes128Gcm, "p");
-        assert!(ob.capabilities().udp);
+    fn udp_response_round_trips_both_families() {
+        for address in [
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+            "2001:db8::10".parse::<IpAddr>().unwrap(),
+        ] {
+            let encoded = encode_udp_response(address, 53, b"answer").unwrap();
+            let (decoded, port, payload) = parse_udp_response(&encoded).unwrap();
+            assert_eq!(decoded, address);
+            assert_eq!(port, 53);
+            assert_eq!(payload, b"answer");
+        }
+    }
+
+    #[test]
+    fn version_capabilities_are_strict() {
+        assert!(!SnellVersion::V2.supports_udp());
+        assert!(SnellVersion::V3.supports_udp());
+        assert!(!SnellVersion::V3.supports_reuse());
+        assert!(SnellVersion::V2.supports_reuse());
+        assert!(SnellVersion::V4.supports_reuse());
+        assert!(SnellVersion::V5.supports_reuse());
+    }
+
+    #[tokio::test]
+    async fn v2_and_v4_clients_reuse_one_authenticated_transport() {
+        for version in [2u8, 4u8] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let accepted_server = Arc::clone(&accepted);
+            let server = tokio::spawn(async move {
+                let (transport, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                let version = SnellVersion::parse(version).unwrap();
+                let mut stream = SnellStream::new(
+                    Box::pin(transport),
+                    Arc::from(&b"pool-password"[..]),
+                    version,
+                    false,
+                )
+                .unwrap();
+                for _ in 0..2 {
+                    let header = stream.read_frame().await.unwrap().unwrap();
+                    assert!(matches!(
+                        parse_request_header(&header).unwrap(),
+                        SnellRequest::Tcp { reuse: true, .. }
+                    ));
+                    stream.write_frame(&tunnel_reply()).await.unwrap();
+                    loop {
+                        match stream.read_event().await.unwrap() {
+                            crate::proto::snell_codec::SnellFrameEvent::Data(frame) => {
+                                stream.write_frame(&frame).await.unwrap();
+                            }
+                            crate::proto::snell_codec::SnellFrameEvent::End => {
+                                stream.write_end().await.unwrap();
+                                break;
+                            }
+                            crate::proto::snell_codec::SnellFrameEvent::TransportEof => {
+                                panic!("pooled transport closed between logical sessions");
+                            }
+                        }
+                    }
+                }
+            });
+
+            let outbound = SnellOutbound::new(
+                format!("snell-v{version}"),
+                address.ip().to_string(),
+                address.port(),
+                "pool-password",
+            )
+            .with_version(version)
+            .unwrap()
+            .with_reuse(version == 4)
+            .unwrap();
+            for payload in [b"first".as_slice(), b"second".as_slice()] {
+                let mut stream = outbound
+                    .dial_tcp(DialContext::tcp("target.invalid", 443))
+                    .await
+                    .unwrap();
+                stream.write_all(payload).await.unwrap();
+                stream.flush().await.unwrap();
+                let mut echoed = vec![0u8; payload.len()];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(echoed, payload);
+                stream.shutdown().await.unwrap();
+                let mut eof = [0u8; 1];
+                assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
+                drop(stream);
+            }
+            server.await.unwrap();
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        }
     }
 }

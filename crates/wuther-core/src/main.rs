@@ -17,8 +17,8 @@ use core_api::ApiServer;
 use core_config::loader::load_from_path;
 use core_feeds::{FeedDiskCache, FeedManager, FeedSink, FeedUpdate};
 use core_inbound::{
-    MixedListener, XhttpListenerHandle, ensure_best_effort_privilege, run_mixed,
-    start_xhttp_listeners,
+    MixedListener, SnellListenerHandle, XhttpListenerHandle, ensure_best_effort_privilege,
+    run_mixed, start_snell_listeners, start_xhttp_listeners,
 };
 use core_ruleset::{RulesetManager, RulesetSpec, RulesetType};
 use core_runtime::{Runtime, UrlTestConfig, UrlTester};
@@ -687,6 +687,49 @@ route:
         runtime.shutdown().await;
         drop(target);
     }
+
+    #[tokio::test]
+    async fn configured_snell_is_prebound_by_main_startup_path() {
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let plan = core_config::loader::load_from_str(&format!(
+            r#"
+version: 1
+profile: server
+listen:
+  panel: false
+  snell:
+    address: 127.0.0.1
+    port: {listen_port}
+    psk: main-startup-secret
+    version: 5
+    udp: true
+    obfs-opts: {{mode: tls, host: cdn.example.com}}
+    tag: main-snell
+route:
+  preset: direct
+"#
+        ))
+        .unwrap();
+        let runtime = Arc::new(Runtime::build(plan.clone()).unwrap());
+
+        let mut handles = start_configured_snell_inbounds(&plan, Arc::clone(&runtime))
+            .await
+            .expect("main startup path must start configured Snell");
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].tag(), "main-snell");
+        assert_eq!(handles[0].local_addr().port(), listen_port);
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+                .await
+                .is_err(),
+            "main startup helper returned before pre-binding the Snell port"
+        );
+
+        handles[0].shutdown().await.unwrap();
+        runtime.shutdown().await;
+    }
 }
 
 fn cmd_check(config: PathBuf) -> anyhow::Result<()> {
@@ -862,6 +905,10 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
     // 任何一项失败都会关闭已启动的同类监听并直接返回 cmd_run。
     let mut xhttp_listener_handles =
         start_configured_xhttp_inbounds(&plan, runtime.clone()).await?;
+    // Snell 同样采用预绑定、事务式启动；配置、PSK、混淆或端口有误时，
+    // 不允许进程以“配置存在但监听未运行”的半成功状态继续。
+    let mut snell_listener_handles =
+        start_configured_snell_inbounds(&plan, runtime.clone()).await?;
 
     // 把运行期 LogBus 挂到 tracing 桥上 —— 让 /v1/logs 与 Clash 兼容 /logs WS
     // 流式输出。tracing 可能已被早期初始化占用，所以 observe 层使用可后挂载的
@@ -1110,6 +1157,16 @@ async fn cmd_run(config: PathBuf) -> anyhow::Result<()> {
         warn!(target: "mesh", error = %error, "mesh supervisor stop failed");
     }
     feed_mgr_handle.stop();
+    for listener in &mut snell_listener_handles {
+        if let Err(error) = listener.shutdown().await {
+            warn!(
+                target: "inbound::snell",
+                tag = listener.tag(),
+                %error,
+                "Snell listener shutdown failed"
+            );
+        }
+    }
     for listener in &mut xhttp_listener_handles {
         if let Err(error) = listener.shutdown().await {
             warn!(
@@ -1149,6 +1206,15 @@ async fn start_configured_xhttp_inbounds(
     start_xhttp_listeners(&plan.listen.xhttp, runtime)
         .await
         .context("XHTTP 入站启动失败")
+}
+
+async fn start_configured_snell_inbounds(
+    plan: &core_config::runtime_plan::RuntimePlan,
+    runtime: Arc<Runtime>,
+) -> anyhow::Result<Vec<SnellListenerHandle>> {
+    start_snell_listeners(&plan.listen.snell, runtime)
+        .await
+        .context("Snell 入站启动失败")
 }
 
 /// 把 [`core_ruleset::RulesetIndex`] 适配为 [`core_capture::IpSetProvider`]。
