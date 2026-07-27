@@ -56,6 +56,7 @@ pub mod udp_forwarder;
 pub mod udp_handle;
 pub mod udp_session;
 pub mod uid_filter;
+pub mod wireguard_tun;
 
 pub use android_caps::{AndroidCapability, AndroidTier};
 pub use android_vpn_config::{
@@ -74,6 +75,7 @@ pub use ipset::{
     IpSetSnapshotError, NoopIpSetProvider, noop as noop_ipset_provider,
 };
 pub use nat::{FlowKey, HostPin, NatEntry, NatTable};
+pub use netstack_dispatch::{NetstackDispatcher, NetstackDispatcherHandles};
 pub use packet::{IpHeader, IpVersion, L4, ParsedPacket, TcpFlags, TcpSummary, UdpSummary};
 pub use resource_claims::host_resource_claims;
 pub use route_table::{ManagedRoute, RouteBackend, RouteTable, SystemBackend};
@@ -92,3 +94,4 @@ pub use tun_inbound::{TunDropReason, TunInbound, TunOutboundMeta, TunPacket, Tun
 pub use tun_io::{TunIo, TunIoError, open_tun_device};
 pub use udp_forwarder::{UdpForwarderConfig, run_return_loop, send_one as udp_send_one};
 pub use udp_session::{UdpFlowKey, UdpSession, UdpSessionTable};
+pub use wireguard_tun::WireGuardTunIo;

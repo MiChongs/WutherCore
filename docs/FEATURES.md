@@ -41,7 +41,9 @@
 | 经典 TLS | Trojan、VLESS、VMess | 支持对应 TLS、UUID 与安全参数 |
 | 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC、Naive | Naive 为可选 feature，包含 H2/H3、ECH、填充与 UoT v2，见 [Naive 指南](NAIVE.md) |
 | 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | 按各自握手、加密和复用模型实现 |
-| 系统隧道 | WireGuard、SSH | 密钥或主机校验需要单独配置 |
+| 系统隧道 | WireGuard、SSH | WireGuard 支持用户态 TCP/UDP、双栈、多 Peer 与服务端；密钥或主机校验需要单独配置 |
+
+WireGuard 的字段、约束和完整示例见 [WireGuard 配置](WIREGUARD.md)。
 
 ## 传输与解析
 
