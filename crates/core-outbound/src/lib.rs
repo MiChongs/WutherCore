@@ -1,9 +1,9 @@
 //! core-outbound —— 出站协议适配器。
 //!
 //! §11.2 关键 trait [`OutboundAdapter`]：所有出站使用统一接口。
-//! MVP 阶段实现 direct / block / http / socks5 / shadowsocks（基础 AEAD）。
-//! 其它协议（vmess / vless / trojan / hysteria2 / tuic / wireguard / ssh）
-//! 提供 stub 适配器，并在 dial 时返回"协议尚未实现"。
+//! 除 direct / block / HTTP / SOCKS5 外，也包含 VMess、VLESS、Trojan、
+//! Hysteria、TUIC、WireGuard 等协议的真实数据面；各协议的精确能力以
+//! [`proto`] 模块和注册器校验为准。
 
 // 大多数模块禁 unsafe；adapter 里 Windows IP_UNICAST_IF / macOS IP_BOUND_IF
 // 必须走 raw setsockopt，由 cfg 平台分支控制，按 module 粒度 allow（其它模块

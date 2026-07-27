@@ -11,6 +11,10 @@ readme = "../../README.md"
 keywords = ["proxy", "networking", "tun", "dns", "rust"]
 categories = ["command-line-utilities", "network-programming"]
 
+[features]
+default = []
+naive = ["core-outbound/naive"]
+
 [[bin]]
 name = "wuther-core"
 path = "src/main.rs"
@@ -30,6 +34,7 @@ core-api      = { workspace = true }
 core-capture  = { workspace = true }
 core-mesh     = { workspace = true }
 core-observe  = { workspace = true }
+core-young    = { workspace = true, features = ["firefox-stack"] }
 clap          = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }

@@ -2,7 +2,7 @@
 //!
 //! 内置规则：direct / block 自动注册；其它协议按 [`NodeProtocol`] 选择。
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 
 use base64::Engine as _;
 use core_config::{
@@ -13,6 +13,11 @@ use core_config::{
     node_uri::{NodeProtocol, ParsedNode},
 };
 use uuid::Uuid;
+
+#[cfg(feature = "naive")]
+use crate::proto::naive::{NaiveOutbound, NaiveOutboundConfig};
+#[cfg(feature = "naive")]
+use cronet::Header;
 
 use crate::{
     adapter::SharedOutbound,
@@ -37,11 +42,12 @@ use crate::{
         vless::{VlessNetwork, VlessOutbound},
         vmess::{VmessNetwork, VmessOutbound, VmessSecurity},
         vmess_legacy::VmessLegacyOutbound,
-        wireguard::WireGuardOutbound,
+        wireguard::{WireGuardConfig, WireGuardOutbound, WireGuardPeerConfig},
         xhttp::config::{
             Config as XhttpConfig, DownloadRealitySettings, DownloadSettings,
             DownloadSocketSettings, DownloadTlsSettings, DownloadTransportSettings,
         },
+        young::YoungOutbound,
     },
     socks5::Socks5Outbound,
     stub::StubOutbound,
@@ -121,6 +127,7 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Vmess => return build_vmess(node),
         NodeProtocol::Vless => return build_vless(node),
         NodeProtocol::Trojan => Arc::new(build_trojan(node)?),
+        NodeProtocol::Naive => build_naive(node),
         NodeProtocol::Snell => build_snell(node),
         NodeProtocol::AnyTls => build_anytls(node),
         NodeProtocol::Ssh => build_ssh(node),
@@ -131,6 +138,7 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
         NodeProtocol::Mieru => build_mieru(node),
         NodeProtocol::Sudoku => build_sudoku(node),
         NodeProtocol::TrustTunnel => build_trusttunnel(node),
+        NodeProtocol::Young => build_young(node),
         ref other => StubOutbound::new(node.name.clone(), proto_static_name(other)),
     };
     Ok(outbound)
@@ -139,6 +147,177 @@ pub fn build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
 /// 源码兼容别名；所有调用路径现在都会保留 XHTTP 配置错误。
 pub fn try_build_outbound(node: &ParsedNode) -> Result<SharedOutbound, String> {
     build_outbound(node)
+}
+
+#[cfg(feature = "naive")]
+fn build_naive(node: &ParsedNode) -> SharedOutbound {
+    let mut config = NaiveOutboundConfig::new(&node.host, node.port);
+    config.username = node.user.clone();
+    config.password = node.password.clone();
+    config.server_name = node.sni.clone().filter(|value| !value.is_empty());
+    config.insecure_concurrency =
+        param_usize(node, &["insecure-concurrency", "insecure_concurrency"], 1).max(1);
+    config.udp_over_tcp = node.udp && param_bool(node, &["udp-over-tcp", "udp_over_tcp"], false);
+    config.quic = param_bool(node, &["quic"], false);
+    config.quic_congestion_control = node
+        .params
+        .get("quic-congestion-control")
+        .or_else(|| node.params.get("quic_congestion_control"))
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "" => "",
+            "bbr" => "TBBR",
+            "bbr2" => "B2ON",
+            "cubic" => "QBIC",
+            "reno" => "RENO",
+            _ => value.as_str(),
+        })
+        .unwrap_or_default()
+        .to_owned();
+    config.receive_window = param_u64(node, &["stream-receive-window", "stream_receive_window"], 0);
+    config.quic_session_receive_window = param_u64(
+        node,
+        &["quic-session-receive-window", "quic_session_receive_window"],
+        0,
+    );
+    config.extra_headers = node
+        .params
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("extra-header.")
+                .or_else(|| key.strip_prefix("header."))
+                .map(|name| Header {
+                    name: name.to_owned(),
+                    value: value.clone(),
+                })
+        })
+        .collect();
+
+    if param_bool(
+        node,
+        &[
+            "insecure",
+            "allow-insecure",
+            "allowInsecure",
+            "skip-cert-verify",
+        ],
+        false,
+    ) {
+        tracing::warn!(
+            target: "naive",
+            node = %node.name,
+            "Cronet Naive rejects insecure TLS; configure certificate/certificate_path instead"
+        );
+        return StubOutbound::new(node.name.clone(), "naive(insecure-tls-unsupported)");
+    }
+    if let Some(path) = node
+        .params
+        .get("certificate-path")
+        .or_else(|| node.params.get("certificate_path"))
+    {
+        match std::fs::read_to_string(path) {
+            Ok(certificate) => config.trusted_root_certificates = Some(certificate),
+            Err(error) => {
+                tracing::warn!(
+                    target: "naive",
+                    node = %node.name,
+                    path,
+                    error = %error,
+                    "failed to read Naive certificate_path"
+                );
+                return StubOutbound::new(node.name.clone(), "naive(invalid-certificate-path)");
+            }
+        }
+    } else if let Some(certificate) = node.params.get("certificate") {
+        config.trusted_root_certificates = Some(certificate.clone());
+    }
+    config.ech_enabled = param_bool(
+        node,
+        &["ech", "ech-enabled", "ech_enabled", "ech-enable"],
+        false,
+    );
+    if let Some(encoded) = node
+        .params
+        .get("ech-config")
+        .or_else(|| node.params.get("ech_config"))
+    {
+        match decode_config_blob(encoded) {
+            Some(config_list) => {
+                config.ech_enabled = true;
+                config.ech_config_list = config_list;
+            }
+            None => {
+                return StubOutbound::new(node.name.clone(), "naive(invalid-ech-config)");
+            }
+        }
+    }
+    config.ech_query_server_name = node
+        .params
+        .get("ech-query-server-name")
+        .or_else(|| node.params.get("ech_query_server_name"))
+        .cloned();
+
+    match NaiveOutbound::new(&node.name, config) {
+        Ok(outbound) => Arc::new(outbound),
+        Err(error) => {
+            tracing::warn!(target: "naive", node = %node.name, error = %error, "invalid Naive node");
+            StubOutbound::new(node.name.clone(), "naive(invalid-config)")
+        }
+    }
+}
+
+#[cfg(not(feature = "naive"))]
+fn build_naive(node: &ParsedNode) -> SharedOutbound {
+    StubOutbound::new(node.name.clone(), "naive(feature-disabled)")
+}
+
+#[cfg(feature = "naive")]
+fn param_bool(node: &ParsedNode, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn param_usize(node: &ParsedNode, keys: &[&str], default: usize) -> usize {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn param_u64(node: &ParsedNode, keys: &[&str], default: u64) -> u64 {
+    keys.iter()
+        .find_map(|key| node.params.get(*key))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(feature = "naive")]
+fn decode_config_blob(value: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+
+    let encoded = value
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .collect::<String>()
+        .replace(char::is_whitespace, "");
+    if encoded.len().is_multiple_of(2)
+        && !encoded.is_empty()
+        && encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return hex::decode(&encoded).ok();
+    }
+    STANDARD
+        .decode(&encoded)
+        .ok()
+        .or_else(|| URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('=')).ok())
 }
 
 fn build_shadowsocks(node: &ParsedNode) -> SharedOutbound {
@@ -1592,41 +1771,638 @@ fn parse_tuic_duration(value: &str) -> Option<std::time::Duration> {
 }
 
 fn build_wireguard(node: &ParsedNode) -> SharedOutbound {
-    let priv_b64 = match node
-        .params
-        .get("private-key")
-        .or_else(|| node.password.as_ref())
-    {
-        Some(s) => s,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(missing-private-key)"),
-    };
-    let peer_b64 = match node.params.get("public-key") {
-        Some(s) => s,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(missing-public-key)"),
-    };
-    let priv_key = match decode_b64_32(priv_b64) {
-        Some(k) => k,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(invalid-private-key)"),
-    };
-    let peer_key = match decode_b64_32(peer_b64) {
-        Some(k) => k,
-        None => return StubOutbound::new(node.name.clone(), "wireguard(invalid-public-key)"),
-    };
-    let mut ob = WireGuardOutbound::new(&node.name, &node.host, node.port, priv_key, peer_key);
-    if let Some(psk_b64) = node.params.get("preshared-key") {
-        if let Some(psk) = decode_b64_32(psk_b64) {
-            ob = ob.with_preshared_key(psk);
+    match wireguard_from_node(node) {
+        Ok(outbound) => Arc::new(outbound),
+        Err(reason) => Arc::new(InvalidWireGuardOutbound {
+            name: node.name.clone(),
+            reason,
+        }),
+    }
+}
+
+#[derive(Debug)]
+struct InvalidWireGuardOutbound {
+    name: String,
+    reason: String,
+}
+
+#[async_trait::async_trait]
+impl crate::adapter::OutboundAdapter for InvalidWireGuardOutbound {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn protocol(&self) -> &'static str {
+        "wireguard"
+    }
+
+    fn capabilities(&self) -> crate::adapter::Capabilities {
+        crate::adapter::Capabilities::default()
+    }
+
+    async fn dial_tcp(
+        &self,
+        _context: crate::adapter::DialContext,
+    ) -> std::io::Result<crate::adapter::BoxedStream> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("wireguard node `{}` is invalid: {}", self.name, self.reason),
+        ))
+    }
+
+    async fn dial_udp(
+        &self,
+        _context: crate::adapter::DialContext,
+    ) -> std::io::Result<crate::adapter::BoxedUdp> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("wireguard node `{}` is invalid: {}", self.name, self.reason),
+        ))
+    }
+}
+
+fn wireguard_from_node(node: &ParsedNode) -> Result<WireGuardOutbound, String> {
+    for unsupported in [
+        "system-interface",
+        "system_interface",
+        "dialer-proxy",
+        "dialer_proxy",
+        "amnezia-wg-option",
+        "amnezia_wg_option",
+    ] {
+        if node.params.contains_key(unsupported) {
+            return Err(format!("unsupported-{unsupported}"));
         }
     }
-    if let Some(addr) = node.params.get("address") {
-        for a in addr.split(',') {
-            let a = a.trim().split('/').next().unwrap_or("");
-            if let Ok(ip) = a.parse() {
-                ob = ob.with_local_address(ip);
+    const SUPPORTED_PARAMETERS: &[&str] = &[
+        "private-key",
+        "private_key",
+        "address",
+        "local-address",
+        "local_address",
+        "ip",
+        "ipv6",
+        "peers",
+        "public-key",
+        "public_key",
+        "peer-public-key",
+        "peer_public_key",
+        "pre-shared-key",
+        "pre_shared_key",
+        "preshared-key",
+        "preshared_key",
+        "allowed-ips",
+        "allowed_ips",
+        "reserved",
+        "persistent-keepalive",
+        "persistent_keepalive",
+        "persistent-keepalive-interval",
+        "persistent_keepalive_interval",
+        "keepalive",
+        "mtu",
+        "tcp-buffer-size",
+        "tcp_buffer_size",
+        "udp-buffer-size",
+        "udp_buffer_size",
+        "max-tcp-sessions",
+        "max_tcp_sessions",
+        "max-udp-sessions",
+        "max_udp_sessions",
+        "packet-queue",
+        "packet_queue",
+        "workers",
+        "connect-timeout",
+        "connect_timeout",
+        "udp-timeout",
+        "udp_timeout",
+        "udp-idle-timeout",
+        "udp_idle_timeout",
+        "remote-dns-resolve",
+        "remote_dns_resolve",
+        "dns",
+        "network",
+    ];
+    if let Some(unknown) = node
+        .params
+        .keys()
+        .find(|key| !SUPPORTED_PARAMETERS.contains(&key.as_str()))
+    {
+        return Err(format!("unknown-parameter-{unknown}"));
+    }
+    let private_key = param_alias(node, &["private-key", "private_key"])?
+        .or(node.password.as_deref())
+        .or(node.uuid.as_deref())
+        .ok_or_else(|| "missing-private-key".to_string())
+        .and_then(|value| decode_b64_32(value).ok_or_else(|| "invalid-private-key".into()))?;
+
+    let mut local_addresses = Vec::new();
+    if let Some(value) = param_alias(node, &["address", "local-address", "local_address"])? {
+        local_addresses.extend(parse_ip_nets(value, "address")?);
+    }
+    for key in ["ip", "ipv6"] {
+        if let Some(value) = node.params.get(key) {
+            local_addresses.extend(parse_ip_nets(value, key)?);
+        }
+    }
+    if local_addresses.is_empty() {
+        return Err("missing-local-address".into());
+    }
+
+    let peers = if let Some(value) = node.params.get("peers") {
+        for field in [
+            "public-key",
+            "public_key",
+            "peer-public-key",
+            "peer_public_key",
+            "pre-shared-key",
+            "pre_shared_key",
+            "preshared-key",
+            "preshared_key",
+            "allowed-ips",
+            "allowed_ips",
+            "persistent-keepalive",
+            "persistent_keepalive",
+            "persistent-keepalive-interval",
+            "persistent_keepalive_interval",
+            "keepalive",
+        ] {
+            if node.params.contains_key(field) {
+                return Err(format!("peers-conflicts-with-{field}"));
             }
         }
+        let default_reserved = node
+            .params
+            .get("reserved")
+            .map(|value| parse_reserved(value))
+            .transpose()?
+            .unwrap_or([0; 3]);
+        parse_wireguard_peers(value, default_reserved)?
+    } else {
+        vec![parse_single_wireguard_peer(node, &local_addresses)?]
+    };
+    if peers.is_empty() {
+        return Err("peers-must-not-be-empty".into());
     }
-    Arc::new(ob)
+    let mut config = WireGuardConfig::new(private_key, peers[0].clone());
+    config.peers = peers;
+    config.local_addresses = local_addresses;
+    config.mtu = parse_usize_param(node, &["mtu"], config.mtu)?;
+    config.tcp_buffer_size = parse_usize_param(
+        node,
+        &["tcp-buffer-size", "tcp_buffer_size"],
+        config.tcp_buffer_size,
+    )?;
+    config.udp_buffer_size = parse_usize_param(
+        node,
+        &["udp-buffer-size", "udp_buffer_size"],
+        config.udp_buffer_size,
+    )?;
+    config.max_tcp_sessions = parse_usize_param(
+        node,
+        &["max-tcp-sessions", "max_tcp_sessions"],
+        config.max_tcp_sessions,
+    )?;
+    config.max_udp_sessions = parse_usize_param(
+        node,
+        &["max-udp-sessions", "max_udp_sessions"],
+        config.max_udp_sessions,
+    )?;
+    config.packet_queue =
+        parse_usize_param(node, &["packet-queue", "packet_queue"], config.packet_queue)?;
+    if let Some(workers) = param_alias(node, &["workers"])? {
+        let workers = workers
+            .parse::<usize>()
+            .map_err(|_| "invalid-workers".to_string())?;
+        if workers != 0 {
+            config.workers = workers;
+        }
+    }
+    if let Some(value) = param_alias(node, &["connect-timeout", "connect_timeout"])? {
+        config.connect_timeout =
+            parse_tuic_duration(value).ok_or_else(|| "invalid-connect-timeout".to_string())?;
+    }
+    if let Some(value) = param_alias(
+        node,
+        &[
+            "udp-timeout",
+            "udp_timeout",
+            "udp-idle-timeout",
+            "udp_idle_timeout",
+        ],
+    )? {
+        config.udp_idle_timeout =
+            parse_tuic_duration(value).ok_or_else(|| "invalid-udp-timeout".to_string())?;
+    }
+
+    config.remote_dns_resolve = param_alias(node, &["remote-dns-resolve", "remote_dns_resolve"])?
+        .map(parse_strict_bool)
+        .transpose()?
+        .unwrap_or(false);
+    if let Some(value) = node.params.get("dns") {
+        config.dns = parse_string_list(value)?
+            .into_iter()
+            .map(|value| {
+                value
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("invalid-dns-address-{value}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+
+    if let Some(network) = node.params.get("network") {
+        match network
+            .trim()
+            .to_ascii_lowercase()
+            .replace(' ', "")
+            .as_str()
+        {
+            "tcp" => {
+                config.tcp = true;
+                config.udp = false;
+            }
+            "udp" => {
+                config.tcp = false;
+                config.udp = true;
+            }
+            "tcp,udp" | "udp,tcp" | "both" => {
+                config.tcp = true;
+                config.udp = true;
+            }
+            _ => return Err("invalid-network".into()),
+        }
+    } else {
+        config.udp = node.udp;
+    }
+    config.validate().map_err(|error| error.to_string())?;
+    Ok(WireGuardOutbound::from_config(&node.name, config))
+}
+
+fn parse_single_wireguard_peer(
+    node: &ParsedNode,
+    local_addresses: &[ipnet::IpNet],
+) -> Result<WireGuardPeerConfig, String> {
+    let public_key = param_alias(
+        node,
+        &[
+            "public-key",
+            "public_key",
+            "peer-public-key",
+            "peer_public_key",
+        ],
+    )?
+    .ok_or_else(|| "missing-public-key".to_string())
+    .and_then(|value| decode_b64_32(value).ok_or_else(|| "invalid-public-key".into()))?;
+    let mut peer = WireGuardPeerConfig::new(&node.host, node.port, public_key);
+    peer.preshared_key = param_alias(
+        node,
+        &[
+            "pre-shared-key",
+            "pre_shared_key",
+            "preshared-key",
+            "preshared_key",
+        ],
+    )?
+    .map(|value| decode_b64_32(value).ok_or_else(|| String::from("invalid-preshared-key")))
+    .transpose()?;
+    peer.allowed_ips = match param_alias(node, &["allowed-ips", "allowed_ips"])? {
+        Some(value) => parse_ip_nets(value, "allowed-ips")?,
+        None => default_allowed_ips(local_addresses),
+    };
+    if let Some(value) = node.params.get("reserved") {
+        peer.reserved = parse_reserved(value)?;
+    }
+    if let Some(value) = param_alias(
+        node,
+        &[
+            "persistent-keepalive",
+            "persistent_keepalive",
+            "persistent-keepalive-interval",
+            "persistent_keepalive_interval",
+            "keepalive",
+        ],
+    )? {
+        peer.persistent_keepalive = parse_keepalive(value)?;
+    }
+    Ok(peer)
+}
+
+fn parse_wireguard_peers(
+    value: &str,
+    default_reserved: [u8; 3],
+) -> Result<Vec<WireGuardPeerConfig>, String> {
+    let peers: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| "invalid-peers-json".to_string())?;
+    let peers = peers
+        .as_array()
+        .ok_or_else(|| "peers-must-be-an-array".to_string())?;
+    if peers.is_empty() || peers.len() > super::proto::wireguard::config::MAX_PEERS {
+        return Err(format!(
+            "peers-must-contain-1-to-{}-entries",
+            super::proto::wireguard::config::MAX_PEERS
+        ));
+    }
+    peers
+        .iter()
+        .enumerate()
+        .map(|(index, peer)| {
+            let peer = peer
+                .as_object()
+                .ok_or_else(|| format!("peer-{index}-must-be-an-object"))?;
+            const PEER_FIELDS: &[&str] = &[
+                "server",
+                "address",
+                "port",
+                "server_port",
+                "server-port",
+                "endpoint",
+                "public-key",
+                "public_key",
+                "pre-shared-key",
+                "pre_shared_key",
+                "preshared-key",
+                "preshared_key",
+                "allowed-ips",
+                "allowed_ips",
+                "reserved",
+                "persistent-keepalive",
+                "persistent_keepalive",
+                "persistent-keepalive-interval",
+                "persistent_keepalive_interval",
+                "keepalive",
+            ];
+            if let Some(unknown) = peer.keys().find(|key| !PEER_FIELDS.contains(&key.as_str())) {
+                return Err(format!("peer-{index}-unknown-field-{unknown}"));
+            }
+            let get = |keys: &[&str]| -> Result<Option<&serde_json::Value>, String> {
+                let mut found = None;
+                for key in keys {
+                    if let Some(value) = peer.get(*key) {
+                        if let Some(previous) = found
+                            && previous != value
+                        {
+                            return Err(format!("peer-{index}-conflicting-{key}"));
+                        }
+                        found = Some(value);
+                    }
+                }
+                Ok(found)
+            };
+            let endpoint = get(&["endpoint"])?;
+            let server = get(&["server", "address"])?;
+            let port_value = get(&["port", "server_port", "server-port"])?;
+            let (host, port) = if let Some(endpoint) = endpoint {
+                if server.is_some() || port_value.is_some() {
+                    return Err(format!("peer-{index}-endpoint-conflicts-with-server-port"));
+                }
+                endpoint
+                    .as_str()
+                    .ok_or_else(|| format!("peer-{index}-invalid-endpoint"))
+                    .and_then(|endpoint| parse_wireguard_endpoint(endpoint, index))?
+            } else {
+                let host = server
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|host| !host.trim().is_empty())
+                    .ok_or_else(|| format!("peer-{index}-missing-server"))?;
+                let port = port_value
+                    .and_then(json_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| format!("peer-{index}-invalid-port"))?;
+                (host.to_owned(), port)
+            };
+            let public_key = get(&["public-key", "public_key"])?
+                .and_then(serde_json::Value::as_str)
+                .and_then(decode_b64_32)
+                .ok_or_else(|| format!("peer-{index}-invalid-public-key"))?;
+            let mut parsed = WireGuardPeerConfig::new(host, port, public_key);
+            parsed.reserved = default_reserved;
+            parsed.preshared_key = get(&[
+                "pre-shared-key",
+                "pre_shared_key",
+                "preshared-key",
+                "preshared_key",
+            ])?
+            .map(|value| {
+                value
+                    .as_str()
+                    .and_then(decode_b64_32)
+                    .ok_or_else(|| format!("peer-{index}-invalid-preshared-key"))
+            })
+            .transpose()?;
+            let allowed = get(&["allowed-ips", "allowed_ips"])?
+                .ok_or_else(|| format!("peer-{index}-missing-allowed-ips"))?;
+            parsed.allowed_ips = parse_json_ip_nets(allowed, &format!("peer-{index}-allowed-ips"))?;
+            if let Some(reserved) = get(&["reserved"])? {
+                parsed.reserved = parse_reserved_json(reserved)?;
+            }
+            if let Some(keepalive) = get(&[
+                "persistent-keepalive",
+                "persistent_keepalive",
+                "persistent-keepalive-interval",
+                "persistent_keepalive_interval",
+                "keepalive",
+            ])? {
+                let keepalive = json_u64(keepalive)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .ok_or_else(|| format!("peer-{index}-invalid-persistent-keepalive"))?;
+                parsed.persistent_keepalive = (keepalive != 0).then_some(keepalive);
+            }
+            Ok(parsed)
+        })
+        .collect()
+}
+
+fn parse_wireguard_endpoint(value: &str, peer_index: usize) -> Result<(String, u16), String> {
+    let value = value.trim();
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| format!("peer-{peer_index}-invalid-endpoint"))?;
+    let host = host
+        .trim()
+        .trim_matches(|character| character == '[' || character == ']');
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("peer-{peer_index}-invalid-endpoint-port"))?;
+    if host.is_empty() {
+        return Err(format!("peer-{peer_index}-invalid-endpoint-host"));
+    }
+    Ok((host.to_owned(), port))
+}
+
+fn default_allowed_ips(local_addresses: &[ipnet::IpNet]) -> Vec<ipnet::IpNet> {
+    let mut routes = Vec::new();
+    if local_addresses
+        .iter()
+        .any(|address| address.addr().is_ipv4())
+    {
+        routes.push("0.0.0.0/0".parse().expect("static IPv4 route"));
+    }
+    if local_addresses
+        .iter()
+        .any(|address| address.addr().is_ipv6())
+    {
+        routes.push("::/0".parse().expect("static IPv6 route"));
+    }
+    routes
+}
+
+fn parse_ip_nets(value: &str, field: &str) -> Result<Vec<ipnet::IpNet>, String> {
+    parse_string_list(value)?
+        .into_iter()
+        .map(|value| parse_ip_net(&value).map_err(|_| format!("invalid-{field}-{value}")))
+        .collect()
+}
+
+fn parse_json_ip_nets(value: &serde_json::Value, field: &str) -> Result<Vec<ipnet::IpNet>, String> {
+    let values = match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| format!("invalid-{field}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::String(value) => parse_string_list(value)?,
+        _ => return Err(format!("invalid-{field}")),
+    };
+    values
+        .into_iter()
+        .map(|value| parse_ip_net(&value).map_err(|_| format!("invalid-{field}-{value}")))
+        .collect()
+}
+
+fn parse_ip_net(value: &str) -> Result<ipnet::IpNet, ()> {
+    if let Ok(network) = value.trim().parse::<ipnet::IpNet>() {
+        return Ok(network);
+    }
+    let ip = value.trim().parse::<IpAddr>().map_err(|_| ())?;
+    ipnet::IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).map_err(|_| ())
+}
+
+fn parse_string_list(value: &str) -> Result<Vec<String>, String> {
+    let value = value.trim();
+    if value.starts_with('[') {
+        let values: Vec<serde_json::Value> =
+            serde_json::from_str(value).map_err(|_| "invalid-list-json".to_string())?;
+        return values
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(value) => Ok(value),
+                serde_json::Value::Number(value) => Ok(value.to_string()),
+                _ => Err("list-values-must-be-scalars".into()),
+            })
+            .collect();
+    }
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err("list-must-not-be-empty".into())
+    } else {
+        Ok(values)
+    }
+}
+
+fn parse_reserved(value: &str) -> Result<[u8; 3], String> {
+    if value.trim().starts_with('[') {
+        let value = serde_json::from_str(value).map_err(|_| "invalid-reserved".to_string())?;
+        return parse_reserved_json(&value);
+    }
+    let comma = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>();
+    if let Ok(bytes) = comma
+        && let Ok(bytes) = <[u8; 3]>::try_from(bytes)
+    {
+        return Ok(bytes);
+    }
+    use base64::Engine;
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
+        if let Ok(bytes) = engine.decode(value.trim())
+            && let Ok(bytes) = <[u8; 3]>::try_from(bytes)
+        {
+            return Ok(bytes);
+        }
+    }
+    Err("invalid-reserved".into())
+}
+
+fn parse_reserved_json(value: &serde_json::Value) -> Result<[u8; 3], String> {
+    match value {
+        serde_json::Value::String(value) => parse_reserved(value),
+        serde_json::Value::Array(values) if values.len() == 3 => {
+            let mut output = [0; 3];
+            for (index, value) in values.iter().enumerate() {
+                output[index] = json_u64(value)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| "invalid-reserved".to_string())?;
+            }
+            Ok(output)
+        }
+        _ => Err("invalid-reserved".into()),
+    }
+}
+
+fn parse_keepalive(value: &str) -> Result<Option<u16>, String> {
+    let value = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "invalid-persistent-keepalive".to_string())?;
+    Ok((value != 0).then_some(value))
+}
+
+fn parse_usize_param(node: &ParsedNode, aliases: &[&str], default: usize) -> Result<usize, String> {
+    param_alias(node, aliases)?
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid-{}", aliases[0]))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn param_alias<'a>(node: &'a ParsedNode, aliases: &[&str]) -> Result<Option<&'a str>, String> {
+    let mut found = None;
+    for alias in aliases {
+        if let Some(value) = node.params.get(*alias) {
+            if let Some(previous) = found
+                && previous != value
+            {
+                return Err(format!("conflicting-{}", aliases[0]));
+            }
+            found = Some(value.as_str());
+        }
+    }
+    Ok(found)
+}
+
+fn parse_strict_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("invalid-boolean-{value}")),
+    }
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 fn build_mieru(node: &ParsedNode) -> SharedOutbound {
@@ -1752,11 +2528,89 @@ fn build_trusttunnel(node: &ParsedNode) -> SharedOutbound {
     Arc::new(ob)
 }
 
+fn build_young(node: &ParsedNode) -> SharedOutbound {
+    let encoded_key = node
+        .user
+        .as_deref()
+        .or(node.password.as_deref())
+        .unwrap_or_default();
+    let key = match core_young::YoungKey::parse_base64url(encoded_key) {
+        Ok(key) => key,
+        Err(_) => return StubOutbound::new(node.name.clone(), "young(invalid-key)"),
+    };
+    let encoded_pin = node
+        .params
+        .get("pin-sha256")
+        .or_else(|| node.params.get("pin_sha256"))
+        .or_else(|| node.params.get("pin"))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let pin = if encoded_pin.len() == 64 && encoded_pin.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        hex::decode(encoded_pin).ok()
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_pin)
+            .ok()
+    };
+    let Some(certificate_sha256) = pin.and_then(|pin| pin.try_into().ok()) else {
+        return StubOutbound::new(node.name.clone(), "young(invalid-certificate-pin)");
+    };
+    let server_name = node.sni.clone().unwrap_or_else(|| node.host.clone());
+    let authority = node
+        .params
+        .get("authority")
+        .cloned()
+        .unwrap_or_else(|| server_name.clone());
+    let padding_min = node
+        .params
+        .get("padding-min")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(64);
+    let padding_max = node
+        .params
+        .get("padding-max")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(512);
+    if padding_min > padding_max || usize::from(padding_max) > core_young::MAX_PADDING_BYTES {
+        return StubOutbound::new(node.name.clone(), "young(invalid-padding)");
+    }
+    let config = core_young::YoungClientConfig {
+        server: node.host.clone(),
+        port: node.port,
+        server_name,
+        authority,
+        path: node
+            .params
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "/assets".into()),
+        key,
+        certificate_sha256,
+        idle_timeout: std::time::Duration::from_secs(
+            node.params
+                .get("idle-secs")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        ),
+        max_streams: node
+            .params
+            .get("max-streams")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024),
+        padding_min,
+        padding_max,
+    };
+    Arc::new(YoungOutbound::new(&node.name, config))
+}
+
 fn decode_b64_32(s: &str) -> Option<[u8; 32]> {
     use base64::Engine;
-    let v = base64::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .ok()?;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let value = s.trim();
+    let v = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode(value).ok())?;
     if v.len() != 32 {
         return None;
     }
@@ -1773,6 +2627,7 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
         NodeProtocol::Vmess => "vmess",
         NodeProtocol::Vless => "vless",
         NodeProtocol::Trojan => "trojan",
+        NodeProtocol::Naive => "naive",
         NodeProtocol::Hysteria => "hysteria",
         NodeProtocol::Hysteria2 => "hysteria2",
         NodeProtocol::Tuic => "tuic",
@@ -1783,6 +2638,7 @@ fn proto_static_name(p: &NodeProtocol) -> &'static str {
         NodeProtocol::Mieru => "mieru",
         NodeProtocol::Sudoku => "sudoku",
         NodeProtocol::TrustTunnel => "trusttunnel",
+        NodeProtocol::Young => "young",
         _ => "stub",
     }
 }
@@ -1796,10 +2652,47 @@ mod tests {
     };
     use uuid::Uuid;
 
+    #[cfg(feature = "naive")]
+    use super::decode_config_blob;
     use super::{
         DownloadTlsSettings, build_outbound, build_trojan, build_xhttp_options, tuic_from_node,
+        wireguard_from_node,
     };
     use crate::proto::tuic::TuicUdpMode;
+
+    #[cfg(feature = "naive")]
+    #[test]
+    fn naive_registry_enables_uot_and_rejects_unsafe_combinations() {
+        let mut node = ParsedNode::new("naive", NodeProtocol::Naive, "proxy.example", 443);
+        node.udp = true;
+        node.params.insert("udp-over-tcp".into(), "true".into());
+        let outbound = build_outbound(&node).unwrap();
+        assert_eq!(outbound.protocol(), "naive");
+        assert!(outbound.capabilities().tcp);
+        assert!(outbound.capabilities().udp);
+
+        node.params.insert("quic".into(), "true".into());
+        node.params
+            .insert("insecure-concurrency".into(), "2".into());
+        assert_eq!(
+            build_outbound(&node).unwrap().protocol(),
+            "naive(invalid-config)"
+        );
+
+        node.params.insert("insecure".into(), "true".into());
+        assert_eq!(
+            build_outbound(&node).unwrap().protocol(),
+            "naive(insecure-tls-unsupported)"
+        );
+    }
+
+    #[cfg(feature = "naive")]
+    #[test]
+    fn naive_registry_decodes_ech_config_formats() {
+        assert_eq!(decode_config_blob("000102ff"), Some(vec![0, 1, 2, 255]));
+        assert_eq!(decode_config_blob("AAEC/w=="), Some(vec![0, 1, 2, 255]));
+        assert_eq!(decode_config_blob("%%%"), None);
+    }
 
     #[test]
     fn ss2022_registry_preserves_udp_flag_and_eih_chain() {
@@ -2466,5 +3359,148 @@ mod tests {
         );
         let error = build_xhttp_options(&conflicting, None, false, vec![]).unwrap_err();
         assert!(error.contains("必须语义等价"), "error={error}");
+    }
+
+    fn wireguard_node() -> ParsedNode {
+        let mut node = ParsedNode::new("wg", NodeProtocol::Wireguard, "127.0.0.1", 51_820);
+        node.params.insert(
+            "private-key".into(),
+            base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+        );
+        node.params.insert(
+            "public-key".into(),
+            base64::engine::general_purpose::STANDARD.encode([2u8; 32]),
+        );
+        node.params.insert("ip".into(), "10.0.0.2/32".into());
+        node.params.insert("ipv6".into(), "fd00::2/128".into());
+        node
+    }
+
+    #[test]
+    fn wireguard_registry_maps_complete_single_peer_config() {
+        let mut node = wireguard_node();
+        node.params
+            .insert("allowed-ips".into(), "[\"10.0.0.0/8\",\"fd00::/8\"]".into());
+        node.params.insert("reserved".into(), "[1,2,3]".into());
+        node.params
+            .insert("persistent-keepalive".into(), "17".into());
+        node.params.insert("mtu".into(), "1380".into());
+        node.params
+            .insert("tcp-buffer-size".into(), "131072".into());
+        node.params.insert("udp-buffer-size".into(), "65536".into());
+        node.params.insert("max-tcp-sessions".into(), "99".into());
+        node.params.insert("max-udp-sessions".into(), "88".into());
+        node.params.insert("packet-queue".into(), "256".into());
+        node.params.insert("workers".into(), "4".into());
+        node.params.insert("connect-timeout".into(), "3s".into());
+        node.params.insert("udp-timeout".into(), "45s".into());
+        node.params
+            .insert("remote-dns-resolve".into(), "true".into());
+        node.params.insert("dns".into(), "[\"10.0.0.53\"]".into());
+        node.params.insert("network".into(), "tcp,udp".into());
+
+        let outbound = wireguard_from_node(&node).unwrap();
+        let config = outbound.config();
+        assert_eq!(config.local_addresses.len(), 2);
+        assert_eq!(config.peers[0].allowed_ips.len(), 2);
+        assert_eq!(config.peers[0].reserved, [1, 2, 3]);
+        assert_eq!(config.peers[0].persistent_keepalive, Some(17));
+        assert_eq!(config.mtu, 1380);
+        assert_eq!(config.tcp_buffer_size, 131_072);
+        assert_eq!(config.udp_buffer_size, 65_536);
+        assert_eq!(config.max_tcp_sessions, 99);
+        assert_eq!(config.max_udp_sessions, 88);
+        assert_eq!(config.packet_queue, 256);
+        assert_eq!(config.workers, 4);
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(config.udp_idle_timeout, std::time::Duration::from_secs(45));
+        assert!(config.remote_dns_resolve);
+        assert_eq!(
+            config.dns,
+            ["10.0.0.53".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert!(config.tcp && config.udp);
+    }
+
+    #[test]
+    fn wireguard_registry_maps_multi_peer_and_url_safe_keys() {
+        let mut node = wireguard_node();
+        node.params.insert(
+            "private-key".into(),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xfbu8; 32]),
+        );
+        node.params.remove("public-key");
+        node.params.insert("reserved".into(), "[5,6,7]".into());
+        node.params.insert("workers".into(), "0".into());
+        node.params.insert(
+            "peers".into(),
+            serde_json::json!([
+                {
+                    "server": "127.0.0.1",
+                    "port": 51820,
+                    "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]),
+                    "allowed_ips": ["10.0.0.0/8"],
+                    "reserved": [9, 8, 7]
+                },
+                {
+                    "endpoint": "[::1]:51821",
+                    "public-key": base64::engine::general_purpose::STANDARD.encode([4u8; 32]),
+                    "allowed-ips": ["fd00::/8"],
+                    "persistent_keepalive_interval": 0
+                }
+            ])
+            .to_string(),
+        );
+        let outbound = wireguard_from_node(&node).unwrap();
+        assert_eq!(outbound.config().peers.len(), 2);
+        assert_eq!(outbound.config().peers[0].reserved, [9, 8, 7]);
+        assert_eq!(outbound.config().peers[1].endpoint_host, "::1");
+        assert_eq!(outbound.config().peers[1].endpoint_port, 51_821);
+        assert_eq!(outbound.config().peers[1].reserved, [5, 6, 7]);
+        assert_eq!(outbound.config().peers[1].persistent_keepalive, None);
+        assert!((1..=64).contains(&outbound.config().workers));
+    }
+
+    #[test]
+    fn wireguard_registry_rejects_conflicts_and_invalid_bounds() {
+        let mut node = wireguard_node();
+        node.params.insert("private_key".into(), "different".into());
+        assert!(
+            wireguard_from_node(&node)
+                .unwrap_err()
+                .contains("conflicting")
+        );
+
+        let mut node = wireguard_node();
+        node.params.insert("mtu".into(), "70000".into());
+        let outbound = build_outbound(&node).unwrap();
+        assert_eq!(outbound.protocol(), "wireguard");
+        assert!(!outbound.capabilities().tcp);
+        assert!(!outbound.capabilities().udp);
+
+        let mut node = wireguard_node();
+        node.params.insert("workres".into(), "8".into());
+        assert_eq!(
+            wireguard_from_node(&node).unwrap_err(),
+            "unknown-parameter-workres"
+        );
+
+        let mut node = wireguard_node();
+        node.params.remove("public-key");
+        node.params.insert(
+            "peers".into(),
+            serde_json::json!([{
+                "endpoint": "127.0.0.1:51820",
+                "public-key": base64::engine::general_purpose::STANDARD.encode([3u8; 32]),
+                "allowed-ips": ["10.0.0.0/8"],
+                "typo": true
+            }])
+            .to_string(),
+        );
+        assert!(
+            wireguard_from_node(&node)
+                .unwrap_err()
+                .contains("unknown-field-typo")
+        );
     }
 }

@@ -39,9 +39,11 @@
 | 通用代理 | HTTP、SOCKS5 | 支持认证；UDP 能力由具体实现决定 |
 | Shadowsocks | Shadowsocks、Shadowsocks 2022、SSR | 包含多种 AEAD/流加密与 SSR 组件 |
 | 经典 TLS | Trojan、VLESS、VMess | 支持对应 TLS、UUID 与安全参数 |
-| 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC | 包含 TLS/QUIC 路径与协议参数 |
+| 现代隧道 | AnyTLS、Hysteria、Hysteria 2、TUIC、Naive | Naive 为可选 feature，包含 H2/H3、ECH、填充与 UoT v2，见 [Naive 指南](NAIVE.md) |
 | 专用协议 | Snell、Mieru、Sudoku、TrustTunnel | 按各自握手、加密和复用模型实现 |
-| 系统隧道 | WireGuard、SSH | 密钥或主机校验需要单独配置 |
+| 系统隧道 | WireGuard、SSH | WireGuard 支持用户态 TCP/UDP、双栈、多 Peer 与服务端；密钥或主机校验需要单独配置 |
+
+WireGuard 的字段、约束和完整示例见 [WireGuard 配置](WIREGUARD.md)。
 
 ## 传输与解析
 
@@ -74,6 +76,7 @@
 - 透明代理依赖系统权限和外部网络状态，无法只靠单元测试覆盖。
 - 当前配置与 API 尚未承诺 1.0 级别的长期稳定性。
 - Android VpnService 需要宿主应用负责生命周期、权限申请和文件描述符传递。
+- Naive 依赖 GPL-3.0-or-later 的 Cronet 组件和平台动态库，默认 MIT 构建与默认 Release 不启用。
 - CodeQL 初始告警正在 [Issue #9](https://github.com/MiChongs/WutherCore/issues/9) 中逐条分类。
 
 ## 判断是否适合使用

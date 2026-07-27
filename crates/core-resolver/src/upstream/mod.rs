@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub mod hickory;
 pub mod marked;
+pub mod outbound;
 pub mod quic;
 pub mod system;
 
