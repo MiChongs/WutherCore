@@ -8,7 +8,11 @@
 //! 共同消费的 *已展开* 数据，而非 YAML 原貌。
 
 use std::{
+<<<<<<< HEAD
     collections::{BTreeMap, HashSet},
+=======
+    collections::BTreeMap,
+>>>>>>> origin/main
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -46,12 +50,17 @@ pub struct ListenPlan {
     #[serde(default)]
     pub reality: Vec<RealityListen>,
     #[serde(default)]
+<<<<<<< HEAD
     pub wireguard: Vec<WireGuardListenPlan>,
+=======
+    pub young: Vec<YoungListen>,
+>>>>>>> origin/main
     pub panel: Option<PanelListen>,
     pub share: Share,
     pub auth: Vec<UserPass>,
 }
 
+<<<<<<< HEAD
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WireGuardListenPlan {
     pub bind: SocketAddr,
@@ -98,6 +107,19 @@ impl std::fmt::Debug for WireGuardListenPeerPlan {
             .field("reserved", &self.reserved)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .finish()
+=======
+impl YoungListen {
+    pub fn socket_addr(&self) -> ConfigResult<SocketAddr> {
+        let host = self.host.trim();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(host);
+        let ip = host
+            .parse::<IpAddr>()
+            .map_err(|_| ConfigError::invalid(format!("非法 Young 监听 IP: {}", self.host)))?;
+        Ok(SocketAddr::new(ip, self.port))
+>>>>>>> origin/main
     }
 }
 
@@ -261,7 +283,11 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         share: None,
         auth: vec![],
         reality: vec![],
+<<<<<<< HEAD
         wireguard: vec![],
+=======
+        young: vec![],
+>>>>>>> origin/main
     });
 
     let share = listen.share.unwrap_or(Share::False);
@@ -336,18 +362,27 @@ fn compile_listen(cfg: &UserConfig) -> ConfigResult<ListenPlan> {
         .collect();
 
     let reality = compile_reality_listeners(&listen.reality)?;
+<<<<<<< HEAD
     let wireguard = compile_wireguard_listeners(&listen.wireguard)?;
+=======
+    let young = compile_young_listeners(&listen.young)?;
+>>>>>>> origin/main
 
     Ok(ListenPlan {
         mixed,
         reality,
+<<<<<<< HEAD
         wireguard,
+=======
+        young,
+>>>>>>> origin/main
         panel,
         share,
         auth,
     })
 }
 
+<<<<<<< HEAD
 fn compile_wireguard_listeners(
     listeners: &[WireGuardListen],
 ) -> ConfigResult<Vec<WireGuardListenPlan>> {
@@ -484,6 +519,94 @@ fn decode_wireguard_key(value: &str, location: &str) -> ConfigResult<[u8; 32]> {
     decoded
         .try_into()
         .map_err(|_| ConfigError::invalid("WireGuard 密钥必须解码为 32 字节").at(location))
+=======
+fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungListen>> {
+    let mut output = Vec::with_capacity(listeners.len());
+    let mut bound = std::collections::HashSet::new();
+    let mut nss_database: Option<&str> = None;
+    for (index, listener) in listeners.iter().enumerate() {
+        let location = format!("listen.young[{index}]");
+        if listener.port == 0 {
+            return Err(ConfigError::invalid("Young 入站端口不能为 0").at(location));
+        }
+        if listener.host.trim().is_empty() {
+            return Err(ConfigError::invalid("Young 入站 host 不能为空").at(location));
+        }
+        let listen_addr = listener
+            .socket_addr()
+            .map_err(|error| error.at(location.clone()))?;
+        if !bound.insert(listen_addr) {
+            return Err(ConfigError::invalid("重复的 Young 监听地址").at(location));
+        }
+        if listener.nss_database.trim().is_empty()
+            || listener.certificate_nickname.trim().is_empty()
+        {
+            return Err(ConfigError::invalid(
+                "Young 入站必须配置 nssDatabase 与 certificateNickname",
+            )
+            .at(location));
+        }
+        if let Some(existing) = nss_database {
+            if existing != listener.nss_database {
+                return Err(ConfigError::invalid(
+                    "同一进程的全部 Young 入站必须使用同一个 nssDatabase",
+                )
+                .at(format!("{location}.nssDatabase")));
+            }
+        } else {
+            nss_database = Some(&listener.nss_database);
+        }
+        if listener.authority.trim().is_empty() {
+            return Err(ConfigError::invalid("Young authority 不能为空")
+                .at(format!("{location}.authority")));
+        }
+        if !listener.path.starts_with('/') || listener.path.len() > 512 {
+            return Err(
+                ConfigError::invalid("Young path 必须以 / 开头且不超过 512 字节")
+                    .at(format!("{location}.path")),
+            );
+        }
+        if listener.users.is_empty() {
+            return Err(
+                ConfigError::invalid("Young 入站至少需要一个 256 位 users 密钥")
+                    .at(format!("{location}.users")),
+            );
+        }
+        let keys = listener
+            .users
+            .iter()
+            .enumerate()
+            .map(|(user_index, user)| {
+                core_young::YoungKey::parse_base64url(user).map_err(|error| {
+                    ConfigError::invalid(format!("非法 Young 256 位密钥：{error}"))
+                        .at(format!("{location}.users[{user_index}]"))
+                })
+            })
+            .collect::<ConfigResult<Vec<_>>>()?;
+        core_young::KeyRing::new(keys).map_err(|error| {
+            ConfigError::invalid(format!("Young users key ring 无效：{error}"))
+                .at(format!("{location}.users"))
+        })?;
+        if !(Duration::from_secs(10)..=Duration::from_secs(10 * 60)).contains(&listener.clock_skew)
+        {
+            return Err(ConfigError::invalid("Young clockSkew 必须在 10s..=10m")
+                .at(format!("{location}.clockSkew")));
+        }
+        if listener.idle_timeout < Duration::from_secs(10)
+            || listener.max_streams == 0
+            || listener.max_sessions == 0
+            || listener.max_flows_per_session == 0
+        {
+            return Err(ConfigError::invalid("Young idleTimeout/资源上限无效").at(location));
+        }
+        if !(100..=599).contains(&listener.decoy_status) || listener.decoy_body.len() > 1024 * 1024
+        {
+            return Err(ConfigError::invalid("Young decoyStatus/decoyBody 无效").at(location));
+        }
+        output.push(listener.clone());
+    }
+    Ok(output)
+>>>>>>> origin/main
 }
 
 fn compile_reality_listeners(listeners: &[RealityListen]) -> ConfigResult<Vec<RealityListen>> {
@@ -2328,6 +2451,76 @@ listen:
             let error = crate::loader::load_from_str(yaml).unwrap_err();
             assert!(error.to_string().contains("端口不能为 0"));
         }
+    }
+
+    #[test]
+    fn young_listener_compiles_with_ipv6_and_key_ring() {
+        let plan = compile_cfg(&format!(
+            r#"
+version: 1
+profile: server
+listen:
+  young:
+    - host: "::1"
+      port: 2443
+      nssDatabase: data/nss
+      certificateNickname: young.example
+      authority: young.example
+      path: /assets
+      users: [{}]
+"#,
+            base64url_bytes(9, 32)
+        ));
+        assert_eq!(plan.listen.young.len(), 1);
+        assert_eq!(
+            plan.listen.young[0].socket_addr().unwrap(),
+            "[::1]:2443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn young_listener_rejects_duplicate_keys_and_mixed_nss_databases() {
+        let key = base64url_bytes(11, 32);
+        let duplicate = crate::loader::load_from_str(&format!(
+            r#"
+version: 1
+profile: server
+listen:
+  young:
+    - port: 2443
+      nssDatabase: data/nss
+      certificateNickname: young.example
+      authority: young.example
+      users: [{key}, {key}]
+"#
+        ))
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("重复 key id"));
+
+        let mixed_databases = crate::loader::load_from_str(&format!(
+            r#"
+version: 1
+profile: server
+listen:
+  young:
+    - port: 2443
+      nssDatabase: data/nss-a
+      certificateNickname: young-a.example
+      authority: young-a.example
+      users: [{key}]
+    - port: 2444
+      nssDatabase: data/nss-b
+      certificateNickname: young-b.example
+      authority: young-b.example
+      users: [{key}]
+"#
+        ))
+        .unwrap_err();
+        assert!(
+            mixed_databases
+                .to_string()
+                .contains("必须使用同一个 nssDatabase")
+        );
     }
 
     #[test]

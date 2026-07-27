@@ -167,6 +167,8 @@ struct SupervisorResources {
     dispatcher: Option<DispatcherHandles>,
     sys_proxy: Option<SystemProxyGuard>,
     outbound_fwmark: Option<OutboundFwmarkLease>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    crash_recovery: Option<crate::platform::linux_recovery::LinuxCaptureGuard>,
 }
 
 impl SupervisorResources {
@@ -234,6 +236,12 @@ impl SupervisorResources {
                         }
                     }
                 }
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if engine_result.is_ok() || !stop_engine {
+            if let Some(guard) = self.crash_recovery.take() {
+                guard.mark_clean()?;
             }
         }
         engine_result
@@ -646,6 +654,12 @@ impl CaptureSupervisor {
         }
         transaction.resources_mut().outbound_fwmark =
             OutboundFwmarkLease::install(runtime.capture_outbound_fwmark())?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.plan.kind != EngineKind::Tun {
+            transaction.resources_mut().crash_recovery = Some(
+                crate::platform::linux_recovery::LinuxCaptureGuard::acquire(&self.plan)?,
+            );
+        }
         transaction.mark_engine_started();
 
         let start_result: Result<(), CaptureError> = async {

@@ -42,11 +42,26 @@ pub(crate) fn listener_resource_claims(plan: &RuntimePlan) -> Result<Vec<HostRes
         ));
     }
 
+<<<<<<< HEAD
     for listener in &plan.listen.wireguard {
         claims.insert(socket_claim(
             host_owner("wuther.wireguard"),
             SocketTransport::Udp,
             listener.bind,
+=======
+    for young in &plan.listen.young {
+        let address = young
+            .socket_addr()
+            .map_err(|error| anyhow::anyhow!("Young listener declaration failed: {error}"))?;
+        ensure!(
+            address.port() != 0,
+            "Young listener port 0 cannot be reserved"
+        );
+        claims.insert(socket_claim(
+            host_owner("wuther.young"),
+            SocketTransport::Udp,
+            address,
+>>>>>>> origin/main
         ));
     }
 

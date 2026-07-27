@@ -15,7 +15,11 @@ pub fn apply_defaults(cfg: &mut UserConfig) {
         share: None,
         auth: vec![],
         reality: vec![],
+<<<<<<< HEAD
         wireguard: vec![],
+=======
+        young: vec![],
+>>>>>>> origin/main
     });
     if listen.local.is_none() {
         listen.local = match profile {

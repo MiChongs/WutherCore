@@ -30,6 +30,7 @@ core-api      = { workspace = true }
 core-capture  = { workspace = true }
 core-mesh     = { workspace = true }
 core-observe  = { workspace = true }
+core-young    = { workspace = true, features = ["firefox-stack"] }
 clap          = { workspace = true }
 tokio         = { workspace = true }
 anyhow        = { workspace = true }

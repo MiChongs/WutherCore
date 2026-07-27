@@ -72,6 +72,7 @@ struct TunState {
     redirect_listeners: Vec<RedirectTcpListener>,
     redirect_backend: Option<AutoRedirectBackend>,
     redirect_route_lease: Option<AutoRedirectRouteLease>,
+    crash_recovery: Option<crate::platform::linux_recovery::LinuxCaptureGuard>,
     redirect_tasks: Option<JoinSet<()>>,
     redirect_stops: Vec<oneshot::Sender<()>>,
 }
@@ -648,6 +649,12 @@ impl CaptureEngine for LinuxTun {
             ));
         }
         if manage_linux_config {
+            // The device is now known to be root-managed rather than an
+            // Android VpnService fd. Persist crash ownership before the first
+            // route, rule, firewall, or interface mutation.
+            g.crash_recovery = Some(crate::platform::linux_recovery::LinuxCaptureGuard::acquire(
+                &effective_plan,
+            )?);
             Self::configure_iface(&effective_plan, device.as_ref())?;
 
             // Bind every required address family before routes or firewall
@@ -1047,6 +1054,9 @@ impl CaptureEngine for LinuxTun {
             "ip",
             &["tuntap", "del", "dev", &plan.interface_name, "mode", "tun"],
         );
+        if let Some(guard) = g.crash_recovery.take() {
+            guard.mark_clean()?;
+        }
         g.started = false;
         g.effective_plan = None;
         info!(target: "capture", iface = %plan.interface_name, "linux tun stopped");
