@@ -130,13 +130,13 @@ jobs:
 
       - name: Install cargo-ndk
         if: matrix.platform.is_android == true
-        uses: taiki-e/install-action@v2.84.0
+        uses: taiki-e/install-action@v2.85.2
         with:
           tool: cargo-ndk@4.1.2
 
       - name: Install Cross
         if: matrix.platform.is_android != true
-        uses: taiki-e/install-action@v2.84.0
+        uses: taiki-e/install-action@v2.85.2
         with:
           tool: cross@0.2.5
 
