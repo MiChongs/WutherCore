@@ -4732,7 +4732,6 @@ dependencies = [
 [[package]]
 name = "nss-rs"
 version = "0.13.4"
-source = "git+https://github.com/mozilla/nss-rs#b7cfa30c8a526167cf6bd653b4a6d4f8549280eb"
 dependencies = [
  "bindgen 0.72.1",
  "enum-map",
@@ -4745,7 +4744,7 @@ dependencies = [
  "strum 0.27.2",
  "thiserror 2.0.19",
  "toml 0.9.12+spec-1.1.0",
- "windows 0.62.2",
+ "windows 0.61.3",
  "zeroize",
 ]
 

@@ -1,0 +1,200 @@
+name: Setup Android NSS
+description: Cross-compile the static NSS libraries nss-rs links into Android builds.
+
+# Upstream nss-rs builds NSS itself, but only for the host: its build.sh call
+# passes no Android toolchain. The one maintained NSS cross build is
+# mozilla/application-services' build-nss-android.sh, which is what Firefox for
+# Android uses. This action drives that script directly rather than through
+# mozilla/actions/nss, because that action derives the Android API level from
+# the NDK's major version number, which would silently raise this project's
+# minimum supported Android release.
+
+inputs:
+  target:
+    description: Rust target triple to build NSS for.
+    required: true
+  api-level:
+    description: Android API level; must match the one used to compile Rust.
+    required: true
+  ndk-home:
+    description: Path to the Android NDK.
+    required: true
+  nss-version:
+    description: NSS release to build.
+    required: false
+    default: "3.125"
+  nss-sha256:
+    description: SHA-256 of the NSS release tarball.
+    required: false
+    default: "1ad541f10da7c58dec01f540ecc44d28cbbc033f741a57473de5a0893d91606d"
+  nspr-version:
+    description: NSPR release to build.
+    required: false
+    default: "4.39"
+  nspr-sha256:
+    description: SHA-256 of the NSPR release tarball.
+    required: false
+    default: "bbd02ee87a55676063a63e5bc819e0227de2666b47307b2a0134414cdf42368e"
+  appservices-version:
+    description: application-services tag supplying the NSS Android build scripts.
+    required: false
+    default: "v153.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve NSS toolchain
+      id: toolchain
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        # build-nss-android.sh only recognizes these three toolchain triples.
+        # Rust's armv7-linux-androideabi and NSS's arm-linux-androideabi are
+        # both armeabi-v7a; build-android-common.sh compiles the latter with
+        # the armv7a-linux-androideabi clang driver.
+        case "$TARGET" in
+        aarch64-linux-android) toolchain=aarch64-linux-android ;;
+        armv7-linux-androideabi) toolchain=arm-linux-androideabi ;;
+        x86_64-linux-android) toolchain=x86_64-linux-android ;;
+        *)
+          echo "::error::No NSS Android build chain for $TARGET."
+          exit 1
+          ;;
+        esac
+        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+        echo "root=$GITHUB_WORKSPACE/.nss-android" >> "$GITHUB_OUTPUT"
+
+    # nss-rs resolves headers and libraries relative to NSS_DIR: it reads
+    # $NSS_DIR/../dist/Release/lib, $NSS_DIR/../dist/Release/include/nspr and
+    # $NSS_DIR/../dist/public/nss. Everything below keeps that layout.
+    # Only the build output is cached. The NSS and NSPR sources are large and,
+    # with NSS_PREBUILT set, nss-rs never reads them: it only resolves paths
+    # relative to NSS_DIR.
+    - name: Restore NSS cache
+      id: cache
+      uses: actions/cache@v4.3.0
+      with:
+        path: .nss-android/dist
+        key: >-
+          nss-android-${{ inputs.target }}-api${{ inputs.api-level }}-nss${{ inputs.nss-version }}-nspr${{ inputs.nspr-version }}-as${{ inputs.appservices-version }}
+
+    - name: Install NSS build dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        missing=()
+        command -v gyp >/dev/null 2>&1 || missing+=(gyp)
+        command -v ninja >/dev/null 2>&1 || missing+=(ninja-build)
+        if ((${#missing[@]})); then
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y "${missing[@]}"
+        fi
+
+    - name: Fetch NSS and NSPR sources
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.toolchain.outputs.root }}
+        NSS_VERSION: ${{ inputs.nss-version }}
+        NSS_SHA256: ${{ inputs.nss-sha256 }}
+        NSPR_VERSION: ${{ inputs.nspr-version }}
+        NSPR_SHA256: ${{ inputs.nspr-sha256 }}
+      run: |
+        set -euo pipefail
+        rm -rf "$ROOT"
+        mkdir -p "$ROOT"
+        cd "$ROOT"
+
+        fetch() {
+          local url="$1" archive="$2" expected="$3" actual
+          curl -fsSL -o "$archive" "$url"
+          actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Checksum mismatch for $archive: expected $expected, got $actual"
+            exit 1
+          fi
+          tar xzf "$archive" --strip-components=1
+          rm -f "$archive"
+        }
+
+        nss_tag="${NSS_VERSION//./_}"
+        fetch \
+          "https://ftp.mozilla.org/pub/security/nss/releases/NSS_${nss_tag}_RTM/src/nss-${NSS_VERSION}.tar.gz" \
+          nss.tar.gz "$NSS_SHA256"
+        fetch \
+          "https://ftp.mozilla.org/pub/nspr/releases/v${NSPR_VERSION}/src/nspr-${NSPR_VERSION}.tar.gz" \
+          nspr.tar.gz "$NSPR_SHA256"
+
+        test -d nss && test -d nspr
+
+    - name: Cross-compile NSS
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.toolchain.outputs.root }}
+        TOOLCHAIN: ${{ steps.toolchain.outputs.toolchain }}
+        API_LEVEL: ${{ inputs.api-level }}
+        NDK_HOME: ${{ inputs.ndk-home }}
+        APPSERVICES_VERSION: ${{ inputs.appservices-version }}
+      run: |
+        set -euo pipefail
+        cd "$ROOT"
+
+        toolchain_path="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+        if [ ! -d "$toolchain_path" ]; then
+          echo "::error::NDK toolchain not found at $toolchain_path"
+          exit 1
+        fi
+
+        for script in build-nss-android.sh build-android-common.sh; do
+          curl -fsSL -o "$script" \
+            "https://raw.githubusercontent.com/mozilla/application-services/refs/tags/$APPSERVICES_VERSION/libs/$script"
+          chmod +x "$script"
+        done
+
+        # NSPR's configure only defines ANDROID inside a branch it never reaches
+        # when cross-compiling this way; application-services patches it the
+        # same way in its own build-all.sh.
+        sed -i'' 's/if test -z "$android_ndk" ; then/$as_echo "#define ANDROID 1" >>confdefs.h\n    ;;\nunreachable)\n    if test -z "$android_ndk" ; then/g' nspr/configure
+
+        staging="$ROOT/staging"
+        rm -rf "$staging"
+        ./build-nss-android.sh "$ROOT" "$staging" "$toolchain_path" "$TOOLCHAIN" "$API_LEVEL"
+
+        # build-nss-android.sh emits lib/*.a plus a single include/nss tree that
+        # already merges the NSS public headers and the NSPR headers. Fan that
+        # out into the two include roots nss-rs passes to bindgen.
+        rm -rf dist
+        mkdir -p dist/Release/lib dist/Release/include dist/public
+        cp -a "$staging/lib/." dist/Release/lib/
+        cp -a "$staging/include/nss" dist/Release/include/nspr
+        cp -a "$staging/include/nss" dist/public/nss
+        rm -rf "$staging"
+
+        # Sanity-check the archives nss-rs's static_link() will ask for.
+        for lib in nspr4 plc4 plds4 nssutil nss_static ssl softokn_static freebl_static sqlite; do
+          if [ ! -f "dist/Release/lib/lib${lib}.a" ]; then
+            echo "::error::NSS Android build produced no lib${lib}.a"
+            ls -1 dist/Release/lib
+            exit 1
+          fi
+        done
+
+    - name: Export NSS environment
+      shell: bash
+      env:
+        ROOT: ${{ steps.toolchain.outputs.root }}
+      run: |
+        set -euo pipefail
+        test -d "$ROOT/dist/Release/lib"
+        # nss-rs resolves everything from NSS_DIR's parent; with NSS_PREBUILT
+        # set it never looks inside NSS_DIR itself, which may be a cache hit
+        # that restored only dist/.
+        mkdir -p "$ROOT/nss"
+        {
+          echo "NSS_DIR=$ROOT/nss"
+          echo "NSS_PREBUILT=1"
+        } >> "$GITHUB_ENV"

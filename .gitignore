@@ -23,6 +23,10 @@ data/rrs-test/
 
 # 构建产物 / 发布归档
 dist/
+
+# NSS 源码与构建输出（setup-nss-android / setup-nss-musl 在 CI workspace 内落盘）
+.nss-android/
+.nss-musl/
 /site/
 
 # 工具/脚本缓存

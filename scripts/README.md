@@ -29,11 +29,45 @@ pwsh -File scripts/build-all.ps1 -Backend cross    -Targets "aarch64-linux-andro
 
 WutherCore 使用 Cargo features 提供与 Go `-tags` 等价的编译期组件裁剪。未指定
 `--tags` 时，本机脚本使用 `standard`，行为与引入组件标签前一致（除需单独许可
-的 Naive 外全部启用）。CI 中 Linux musl、Android 与 Windows 目标使用
-`portable`，原生 Linux GNU 与 macOS 使用 `standard`。`portable` 不包含
+的 Naive 外全部启用）。`portable` 不包含
 上游无法覆盖全部 musl/交叉架构的 BoringSSL 传输；支持 BoringSSL 的目标可选择
 `portable_boringssl`，或显式加入对应标签。一旦指定 `--tags`，
 脚本和 CI 都会自动添加 `--no-default-features`，只有列出的标签及其依赖会进入构建。
+
+CI 每个目标的默认预设见下表。留空 `tags` 时按此选择，显式传入则所有目标一律
+采用请求的组件集：
+
+| 目标 | 默认预设 | Young | NSS 链接方式 |
+|---|---|---|---|
+| Linux GNU AMD64 / ARM64 | `standard` | ✅ | 动态，归档携带 `.so` |
+| macOS Apple Silicon | `standard` | ✅ | 动态，归档携带 `.dylib` |
+| Linux musl AMD64 / ARM64 | `portable,with_young` | ✅ | 静态 |
+| Windows MSVC AMD64 | `portable,with_young` | ✅ | 静态 |
+| Android ARM64 / ARMv7 | `portable,with_young` | ✅ | 静态 |
+| Windows MSVC ARM64 | `portable` | ❌ | 不适用 |
+
+`with_young` 通过 `nss-rs` 内嵌 Mozilla NSS，各目标的 NSS 来源不同：
+
+- **Linux GNU / macOS**：`nss-rs` 自行拉取并构建 NSS，`setup-neqo` 只补齐 runner
+  缺的 gyp / ninja / mercurial / clang；
+- **Windows AMD64**：`mozilla/actions/nss`（neqo CI 同款）提供 NSS 与 MSVC 环境。
+  `nss-rs` 在 Windows 走静态链接，归档不额外携带 NSS 运行库；
+- **Android**：`setup-nss-android` 调用 `mozilla/application-services` 的
+  `build-nss-android.sh`（Firefox for Android 同款）交叉编译静态 NSS。NSS 与 Rust
+  用同一个 NDK 和同一个 API level（见 `build.yml` 的 `ANDROID_API_LEVEL`）；
+- **musl**：`setup-nss-musl` 在同架构 Alpine 容器里从源码编译静态 NSS，归档保持
+  单文件全静态二进制；
+- **Windows ARM64**：runner 镜像没有 MSYS2，NSS 也没有原生 ARM64 Windows 构建链，
+  因此不提供 Young。
+
+上游 `nss-rs` 只在 `PROFILE=debug`、Windows 或 fuzzing 时静态链接 NSS，这会让
+Android 与 musl 的 release 构建去找根本不生成的 `libnss3` 等共享库。仓库因此在
+`third_party/nss-rs-b7cfa30` 保留一份按 target 而非 profile 判定的副本，见根
+`Cargo.toml` 的 `[patch."https://github.com/mozilla/nss-rs"]`。
+
+在不支持的目标上显式请求 `with_young`（含 `standard`、`all_components`）会直接失败，
+不会静默降级。发布流程还会用 `scripts/verify-release-components.py` 读取每个归档里的
+`BUILD-COMPONENTS.txt`，核对该平台应有的组件确实编译进去了。
 
 ```cmd
 :: VLESS + gRPC + uTLS，只构建 Windows x64

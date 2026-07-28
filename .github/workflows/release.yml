@@ -135,6 +135,13 @@ jobs:
           merge-multiple: true
           skip-decompress: true
 
+      - name: Checkout release tag
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+          path: source
+
       - name: Validate and checksum release assets
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
@@ -148,6 +155,9 @@ jobs:
             printf 'Found: %s\n' "${archives[@]:-none}"
             exit 1
           fi
+
+          python source/scripts/verify-release-components.py \
+            --dist dist --version "$RELEASE_VERSION"
 
           cd dist
           printf '%s\0' wuther-core-"$RELEASE_VERSION"-*.zip \

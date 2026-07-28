@@ -1,0 +1,146 @@
+name: Setup musl NSS
+description: Build the static NSS libraries nss-rs links into musl builds.
+
+# NSS has no musl support in its own build chain and no musl cross build
+# upstream, but Alpine ships NSS built against musl, so the combination itself
+# is maintained. The runner's musl-tools only provides musl-gcc, and NSS needs
+# a C++ compiler for mozpkix, so the build runs inside an Alpine container
+# instead. Both musl matrix entries run on a runner of their own architecture,
+# so the container compiles natively and nothing is cross-compiled.
+#
+# NSS's build.sh writes to $NSS_DIR/../dist, which is exactly the layout
+# nss-rs's standalone path reads, so no post-processing is needed here.
+
+inputs:
+  target:
+    description: Rust target triple the archives are linked into.
+    required: true
+  alpine-image:
+    description: Alpine image supplying the musl toolchain.
+    required: false
+    default: "alpine:3.22"
+  nss-version:
+    description: NSS release to build.
+    required: false
+    default: "3.125"
+  nss-sha256:
+    description: SHA-256 of the NSS release tarball.
+    required: false
+    default: "1ad541f10da7c58dec01f540ecc44d28cbbc033f741a57473de5a0893d91606d"
+  nspr-version:
+    description: NSPR release to build.
+    required: false
+    default: "4.39"
+  nspr-sha256:
+    description: SHA-256 of the NSPR release tarball.
+    required: false
+    default: "bbd02ee87a55676063a63e5bc819e0227de2666b47307b2a0134414cdf42368e"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve build root
+      id: paths
+      shell: bash
+      run: echo "root=$GITHUB_WORKSPACE/.nss-musl" >> "$GITHUB_OUTPUT"
+
+    # Only the build output is cached. The NSS and NSPR sources are large and,
+    # with NSS_PREBUILT set, nss-rs never reads them: it only resolves paths
+    # relative to NSS_DIR.
+    - name: Restore NSS cache
+      id: cache
+      uses: actions/cache@v4.3.0
+      with:
+        path: .nss-musl/dist
+        key: >-
+          nss-musl-${{ inputs.target }}-${{ inputs.alpine-image }}-nss${{ inputs.nss-version }}-nspr${{ inputs.nspr-version }}
+
+    - name: Fetch NSS and NSPR sources
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.paths.outputs.root }}
+        NSS_VERSION: ${{ inputs.nss-version }}
+        NSS_SHA256: ${{ inputs.nss-sha256 }}
+        NSPR_VERSION: ${{ inputs.nspr-version }}
+        NSPR_SHA256: ${{ inputs.nspr-sha256 }}
+      run: |
+        set -euo pipefail
+        rm -rf "$ROOT"
+        mkdir -p "$ROOT"
+        cd "$ROOT"
+
+        fetch() {
+          local url="$1" archive="$2" expected="$3" actual
+          curl -fsSL -o "$archive" "$url"
+          actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Checksum mismatch for $archive: expected $expected, got $actual"
+            exit 1
+          fi
+          tar xzf "$archive" --strip-components=1
+          rm -f "$archive"
+        }
+
+        nss_tag="${NSS_VERSION//./_}"
+        fetch \
+          "https://ftp.mozilla.org/pub/security/nss/releases/NSS_${nss_tag}_RTM/src/nss-${NSS_VERSION}.tar.gz" \
+          nss.tar.gz "$NSS_SHA256"
+        fetch \
+          "https://ftp.mozilla.org/pub/nspr/releases/v${NSPR_VERSION}/src/nspr-${NSPR_VERSION}.tar.gz" \
+          nspr.tar.gz "$NSPR_SHA256"
+
+        test -d nss && test -d nspr
+
+    - name: Build NSS against musl
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ROOT: ${{ steps.paths.outputs.root }}
+        ALPINE_IMAGE: ${{ inputs.alpine-image }}
+      run: |
+        set -euo pipefail
+        # Docker resolves the image for the runner's own architecture, so the
+        # amd64 and arm64 musl jobs each get a native toolchain.
+        docker run --rm \
+          -v "$ROOT:/work" \
+          -w /work \
+          "$ALPINE_IMAGE" \
+          sh -euc '
+            apk add --no-cache build-base python3 py3-pip ninja perl linux-headers zlib-dev
+            python3 -m pip install --break-system-packages --no-input "gyp-next==0.22.2"
+            ./nss/build.sh \
+              -Ddisable_tests=1 \
+              -Ddisable_dbm=1 \
+              -Ddisable_libpkix=1 \
+              -Ddisable_ckbi=1 \
+              -Ddisable_fips=1 \
+              --opt --static
+            chmod -R a+rX /work/dist
+          '
+
+        # Sanity-check the archives nss-rs static_link() will ask for, so a
+        # partial NSS build fails here instead of as a wall of linker errors.
+        for lib in nspr4 plc4 plds4 nssutil nss_static ssl softokn_static freebl_static sqlite; do
+          if [ ! -f "$ROOT/dist/Release/lib/lib${lib}.a" ]; then
+            echo "::error::musl NSS build produced no lib${lib}.a"
+            ls -1 "$ROOT/dist/Release/lib" || true
+            exit 1
+          fi
+        done
+
+    - name: Export NSS environment
+      shell: bash
+      env:
+        ROOT: ${{ steps.paths.outputs.root }}
+      run: |
+        set -euo pipefail
+        test -d "$ROOT/dist/Release/lib"
+        # nss-rs resolves everything from NSS_DIR's parent; with NSS_PREBUILT
+        # set it never looks inside NSS_DIR itself, which may be a cache hit
+        # that restored only dist/.
+        mkdir -p "$ROOT/nss"
+        {
+          echo "NSS_DIR=$ROOT/nss"
+          echo "NSS_PREBUILT=1"
+        } >> "$GITHUB_ENV"

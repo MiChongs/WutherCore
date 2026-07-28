@@ -25,6 +25,7 @@ members = [
 ]
 exclude = [
     "third_party/h3-c38a1af/h3",
+    "third_party/nss-rs-b7cfa30",
     "third_party/shaped-rustls-94f088e",
 ]
 
@@ -228,6 +229,15 @@ xray-utls     = { git = "https://github.com/aimalygin/xray-rust.git", rev = "bb3
 # XHTTP 的 uTLS/ECH 也依赖精确扩展塑形。上游 rustls 没有这些 finalizer/
 # customizer hook，因此固定使用经过审阅的同 revision 本地源码。
 rustls = { path = "third_party/shaped-rustls-94f088e/rustls" }
+
+[patch."https://github.com/mozilla/nss-rs"]
+# Android 上唯一可用的 NSS 交叉构建（mozilla/application-services 的
+# build-nss-android.sh，Firefox for Android 同款）只产出静态库，而上游 nss-rs
+# 仅在 PROFILE=debug / Windows / fuzzing 时选择静态链接。release 构建会去链
+# libnss3、libssl3、libnssutil3 这些从不生成的共享库，导致 with_young 在
+# Android 上必然链接失败。本地副本按 target_os 而非 profile 判定，其余与
+# b7cfa30 逐字节一致。
+nss-rs = { path = "third_party/nss-rs-b7cfa30" }
 
 [patch."https://github.com/hyperium/h3"]
 # c38a1af 的 h3 会把合法的零长度 DATA 帧误报成消息 EOF。XHTTP/3

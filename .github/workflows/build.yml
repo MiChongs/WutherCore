@@ -59,6 +59,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Minimum supported Android release. NSS and the Rust binary are both built
+  # against it; raising it here raises the floor for published Android archives.
+  ANDROID_API_LEVEL: "24"
 
 jobs:
   prepare:
@@ -119,26 +122,38 @@ jobs:
       fail-fast: false
       matrix:
         platform:
+          # The musl targets build NSS from source against musl and link it
+          # statically, so they stay single static binaries. BoringSSL still
+          # has no musl build, which is why their preset is `portable` plus
+          # Young rather than `standard`.
           - target: x86_64-unknown-linux-gnu
             name: linux-amd64
+            libc: gnu
             runner: ubuntu-24.04
             packages: ""
             default-tags: standard
+            young-supported: true
           - target: aarch64-unknown-linux-gnu
             name: linux-arm64
+            libc: gnu
             runner: ubuntu-24.04-arm
             packages: ""
             default-tags: standard
+            young-supported: true
           - target: x86_64-unknown-linux-musl
             name: linux-amd64-musl
+            libc: musl
             runner: ubuntu-24.04
             packages: musl-tools
-            default-tags: portable
+            default-tags: portable,with_young
+            young-supported: true
           - target: aarch64-unknown-linux-musl
             name: linux-arm64-musl
+            libc: musl
             runner: ubuntu-24.04-arm
             packages: musl-tools
-            default-tags: portable
+            default-tags: portable,with_young
+            young-supported: true
 
     steps:
       - name: Checkout
@@ -155,18 +170,9 @@ jobs:
           REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
           REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
           REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
-        run: |
-          tags="$REQUESTED_TAGS"
-          label="$REQUESTED_LABEL"
-          key="$REQUESTED_KEY"
-          if [ -z "$tags" ] && [ "$DEFAULT_TAGS" = "portable" ]; then
-            tags="portable"
-            label="portable (platform default)"
-            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "label=$label" >> "$GITHUB_OUTPUT"
-          echo "key=$key" >> "$GITHUB_OUTPUT"
+          TARGET: ${{ matrix.platform.target }}
+          YOUNG_SUPPORTED: ${{ matrix.platform.young-supported }}
+        run: bash .github/scripts/resolve-components.sh
 
       - name: Install target system toolchain
         if: matrix.platform.packages != ''
@@ -179,13 +185,17 @@ jobs:
           read -r -a packages <<< "$PACKAGES"
           sudo apt-get install --no-install-recommends -y "${packages[@]}"
 
+      # glibc targets let nss-rs build NSS itself; musl has no such path and
+      # gets prebuilt static archives instead.
       - name: Ensure Firefox Neqo build tools
-        if: >-
-          (needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        if: steps.components.outputs.young == 'true' && matrix.platform.libc == 'gnu'
         uses: ./.github/actions/setup-neqo
+
+      - name: Build NSS against musl
+        if: steps.components.outputs.young == 'true' && matrix.platform.libc == 'musl'
+        uses: ./.github/actions/setup-nss-musl
+        with:
+          target: ${{ matrix.platform.target }}
 
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
@@ -208,12 +218,10 @@ jobs:
             cargo build --release --locked --target "$TARGET" -p wuther-core
           fi
 
+      # Only the glibc archives ship NSS shared objects. musl links the same
+      # libraries statically, so there is nothing to stage beside the binary.
       - name: Stage Linux runtime libraries
-        if: >-
-          ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,'))
+        if: steps.components.outputs.young == 'true' && matrix.platform.libc == 'gnu'
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
@@ -223,15 +231,26 @@ jobs:
           --require libnssutil3.so
 
       - name: Smoke-test native Linux binary
-        if: >-
-          ((needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,'))
+        if: steps.components.outputs.young == 'true'
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
-        run: "./target/$TARGET/release/wuther-core --version"
+          LIBC: ${{ matrix.platform.libc }}
+        run: |
+          set -euo pipefail
+          binary="./target/$TARGET/release/wuther-core"
+          "$binary" --version
+          "$binary" components | tee components.txt
+          grep -q 'with_young' components.txt
+          rm -f components.txt
+
+          # The musl archives are published as standalone static binaries;
+          # catch a dynamic NSS creeping in here rather than on a user's box.
+          if [ "$LIBC" = "musl" ] && ldd "$binary" 2>&1 | grep -q 'libnss\|libnspr\|libssl3'; then
+            echo "::error::musl binary links NSS dynamically"
+            ldd "$binary" || true
+            exit 1
+          fi
 
       - name: Package artifact
         id: package
@@ -266,12 +285,20 @@ jobs:
       fail-fast: false
       matrix:
         platform:
+          # NSS is cross-compiled statically for Android, so these archives stay
+          # single self-contained binaries. BoringSSL still has no Android cross
+          # build, which is why the preset is `portable` plus Young rather than
+          # `standard`.
           - target: aarch64-linux-android
             ndk-target: arm64-v8a
             name: android-arm64
+            default-tags: portable,with_young
+            young-supported: true
           - target: armv7-linux-androideabi
             ndk-target: armeabi-v7a
             name: android-arm
+            default-tags: portable,with_young
+            young-supported: true
 
     steps:
       - name: Checkout
@@ -284,21 +311,13 @@ jobs:
         id: components
         shell: bash
         env:
+          DEFAULT_TAGS: ${{ matrix.platform.default-tags }}
           REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
           REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
           REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
-        run: |
-          tags="$REQUESTED_TAGS"
-          label="$REQUESTED_LABEL"
-          key="$REQUESTED_KEY"
-          if [ -z "$tags" ]; then
-            tags="portable"
-            label="portable (platform default)"
-            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "label=$label" >> "$GITHUB_OUTPUT"
-          echo "key=$key" >> "$GITHUB_OUTPUT"
+          TARGET: ${{ matrix.platform.target }}
+          YOUNG_SUPPORTED: ${{ matrix.platform.young-supported }}
+        run: bash .github/scripts/resolve-components.sh
 
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
@@ -308,6 +327,7 @@ jobs:
           cache-targets: true
 
       - name: Setup Android NDK
+        id: ndk
         uses: nttld/setup-ndk@v1.6.0
         with:
           ndk-version: r29
@@ -319,6 +339,17 @@ jobs:
         with:
           tool: cargo-ndk@4.1.2
 
+      # NSS and the Rust binary must agree on the Android API level, otherwise
+      # the static archives reference bionic symbols the linker resolves against
+      # a different set of stubs. Both sides read ANDROID_API_LEVEL below.
+      - name: Cross-compile NSS for Android
+        if: steps.components.outputs.young == 'true'
+        uses: ./.github/actions/setup-nss-android
+        with:
+          target: ${{ matrix.platform.target }}
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          ndk-home: ${{ steps.ndk.outputs.ndk-path }}
+
       - name: Build Android binary
         shell: bash
         env:
@@ -328,11 +359,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
-            cargo ndk --target "$NDK_TARGET" --platform 24 \
+            cargo ndk --target "$NDK_TARGET" --platform "$ANDROID_API_LEVEL" \
               build --release --locked -p wuther-core \
               --no-default-features --features "$WUTHER_BUILD_TAGS"
           else
-            cargo ndk --target "$NDK_TARGET" --platform 24 \
+            cargo ndk --target "$NDK_TARGET" --platform "$ANDROID_API_LEVEL" \
               build --release --locked -p wuther-core
           fi
 
@@ -369,14 +400,20 @@ jobs:
       fail-fast: false
       matrix:
         platform:
+          # nss-rs links NSS statically on Windows, so Young adds no runtime
+          # dependency to the archive. ARM64 stays on `portable`: the
+          # windows-11-arm image ships no MSYS2, and NSS has no native ARM64
+          # Windows build chain, so its NSS toolchain cannot be provisioned.
           - target: x86_64-pc-windows-msvc
             name: windows-amd64-msvc
             runner: windows-2025
-            default-tags: portable
+            default-tags: portable,with_young
+            young-supported: true
           - target: aarch64-pc-windows-msvc
             name: windows-arm64-msvc
             runner: windows-11-arm
             default-tags: portable
+            young-supported: false
 
     steps:
       - name: Checkout
@@ -393,18 +430,9 @@ jobs:
           REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
           REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
           REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
-        run: |
-          tags="$REQUESTED_TAGS"
-          label="$REQUESTED_LABEL"
-          key="$REQUESTED_KEY"
-          if [ -z "$tags" ] && [ "$DEFAULT_TAGS" = "portable" ]; then
-            tags="portable"
-            label="portable (platform default)"
-            key="$(printf '%s' "$tags" | sha256sum | cut -c1-16)"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "label=$label" >> "$GITHUB_OUTPUT"
-          echo "key=$key" >> "$GITHUB_OUTPUT"
+          TARGET: ${{ matrix.platform.target }}
+          YOUNG_SUPPORTED: ${{ matrix.platform.young-supported }}
+        run: bash .github/scripts/resolve-components.sh
 
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
@@ -414,11 +442,7 @@ jobs:
           cache-targets: true
 
       - name: Ensure Firefox Neqo build tools
-        if: >-
-          (needs.prepare.outputs.tags == '' && matrix.platform.default-tags == 'standard') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        if: steps.components.outputs.young == 'true'
         uses: ./.github/actions/setup-neqo
 
       - name: Build Windows binary
@@ -439,7 +463,29 @@ jobs:
         shell: pwsh
         env:
           TARGET: ${{ matrix.platform.target }}
-        run: '& "target/$env:TARGET/release/wuther-core.exe" --version'
+          EXPECT_YOUNG: ${{ steps.components.outputs.young }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Drop the NSS build tree and MSYS2 from PATH first. nss-rs links NSS
+          # statically on Windows, so the archive ships no NSS DLLs; running with
+          # those directories still on PATH would hide an accidental dynamic link
+          # here and only break on the user's machine.
+          $env:PATH = ($env:PATH -split ';' | Where-Object {
+            $_ -and $_ -notmatch 'msys64' -and $_ -notmatch 'dist[\\/]Release[\\/]lib'
+          }) -join ';'
+
+          $binary = "target/$env:TARGET/release/wuther-core.exe"
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw "wuther-core --version failed" }
+
+          if ($env:EXPECT_YOUNG -eq 'true') {
+            $components = & $binary components
+            if ($LASTEXITCODE -ne 0) { throw "wuther-core components failed" }
+            Write-Output "components: $components"
+            if ($components -notmatch 'with_young') {
+              throw "with_young is missing from the $env:TARGET build"
+            }
+          }
 
       - name: Package artifact
         id: package
@@ -480,26 +526,34 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Resolve target components
+        id: components
+        shell: bash
+        env:
+          DEFAULT_TAGS: standard
+          REQUESTED_KEY: ${{ needs.prepare.outputs.tag-key }}
+          REQUESTED_TAGS: ${{ needs.prepare.outputs.tags }}
+          REQUESTED_LABEL: ${{ needs.prepare.outputs.tag-label }}
+          TARGET: aarch64-apple-darwin
+          YOUNG_SUPPORTED: true
+        run: bash .github/scripts/resolve-components.sh
+
       - name: Setup cached Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: build-aarch64-apple-darwin-${{ needs.prepare.outputs.tag-key }}
+          cache-key: build-aarch64-apple-darwin-${{ steps.components.outputs.key }}
           targets: aarch64-apple-darwin
           cache-targets: true
 
       - name: Ensure Firefox Neqo build tools
-        if: >-
-          needs.prepare.outputs.tags == '' ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        if: steps.components.outputs.young == 'true'
         uses: ./.github/actions/setup-neqo
 
       - name: Build macOS binary
         shell: bash
         env:
           TARGET: aarch64-apple-darwin
-          WUTHER_BUILD_TAGS: ${{ needs.prepare.outputs.tags }}
+          WUTHER_BUILD_TAGS: ${{ steps.components.outputs.tags }}
         run: |
           set -euo pipefail
           if [ -n "$WUTHER_BUILD_TAGS" ]; then
@@ -510,11 +564,7 @@ jobs:
           fi
 
       - name: Stage macOS runtime libraries
-        if: >-
-          needs.prepare.outputs.tags == '' ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',with_young,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',standard,') ||
-          contains(format(',{0},', needs.prepare.outputs.tags), ',all_components,')
+        if: steps.components.outputs.young == 'true'
         shell: bash
         env:
           TARGET: aarch64-apple-darwin
@@ -527,7 +577,16 @@ jobs:
         shell: bash
         env:
           TARGET: aarch64-apple-darwin
-        run: "./target/$TARGET/release/wuther-core --version"
+          EXPECT_YOUNG: ${{ steps.components.outputs.young }}
+        run: |
+          set -euo pipefail
+          binary="./target/$TARGET/release/wuther-core"
+          "$binary" --version
+          if [ "$EXPECT_YOUNG" = "true" ]; then
+            "$binary" components | tee components.txt
+            grep -q 'with_young' components.txt
+            rm -f components.txt
+          fi
 
       - name: Package artifact
         id: package
@@ -535,7 +594,7 @@ jobs:
           TARGET: aarch64-apple-darwin
           PLATFORM_NAME: macos-arm64
           RELEASE_VERSION: ${{ inputs.version }}
-          WUTHER_BUILD_TAG_LABEL: ${{ needs.prepare.outputs.tag-label }}
+          WUTHER_BUILD_TAG_LABEL: ${{ steps.components.outputs.label }}
         run: >-
           python3 scripts/package-artifact.py
           --target "$TARGET"

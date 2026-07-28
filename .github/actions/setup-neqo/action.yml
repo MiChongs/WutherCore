@@ -1,5 +1,11 @@
 name: Setup Firefox Neqo build tools
-description: Install only the native tools missing from the current runner image.
+description: Provide the NSS toolchain nss-rs needs on the current runner image.
+
+inputs:
+  nss-minimum-version:
+    description: Minimum NSS release accepted by nss-rs; keep in sync with its min_version.txt.
+    required: false
+    default: "3.121"
 
 runs:
   using: composite
@@ -44,26 +50,41 @@ runs:
           brew install ninja
         fi
 
-    - name: Ensure Windows tools
+    # Windows cannot use the same approach as Linux and macOS. There, nss-rs
+    # clones NSS itself and runs its build.sh; on Windows that script additionally
+    # needs an activated MSVC environment and MSYS tooling, and NSPR does not
+    # produce usable shared libraries, so nss-rs links NSS statically instead.
+    # Mozilla's own action provisions a pinned NSS release plus that environment
+    # and exports NSS_DIR/NSS_PREBUILT, which makes nss-rs consume the prepared
+    # tree rather than build one. It is the same action neqo's CI uses.
+    - name: Provision NSS (Windows)
+      if: runner.os == 'Windows'
+      uses: mozilla/actions/nss@c7f9db3409fff64a55f16ac0cacbc4cdd05ae435 # v1.1.19
+      with:
+        minimum-version: ${{ inputs.nss-minimum-version }}
+
+    # nss-rs only derives LIBCLANG_PATH from a gecko checkout, and otherwise
+    # leaves bindgen to find libclang on its own. Pin it to the runner's LLVM so
+    # a missing libclang fails here with a clear message instead of surfacing as
+    # an opaque bindgen error part-way through the build.
+    - name: Expose libclang (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $missingPythonTools = @()
-        if (-not (Get-Command gyp -ErrorAction SilentlyContinue)) {
-          $missingPythonTools += 'gyp-next==0.22.2'
+        if ($env:LIBCLANG_PATH) {
+          Write-Output "LIBCLANG_PATH already set to $env:LIBCLANG_PATH"
+          exit 0
         }
-        if (-not (Get-Command hg -ErrorAction SilentlyContinue)) {
-          $missingPythonTools += 'mercurial==7.2.3'
+        $candidates = @(
+          (Join-Path $env:ProgramFiles 'LLVM\bin'),
+          (Join-Path ${env:ProgramFiles(x86)} 'LLVM\bin')
+        )
+        $found = $candidates |
+          Where-Object { $_ -and (Test-Path (Join-Path $_ 'libclang.dll')) } |
+          Select-Object -First 1
+        if (-not $found) {
+          throw "libclang.dll not found in $($candidates -join ', '); bindgen cannot generate NSS bindings."
         }
-        if ($missingPythonTools.Count -gt 0) {
-          $toolsVenv = Join-Path $env:RUNNER_TEMP 'neqo-python-tools'
-          python -m venv $toolsVenv
-          & "$toolsVenv\Scripts\python.exe" -m pip install `
-            --disable-pip-version-check --no-input @missingPythonTools
-          (Join-Path $toolsVenv 'Scripts') |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        }
-        if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
-          choco install ninja --yes --no-progress
-        }
+        Write-Output "Using libclang from $found"
+        "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
