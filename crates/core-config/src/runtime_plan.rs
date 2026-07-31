@@ -60,6 +60,7 @@ pub struct ListenPlan {
     pub reality: Vec<RealityListen>,
     #[serde(default)]
     pub wireguard: Vec<WireGuardListenPlan>,
+    #[serde(default)]
     pub young: Vec<YoungListen>,
     pub grpc: Vec<GrpcListen>,
     pub panel: Option<PanelListen>,
@@ -1328,6 +1329,7 @@ fn decode_wireguard_key(value: &str, location: &str) -> ConfigResult<[u8; 32]> {
         .try_into()
         .map_err(|_| ConfigError::invalid("WireGuard 密钥必须解码为 32 字节").at(location))
 }
+
 fn compile_young_listeners(listeners: &[YoungListen]) -> ConfigResult<Vec<YoungListen>> {
     let mut output = Vec::with_capacity(listeners.len());
     let mut bound = std::collections::HashSet::new();
