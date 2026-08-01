@@ -244,12 +244,18 @@ impl CapturePlan {
                 core_config::model::DEFAULT_AUTO_REDIRECT_INPUT_MARK,
                 c.on,
             )?),
-            output: Some(mark_or_default(
-                "capture.tun.auto_redirect_output_mark",
-                c.tun.auto_redirect_output_mark.as_deref(),
-                core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
-                c.on,
-            )?),
+            output: Some(core_config::model::platform_tun_output_mark(
+                mark_or_default(
+                    "capture.tun.auto_redirect_output_mark",
+                    c.tun.auto_redirect_output_mark.as_deref(),
+                    if cfg!(target_os = "android") {
+                        crate::resource_claims::ANDROID_TUN_BYPASS_MARK
+                    } else {
+                        core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+                    },
+                    c.on,
+                )?,
+            )),
             reset: Some(mark_or_default(
                 "capture.tun.auto_redirect_reset_mark",
                 c.tun.auto_redirect_reset_mark.as_deref(),

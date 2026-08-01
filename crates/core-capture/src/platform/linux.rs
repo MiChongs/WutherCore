@@ -24,11 +24,14 @@ use crate::{
         linux_auto_redirect_route::{self, AutoRedirectRouteLease},
         linux_tproxy::{RedirectTcpListener, bind_tcp_redirect_listener_set, run_tcp_redirect},
     },
-    route_table::{ManagedRoute, RouteTable},
+    route_table::RouteTable,
     tproxy_rules,
     tun_io::TunIo,
     tun_logging::root_tun_summary,
 };
+
+#[cfg(not(target_os = "android"))]
+use crate::route_table::ManagedRoute;
 
 pub fn list_interfaces() -> Vec<String> {
     let mut out = Vec::new();
@@ -570,6 +573,18 @@ impl CaptureEngine for LinuxTun {
                     "root TUN opened without a CAP_NET_ADMIN recovery lock".into(),
                 )
             })?;
+            #[cfg(target_os = "android")]
+            if effective_plan.auto_route {
+                // Check before arming the recovery journal. A journal owns its
+                // configured table and will flush it during rollback, so it
+                // must never be armed for a table already owned by netd.
+                crate::linux_netlink::ensure_route_table_available(
+                    effective_plan.iproute2_table_index,
+                )
+                .map_err(|error| {
+                    CaptureError::Route(format!("Android private TUN table check: {error}"))
+                })?;
+            }
             // Persist ownership only after the effective kernel-selected name
             // is known, but before address, route or policy mutation.
             recovery.arm(
@@ -595,7 +610,22 @@ impl CaptureEngine for LinuxTun {
             if (effective_plan.auto_route || effective_plan.strict_route)
                 && !effective_plan.auto_redirect
             {
-                g.policy_rule_lease = Some(install_root_tun_policy(&self.routes, &effective_plan)?);
+                #[cfg(target_os = "android")]
+                {
+                    let ipv6_tun = effective_plan
+                        .tun_v6_cidr
+                        .is_some_and(|_| is_ipv6_available(&effective_plan.interface_name));
+                    g.policy_rule_lease = Some(crate::platform::android_route::install(
+                        &self.routes,
+                        &effective_plan,
+                        ipv6_tun,
+                    )?);
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    g.policy_rule_lease =
+                        Some(install_root_tun_policy(&self.routes, &effective_plan)?);
+                }
             }
             if effective_plan.auto_route && !effective_plan.auto_redirect {
                 // 内核级身份旁路：在 OUTPUT/mangle 链上为 excluded UID/GID/package
@@ -614,6 +644,21 @@ impl CaptureEngine for LinuxTun {
                         all_ok = report.all_ok,
                         "kernel-level identity bypass installed"
                     );
+                }
+                #[cfg(target_os = "android")]
+                if crate::platform::android_route::requires_identity_firewall(
+                    &effective_plan.filters,
+                ) {
+                    let ipv4_ready = report.backends.contains(&"iptables");
+                    let ipv6_ready = !effective_plan.ipv6_enabled
+                        || effective_plan.tun_v6_cidr.is_none()
+                        || report.backends.contains(&"ip6tables");
+                    if !report.all_ok || !ipv4_ready || !ipv6_ready {
+                        return Err(CaptureError::Unsupported(
+                            "Android GID filters require working iptables owner rules for every enabled address family"
+                                .into(),
+                        ));
+                    }
                 }
             }
         } else {
@@ -857,6 +902,7 @@ impl CaptureEngine for LinuxTun {
 
 /* ---------------- auto_route / strict_route / auto_redirect helpers ---------------- */
 
+#[cfg(not(target_os = "android"))]
 fn install_root_tun_routes(
     routes: &RouteTable,
     plan: &CapturePlan,
@@ -886,6 +932,7 @@ fn install_root_tun_routes(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn install_root_tun_policy(
     routes: &RouteTable,
     plan: &CapturePlan,
@@ -1231,6 +1278,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "android"))]
     fn auto_route_installs_split_default_routes_in_custom_table() {
         #[derive(Debug, Default)]
         struct CaptureBackend {

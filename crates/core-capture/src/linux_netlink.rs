@@ -13,11 +13,13 @@ use std::{
 };
 
 use futures::TryStreamExt;
+#[cfg(target_os = "android")]
+use rtnetlink::packet_route::route::RouteAttribute;
 use rtnetlink::packet_route::{
     AddressFamily,
     link::LinkAttribute,
-    route::{RouteMessage, RouteScope, RouteType},
-    rule::{RuleAction, RuleAttribute, RuleMessage},
+    route::{RouteMessage, RouteProtocol, RouteScope, RouteType},
+    rule::{RuleAction, RuleAttribute, RuleMessage, RuleUidRange},
 };
 use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
 
@@ -73,6 +75,12 @@ impl PolicyFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PolicyAction {
     Lookup(u32),
+    /// Continue evaluation at an existing policy-rule priority.
+    ///
+    /// Android uses this to hand bypassed traffic back to netd instead of
+    /// guessing whether the active physical table is wlan, cellular, VPN, or
+    /// a per-UID network table.
+    Goto(u32),
     Blackhole,
 }
 
@@ -82,7 +90,10 @@ pub(crate) struct PolicyRule {
     pub(crate) priority: u32,
     pub(crate) action: PolicyAction,
     pub(crate) fw_mark: Option<u32>,
+    pub(crate) fw_mask: Option<u32>,
     pub(crate) destination: Option<ipnet::IpNet>,
+    pub(crate) incoming_interface: Option<String>,
+    pub(crate) uid_range: Option<(u32, u32)>,
 }
 
 impl PolicyRule {
@@ -92,7 +103,23 @@ impl PolicyRule {
             priority,
             action: PolicyAction::Lookup(table),
             fw_mark: None,
+            fw_mask: None,
             destination: None,
+            incoming_interface: None,
+            uid_range: None,
+        }
+    }
+
+    pub(crate) fn goto(family: PolicyFamily, priority: u32, target: u32) -> Self {
+        Self {
+            family,
+            priority,
+            action: PolicyAction::Goto(target),
+            fw_mark: None,
+            fw_mask: None,
+            destination: None,
+            incoming_interface: None,
+            uid_range: None,
         }
     }
 
@@ -102,17 +129,37 @@ impl PolicyRule {
             priority,
             action: PolicyAction::Blackhole,
             fw_mark: None,
+            fw_mask: None,
             destination: None,
+            incoming_interface: None,
+            uid_range: None,
         }
     }
 
     pub(crate) fn with_fw_mark(mut self, mark: u32) -> Self {
         self.fw_mark = Some(mark);
+        self.fw_mask = Some(u32::MAX);
+        self
+    }
+
+    pub(crate) fn with_fw_mark_mask(mut self, mark: u32, mask: u32) -> Self {
+        self.fw_mark = Some(mark);
+        self.fw_mask = Some(mask);
         self
     }
 
     pub(crate) fn with_destination(mut self, destination: ipnet::IpNet) -> Self {
         self.destination = Some(destination);
+        self
+    }
+
+    pub(crate) fn with_incoming_interface(mut self, interface: impl Into<String>) -> Self {
+        self.incoming_interface = Some(interface.into());
+        self
+    }
+
+    pub(crate) fn with_uid_range(mut self, start: u32, end: u32) -> Self {
+        self.uid_range = Some((start, end));
         self
     }
 }
@@ -160,12 +207,21 @@ async fn route_message(handle: &Handle, route: &ManagedRoute) -> Result<RouteMes
             let mut builder = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
                 .destination_prefix(dest.network(), dest.prefix_len())
                 .output_interface(index)
-                .priority(route.metric)
+                .protocol(RouteProtocol::Static)
+                .kind(RouteType::Unicast)
                 .table_id(table);
+            if route.metric != 0 {
+                builder = builder.priority(route.metric);
+            }
             if let Some(IpAddr::V4(gateway)) = gateway {
                 builder = builder.gateway(gateway);
             } else if gateway.is_some() {
                 return Err("IPv6 gateway cannot be used by an IPv4 route".into());
+            } else {
+                // Device-only routes are directly connected. Android netd
+                // emits RT_SCOPE_LINK for this shape and several vendor
+                // kernels reject the generic RT_SCOPE_UNIVERSE variant.
+                builder = builder.scope(RouteScope::Link);
             }
             builder.build()
         }
@@ -173,17 +229,38 @@ async fn route_message(handle: &Handle, route: &ManagedRoute) -> Result<RouteMes
             let mut builder = RouteMessageBuilder::<std::net::Ipv6Addr>::new()
                 .destination_prefix(dest.network(), dest.prefix_len())
                 .output_interface(index)
-                .priority(route.metric)
+                .protocol(RouteProtocol::Static)
+                .kind(RouteType::Unicast)
                 .table_id(table);
+            if route.metric != 0 {
+                builder = builder.priority(route.metric);
+            }
             if let Some(IpAddr::V6(gateway)) = gateway {
                 builder = builder.gateway(gateway);
             } else if gateway.is_some() {
                 return Err("IPv4 gateway cannot be used by an IPv6 route".into());
+            } else {
+                builder = builder.scope(RouteScope::Link);
             }
             builder.build()
         }
     };
-    Ok(message)
+    Ok(explicit_android_route_table(message, table))
+}
+
+#[cfg(target_os = "android")]
+fn explicit_android_route_table(mut message: RouteMessage, table: u32) -> RouteMessage {
+    message.header.table = 0;
+    message
+        .attributes
+        .retain(|attribute| !matches!(attribute, RouteAttribute::Table(_)));
+    message.attributes.push(RouteAttribute::Table(table));
+    message
+}
+
+#[cfg(not(target_os = "android"))]
+fn explicit_android_route_table(message: RouteMessage, _table: u32) -> RouteMessage {
+    message
 }
 
 pub(crate) fn add_route(route: &ManagedRoute) -> Result<(), String> {
@@ -213,7 +290,7 @@ pub(crate) fn delete_route(route: &ManagedRoute) -> Result<(), String> {
 }
 
 fn set_rule_table(message: &mut RuleMessage, table: u32) {
-    if table > u8::MAX.into() {
+    if cfg!(target_os = "android") || table > u8::MAX.into() {
         message.attributes.push(RuleAttribute::Table(table));
     } else {
         message.header.table = table as u8;
@@ -228,6 +305,10 @@ fn policy_rule_message(rule: &PolicyRule) -> Result<RuleMessage, String> {
             set_rule_table(&mut message, table);
             RuleAction::ToTable
         }
+        PolicyAction::Goto(target) => {
+            message.attributes.push(RuleAttribute::Goto(target));
+            RuleAction::Goto
+        }
         PolicyAction::Blackhole => RuleAction::Blackhole,
     };
     message
@@ -235,7 +316,22 @@ fn policy_rule_message(rule: &PolicyRule) -> Result<RuleMessage, String> {
         .push(RuleAttribute::Priority(rule.priority));
     if let Some(mark) = rule.fw_mark {
         message.attributes.push(RuleAttribute::FwMark(mark));
-        message.attributes.push(RuleAttribute::FwMask(u32::MAX));
+        message
+            .attributes
+            .push(RuleAttribute::FwMask(rule.fw_mask.unwrap_or(u32::MAX)));
+    }
+    if let Some(interface) = &rule.incoming_interface {
+        message
+            .attributes
+            .push(RuleAttribute::Iifname(interface.clone()));
+    }
+    if let Some((start, end)) = rule.uid_range {
+        if start > end {
+            return Err(format!("invalid policy UID range {start}:{end}"));
+        }
+        message
+            .attributes
+            .push(RuleAttribute::UidRange(RuleUidRange { start, end }));
     }
     if let Some(destination) = rule.destination {
         match (rule.family, destination) {
@@ -407,6 +503,12 @@ fn route_table(message: &RouteMessage) -> u32 {
         .unwrap_or(u32::from(message.header.table))
 }
 
+fn route_dump_message(family: PolicyFamily) -> RouteMessage {
+    let mut message = RouteMessage::default();
+    message.header.address_family = family.address_family();
+    message
+}
+
 pub(crate) fn recover_owned_policy(
     table: u32,
     rule_priority: u32,
@@ -465,20 +567,42 @@ fn recovery_owns_rule(
     let owns_custom = custom_priorities.contains(&priority) && lookup_table == table;
     let owns_bypass = bypass_priorities.contains(&priority)
         && (bypass_any_table || bypass_tables.contains(&lookup_table));
+    let owns_android_netd_handoff = bypass_priorities.contains(&priority)
+        && message.header.action == RuleAction::Goto
+        && message
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RuleAttribute::Goto(target) if *target == 10_000));
     let owns_strict = strict_route
         && priority == rule_priority.saturating_add(1)
         && message.header.action == RuleAction::Blackhole;
-    owns_custom || owns_bypass || owns_strict
+    owns_custom || owns_bypass || owns_android_netd_handoff || owns_strict
+}
+
+/// Refuse to reuse a routing table that already belongs to Android netd or
+/// another process. The caller invokes this before adding any owned route.
+pub(crate) fn ensure_route_table_available(table: u32) -> Result<(), String> {
+    transact(move |handle| async move {
+        for family in [PolicyFamily::V4, PolicyFamily::V6] {
+            let message = route_dump_message(family);
+            let mut routes = handle.route().get(message).execute();
+            while let Some(route) = routes.try_next().await.map_err(|error| error.to_string())? {
+                if route_table(&route) == table {
+                    return Err(format!(
+                        "routing table {table} already contains a route; choose an unused inbounds[].iproute2_table_index"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn flush_route_table(table: u32) -> Result<(), String> {
     transact(move |handle| async move {
         let mut owned = Vec::new();
         for family in [PolicyFamily::V4, PolicyFamily::V6] {
-            let message = match family {
-                PolicyFamily::V4 => RouteMessageBuilder::<Ipv4Addr>::new().build(),
-                PolicyFamily::V6 => RouteMessageBuilder::<Ipv6Addr>::new().build(),
-            };
+            let message = route_dump_message(family);
             let mut routes = handle.route().get(message).execute();
             while let Some(route) = routes.try_next().await.map_err(|error| error.to_string())? {
                 if route_table(&route) == table {
@@ -771,6 +895,55 @@ mod tests {
                 .attributes
                 .contains(&RuleAttribute::FwMask(u32::MAX))
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "android")]
+    fn android_always_uses_explicit_route_and_rule_table_attributes() {
+        let route = explicit_android_route_table(
+            RouteMessageBuilder::<Ipv4Addr>::new().table_id(97).build(),
+            97,
+        );
+        assert_eq!(route.header.table, 0);
+        assert!(route.attributes.contains(&RouteAttribute::Table(97)));
+
+        let rule = policy_rule_message(&PolicyRule::lookup(PolicyFamily::V4, 9000, 97)).unwrap();
+        assert_eq!(rule.header.table, 0);
+        assert!(rule.attributes.contains(&RuleAttribute::Table(97)));
+    }
+
+    #[test]
+    fn android_netd_handoff_encodes_goto_iif_uid_and_partial_mark_mask() {
+        let message = policy_rule_message(
+            &PolicyRule::goto(PolicyFamily::V4, 8999, 10_000)
+                .with_incoming_interface("lo")
+                .with_uid_range(10_000, 19_999)
+                .with_fw_mark_mask(0x0020_0000, 0x0020_0000),
+        )
+        .unwrap();
+
+        assert_eq!(message.header.action, RuleAction::Goto);
+        assert_eq!(rule_table(&message), 0);
+        assert!(message.attributes.contains(&RuleAttribute::Goto(10_000)));
+        assert!(
+            message
+                .attributes
+                .contains(&RuleAttribute::Iifname("lo".into()))
+        );
+        assert!(
+            message
+                .attributes
+                .contains(&RuleAttribute::UidRange(RuleUidRange {
+                    start: 10_000,
+                    end: 19_999,
+                }))
+        );
+        assert!(
+            message
+                .attributes
+                .contains(&RuleAttribute::FwMask(0x0020_0000))
+        );
+        assert!(recovery_owns_rule(&message, 2022, 9000, &[], false, false,));
     }
 
     #[test]

@@ -1957,14 +1957,21 @@ pub struct UdpDialResult {
 
 fn outbound_fwmark_for_plan(plan: &RuntimePlan) -> u32 {
     if capture_uses_tun_auto_route(&plan.capture) {
-        core_config::model::normalize_auto_redirect_mark(
-            plan.capture.tun.auto_redirect_output_mark.as_deref(),
-            core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK,
+        let default = if cfg!(target_os = "android") {
+            core_config::model::ANDROID_DEFAULT_TUN_OUTPUT_MARK
+        } else {
+            core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+        };
+        core_config::model::platform_tun_output_mark(
+            core_config::model::normalize_auto_redirect_mark(
+                plan.capture.tun.auto_redirect_output_mark.as_deref(),
+                default,
+            )
+            // RuntimePlan normally came through validation. A manually-mutated plan
+            // must still use the same safe default as CapturePlan instead of
+            // silently disabling the loop-prevention mark.
+            .unwrap_or(default),
         )
-        // RuntimePlan normally came through validation. A manually-mutated plan
-        // must still use the same safe default as CapturePlan instead of
-        // silently disabling the loop-prevention mark.
-        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
     } else if plan.capture.on && capture_uses_tproxy(&plan.capture) {
         0x2d0
     } else {

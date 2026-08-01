@@ -71,6 +71,8 @@ pub mod stub;
 pub mod android;
 #[cfg(target_os = "android")]
 pub mod android_jni;
+#[cfg(target_os = "android")]
+pub(crate) mod android_route;
 pub mod android_tun_io;
 #[cfg(target_os = "android")]
 pub mod vpnservice_tun_io;

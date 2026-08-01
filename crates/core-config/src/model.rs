@@ -5864,6 +5864,22 @@ pub const DEFAULT_AUTO_REDIRECT_INPUT_MARK: u32 = 0x2023;
 /// auto_redirect 的连接出站 mark；同时复用于 TUN outbound socket 的
 /// auto_route 绕行，避免代理自身流量再次进入 TUN。
 pub const DEFAULT_AUTO_REDIRECT_OUTPUT_MARK: u32 = 0x2024;
+/// Android netd reserves fwmark bits 21 through 28 for platform-private use.
+/// Root TUN uses one of those bits so its bypass mark does not masquerade as
+/// an Android network id.
+pub const ANDROID_DEFAULT_TUN_OUTPUT_MARK: u32 = 1 << 21;
+
+/// Translate the historical Linux TUN mark when the same configuration is
+/// opened by an Android build. Older official examples explicitly serialized
+/// `0x2024`, so treating that value as a user-selected Android netId would
+/// break an otherwise valid upgrade.
+pub const fn platform_tun_output_mark(mark: u32) -> u32 {
+    if cfg!(target_os = "android") && mark == DEFAULT_AUTO_REDIRECT_OUTPUT_MARK {
+        ANDROID_DEFAULT_TUN_OUTPUT_MARK
+    } else {
+        mark
+    }
+}
 
 /// sing-tun auto_redirect reset mark 默认值（`DefaultAutoRedirectResetMark`）。
 ///

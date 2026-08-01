@@ -312,6 +312,7 @@ fn parse_route_table(table: &str) -> Option<u32> {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn probe_bypass_tables() -> Vec<String> {
     let mut tables = Vec::new();
     for target in ["1.1.1.1", "2606:4700:4700::1111"] {
@@ -329,6 +330,13 @@ fn probe_bypass_tables() -> Vec<String> {
         tables.push("254".to_owned());
     }
     tables
+}
+
+#[cfg(target_os = "android")]
+fn probe_bypass_tables() -> Vec<String> {
+    // Android bypass rules use FR_ACT_GOTO to return to netd. No physical
+    // table is owned or cached, so recovery must not guess `main`.
+    Vec::new()
 }
 
 fn delete_nft_table(table: &str) {

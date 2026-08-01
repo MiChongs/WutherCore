@@ -453,7 +453,7 @@ fn resolve_included_uids(f: &CaptureFilters) -> Vec<u32> {
 const ANDROID_USER_RANGE: u32 = 100_000;
 
 #[cfg(target_os = "android")]
-fn load_package_to_uid() -> HashMap<String, u32> {
+pub(crate) fn load_package_to_uid() -> HashMap<String, u32> {
     let content = std::fs::read_to_string("/data/system/packages.list").unwrap_or_default();
     let mut map = HashMap::new();
     for line in content.lines() {
@@ -471,7 +471,7 @@ fn load_package_to_uid() -> HashMap<String, u32> {
 }
 
 #[cfg(not(target_os = "android"))]
-fn load_package_to_uid() -> HashMap<String, u32> {
+pub(crate) fn load_package_to_uid() -> HashMap<String, u32> {
     HashMap::new()
 }
 

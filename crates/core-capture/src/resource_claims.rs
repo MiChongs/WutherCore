@@ -390,10 +390,29 @@ fn claim(claims: &mut BTreeSet<ResourceClaim>, resource: SystemResource) {
     claims.insert(ResourceClaim::exclusive(resource));
 }
 
+/// Android-private bypass mark in the reserved section of netd's Fwmark.
+pub(crate) const ANDROID_TUN_BYPASS_MARK: u32 = core_config::model::ANDROID_DEFAULT_TUN_OUTPUT_MARK;
+
 pub(crate) fn tun_outbound_mark(plan: &CapturePlan) -> u32 {
-    plan.auto_redirect_marks
-        .output
-        .unwrap_or(core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK)
+    if let Some(mark) = plan.auto_redirect_marks.output {
+        return mark;
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        // Android owns the low 21 fwmark bits: netId, explicit-network,
+        // protect-from-VPN, permission, and billing. Reusing Linux's 0x2024
+        // default turns that value into a fake netId and can make netd route
+        // the core's own sockets to the terminal unreachable rule. Bit 21 is
+        // in netd's reserved field and is matched with an exact one-bit mask
+        // by the Android policy backend.
+        return ANDROID_TUN_BYPASS_MARK;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        core_config::model::DEFAULT_AUTO_REDIRECT_OUTPUT_MARK
+    }
 }
 
 pub(crate) fn linux_auto_route_is_catch_all(plan: &CapturePlan) -> bool {
