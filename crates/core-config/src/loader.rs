@@ -880,7 +880,7 @@ inbounds:
         .to_string();
 
         assert!(
-            error.contains("只能声明一个 tun、tproxy 或 redirect inbound"),
+            error.contains("只能启用一个 tun、tproxy、redirect 或 ebpf inbound"),
             "{error}"
         );
     }

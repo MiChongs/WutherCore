@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use aya::{
@@ -17,16 +17,14 @@ use aya::{
         tc::{NlOptions, SchedClassifierLinkId, TcAttachOptions, TcHandle, qdisc_add_clsact},
     },
 };
-use core_config::model::{EbpfInboundOptions, EbpfSharedNetworkOptions};
+use core_config::model::{EbpfCapabilityOptions, EbpfInboundOptions, EbpfSharedNetworkOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use nix::{
-    ifaddrs::getifaddrs,
-    net::if_::if_nametoindex,
-    sys::resource::{RLIM_INFINITY, Resource, setrlimit},
-};
+use nix::{ifaddrs::getifaddrs, net::if_::if_nametoindex, sys::statfs::statfs};
 use tracing::{debug, info, warn};
 
-use super::{BypassPrefixSnapshot, EbpfInboundError, socket::FamilySockets};
+use super::{
+    BypassPrefixSnapshot, EbpfCapabilityReport, EbpfInboundError, capability, socket::FamilySockets,
+};
 
 const FLAG_INCLUDE_UID: u32 = 1 << 0;
 const FLAG_IPV4: u32 = 1 << 1;
@@ -127,6 +125,8 @@ pub(super) struct AyaDataPlane {
     active_bypass_bank: usize,
     bank_v4: [V4PrefixSet; 2],
     bank_v6: [V6PrefixSet; 2],
+    capability_policy: EbpfCapabilityOptions,
+    capability_report: EbpfCapabilityReport,
 }
 
 impl AyaDataPlane {
@@ -134,7 +134,7 @@ impl AyaDataPlane {
         options: &EbpfInboundOptions,
         snapshot: &BypassPrefixSnapshot,
     ) -> Result<Self, EbpfInboundError> {
-        let _ = setrlimit(Resource::RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY);
+        let mut capability_report = capability::prepare(&options.capabilities)?;
         let redirect = options
             .redirect_address
             .iter()
@@ -165,12 +165,30 @@ impl AyaDataPlane {
             .map_max_entries("SHARED_SOURCE_V6", options.map_capacity)
             .map_max_entries("SHARED_EXCLUDE_SOURCE_V4", options.map_capacity)
             .map_max_entries("SHARED_EXCLUDE_SOURCE_V6", options.map_capacity);
-        let mut ebpf = loader
-            .load(aya::include_bytes_aligned!(concat!(
-                env!("OUT_DIR"),
-                "/core-inbound-ebpf"
-            )))
-            .map_err(|error| EbpfInboundError::Aya(format!("load eBPF object: {error}")))?;
+        let object = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/core-inbound-ebpf"));
+        let mut load_result = loader.load(object);
+        if capability_report.authority == super::EbpfBpfAuthority::CapBpf
+            && load_result
+                .as_ref()
+                .is_err_and(|error| is_permission_error(error))
+            && let Some(fallback_report) =
+                capability::prepare_sys_admin_fallback(&options.capabilities)?
+        {
+            warn!(
+                target: "inbound::ebpf",
+                primary_authority = capability_report.authority.as_str(),
+                fallback_authority = fallback_report.authority.as_str(),
+                "BPF load was denied with CAP_BPF; retrying Android vendor compatibility authority"
+            );
+            capability_report = fallback_report;
+            load_result = loader.load(object);
+        }
+        let mut ebpf = load_result.map_err(|error| {
+            EbpfInboundError::Aya(format!(
+                "load eBPF object: {error}; runtime: {}",
+                ebpf_runtime_diagnostics()
+            ))
+        })?;
 
         let include_ranges = parse_ranges(&options.include_uid_range)?;
         let exclude_ranges = parse_ranges(&options.exclude_uid_range)?;
@@ -257,12 +275,32 @@ impl AyaDataPlane {
             active_bypass_bank: 0,
             bank_v4: [BTreeSet::new(), BTreeSet::new()],
             bank_v6: [BTreeSet::new(), BTreeSet::new()],
+            capability_policy: options.capabilities.clone(),
+            capability_report,
         };
         plane.replace_bypass(options, snapshot)?;
         Ok(plane)
     }
 
     pub(super) fn attach_lookup(&mut self, tc_priority: u16) -> Result<(), EbpfInboundError> {
+        capability::ensure_current_thread(&self.capability_policy)?;
+        #[cfg(target_os = "android")]
+        {
+            info!(
+                target: "inbound::ebpf",
+                attach = "tc_ingress",
+                interface = "lo",
+                "using Android-compatible mark-gated socket assignment"
+            );
+            return self.attach_tc_lookup(tc_priority);
+        }
+
+        #[cfg(not(target_os = "android"))]
+        self.attach_linux_lookup(tc_priority)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn attach_linux_lookup(&mut self, tc_priority: u16) -> Result<(), EbpfInboundError> {
         let netns = File::open("/proc/self/ns/net")
             .map_err(|error| EbpfInboundError::Aya(format!("open current netns: {error}")))?;
         let link_result = (|| {
@@ -291,11 +329,23 @@ impl AyaDataPlane {
                 Ok(())
             }
             Err(link_error) => {
-                warn!(
-                    target: "inbound::ebpf",
-                    error = %link_error,
-                    "netns sk_lookup link unavailable; using loopback TC socket assignment"
-                );
+                if is_sk_lookup_context_incompatible(&link_error) {
+                    info!(
+                        target: "inbound::ebpf",
+                        "kernel sk_lookup context lacks ingress_ifindex; using mark-gated loopback TC socket assignment"
+                    );
+                    debug!(
+                        target: "inbound::ebpf",
+                        error = %link_error,
+                        "sk_lookup verifier compatibility detail"
+                    );
+                } else {
+                    warn!(
+                        target: "inbound::ebpf",
+                        error = %link_error,
+                        "netns sk_lookup link unavailable; using loopback TC socket assignment"
+                    );
+                }
                 self.attach_tc_lookup(tc_priority)
                     .map_err(|fallback_error| {
                         EbpfInboundError::Aya(format!(
@@ -363,8 +413,10 @@ impl AyaDataPlane {
     }
 
     pub(super) fn attach_cgroup(&mut self, path: &Path) -> Result<(), EbpfInboundError> {
-        let cgroup = File::open(path).map_err(|error| {
-            EbpfInboundError::Aya(format!("open cgroup {}: {error}", path.display()))
+        capability::ensure_current_thread(&self.capability_policy)?;
+        let path = resolve_cgroup2_path(path)?;
+        let cgroup = File::open(&path).map_err(|error| {
+            EbpfInboundError::Aya(format!("open cgroup v2 {}: {error}", path.display()))
         })?;
         for name in CGROUP_PROGRAMS {
             let program: &mut CgroupSockAddr = self
@@ -372,17 +424,33 @@ impl AyaDataPlane {
                 .program_mut(name)
                 .ok_or_else(|| missing_program(name))?
                 .try_into()
-                .map_err(program_error)?;
-            program.load().map_err(program_error)?;
+                .map_err(|error| {
+                    program_context_error(&format!("prepare cgroup program {name}"), error)
+                })?;
+            program.load().map_err(|error| {
+                program_context_error(&format!("load cgroup program {name}"), error)
+            })?;
             let link = program
                 .attach(&cgroup, CgroupAttachMode::AllowMultiple)
-                .map_err(program_error)?;
+                .map_err(|error| {
+                    program_context_error(
+                        &format!("attach cgroup program {name} to {}", path.display()),
+                        error,
+                    )
+                })?;
             self.cgroup_links.push((name, link));
         }
+        info!(
+            target: "inbound::ebpf",
+            path = %path.display(),
+            programs = CGROUP_PROGRAMS.len(),
+            "cgroup v2 eBPF programs attached"
+        );
         Ok(())
     }
 
     pub(super) fn detach_cgroup(&mut self) -> Result<(), EbpfInboundError> {
+        capability::ensure_current_thread(&self.capability_policy)?;
         let mut first_error = None;
         while let Some((name, link)) = self.cgroup_links.pop() {
             let result = (|| {
@@ -410,6 +478,7 @@ impl AyaDataPlane {
         &mut self,
         shared: &EbpfSharedNetworkOptions,
     ) -> Result<Vec<String>, EbpfInboundError> {
+        capability::ensure_current_thread(&self.capability_policy)?;
         if !shared.enabled {
             self.detach_shared_interfaces()?;
             return Ok(Vec::new());
@@ -446,6 +515,7 @@ impl AyaDataPlane {
     }
 
     pub(super) fn detach_shared_interfaces(&mut self) -> Result<(), EbpfInboundError> {
+        capability::ensure_current_thread(&self.capability_policy)?;
         let names = self.shared_links.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
         for name in names {
@@ -580,6 +650,7 @@ impl AyaDataPlane {
     }
 
     pub(super) fn detach_lookup(&mut self) -> Result<(), EbpfInboundError> {
+        capability::ensure_current_thread(&self.capability_policy)?;
         let mut first_error = None;
         if let Some(link) = self.lookup_link.take() {
             let result = self
@@ -638,6 +709,10 @@ impl AyaDataPlane {
             })?);
         }
         Ok((tcp, udp, self.sockets.anchors.clone()))
+    }
+
+    pub(super) fn capability_report(&self) -> &EbpfCapabilityReport {
+        &self.capability_report
     }
 
     pub(super) fn replace_bypass(
@@ -1127,6 +1202,69 @@ fn program_phase_error(
     EbpfInboundError::Aya(format!("{phase}: {}", format_error_chain(&error)))
 }
 
+fn program_context_error(
+    context: &str,
+    error: impl std::error::Error + 'static,
+) -> EbpfInboundError {
+    EbpfInboundError::Aya(format!(
+        "{context}: {}; runtime: {}",
+        format_error_chain(&error),
+        ebpf_runtime_diagnostics()
+    ))
+}
+
+fn resolve_cgroup2_path(requested: &Path) -> Result<PathBuf, EbpfInboundError> {
+    if is_cgroup2(requested) {
+        return Ok(requested.to_path_buf());
+    }
+    if requested == Path::new("/sys/fs/cgroup")
+        && let Some(discovered) = discover_cgroup2_mount()
+    {
+        info!(
+            target: "inbound::ebpf",
+            requested = %requested.display(),
+            discovered = %discovered.display(),
+            "using discovered cgroup v2 mount"
+        );
+        return Ok(discovered);
+    }
+    let kind = statfs(requested)
+        .map(|value| format!("filesystem magic=0x{:x}", value.filesystem_type().0))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    Err(EbpfInboundError::Capability(format!(
+        "cgroup_path {} is not a cgroup v2 mount ({kind}); BPF_CGROUP_INET4/6_CONNECT and \
+         SENDMSG require CONFIG_CGROUP_BPF on a cgroup v2 hierarchy",
+        requested.display()
+    )))
+}
+
+fn is_cgroup2(path: &Path) -> bool {
+    statfs(path)
+        .is_ok_and(|value| value.filesystem_type().0 as u64 == libc::CGROUP2_SUPER_MAGIC as u64)
+}
+
+fn discover_cgroup2_mount() -> Option<PathBuf> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mountinfo.lines().find_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        (filesystem.split_whitespace().next()? == "cgroup2")
+            .then(|| mount.split_whitespace().nth(4))
+            .flatten()
+            .map(decode_mountinfo_path)
+            .filter(|path| is_cgroup2(path))
+    })
+}
+
+fn decode_mountinfo_path(value: &str) -> PathBuf {
+    PathBuf::from(
+        value
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\"),
+    )
+}
+
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
@@ -1139,6 +1277,27 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = error.source();
     }
     message
+}
+
+fn is_permission_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let message = format_error_chain(error).to_ascii_lowercase();
+    [
+        "permission denied",
+        "operation not permitted",
+        "os error 1",
+        "os error 13",
+        "eperm",
+        "eacces",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+#[cfg(not(target_os = "android"))]
+fn is_sk_lookup_context_incompatible(error: &EbpfInboundError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("invalid bpf_context access")
+        && (message.contains("off=64") || message.contains("ingress_ifindex"))
 }
 
 fn ebpf_runtime_diagnostics() -> String {
@@ -1248,5 +1407,34 @@ mod tests {
         let policy = compile_shared_source_policy(&shared).unwrap();
         assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V4 != 0);
         assert!(policy.flags & FLAG_SHARED_SOURCE_ANY_V6 != 0);
+    }
+
+    #[test]
+    fn mountinfo_path_decoder_handles_kernel_escapes() {
+        assert_eq!(
+            decode_mountinfo_path("/sys/fs/cgroup\\040unified"),
+            PathBuf::from("/sys/fs/cgroup unified")
+        );
+        assert_eq!(decode_mountinfo_path("/a\\134b"), PathBuf::from("/a\\b"));
+    }
+
+    #[test]
+    fn permission_classifier_handles_android_errno_text() {
+        let error = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(is_permission_error(&error));
+        let error = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!is_permission_error(&error));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn old_sk_lookup_context_is_classified_as_compatibility_issue() {
+        let error = EbpfInboundError::Aya(
+            "load sk_lookup program: Permission denied; invalid bpf_context access off=64 size=4"
+                .to_owned(),
+        );
+        assert!(is_sk_lookup_context_incompatible(&error));
+        let error = EbpfInboundError::Aya("attach sk_lookup: operation not permitted".to_owned());
+        assert!(!is_sk_lookup_context_incompatible(&error));
     }
 }

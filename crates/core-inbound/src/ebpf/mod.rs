@@ -7,6 +7,7 @@
 //! and an `sk_lookup` program assigns them directly to proxy-owned sockets.
 
 mod aya_runtime;
+mod capability;
 mod relay;
 mod route;
 mod ruleset;
@@ -24,6 +25,7 @@ use tokio::{
 use tracing::{info, warn};
 
 pub use aya_runtime::EbpfStats;
+pub use capability::{EbpfBpfAuthority, EbpfCapabilityReport, EbpfMemlockStatus};
 
 use aya_runtime::AyaDataPlane;
 use route::PolicyRoute;
@@ -65,6 +67,8 @@ pub enum EbpfInboundError {
     Configuration(String),
     #[error("Aya eBPF error: {0}")]
     Aya(String),
+    #[error("eBPF capability error: {0}")]
+    Capability(String),
     #[error("eBPF socket error: {0}")]
     Socket(String),
     #[error("eBPF policy-route error: {0}")]
@@ -82,6 +86,7 @@ pub struct EbpfInboundStatus {
     pub anchors: Vec<std::net::SocketAddr>,
     pub shared_interfaces: Vec<String>,
     pub rule_set_revision: u64,
+    pub capabilities: EbpfCapabilityReport,
     pub stats: EbpfStats,
 }
 
@@ -144,6 +149,7 @@ pub async fn start_ebpf_inbound(
         .iter()
         .any(|value| matches!(value.parse::<ipnet::IpNet>(), Ok(ipnet::IpNet::V6(_))));
     let policy = match PolicyRoute::install(
+        &options.capabilities,
         options.mark,
         options.route_table,
         options.rule_priority,
@@ -202,12 +208,14 @@ pub async fn start_ebpf_inbound(
     }
 
     let initial_stats = plane.stats().unwrap_or_default();
+    let capabilities = plane.capability_report().clone();
     let initial_status = EbpfInboundStatus {
         tag: options.tag.clone(),
         running: true,
         anchors: anchors.clone(),
         shared_interfaces: shared_interfaces.clone(),
         rule_set_revision: snapshot.revision,
+        capabilities: capabilities.clone(),
         stats: initial_stats,
     };
     let (status_tx, status_rx) = watch::channel(initial_status);
@@ -223,6 +231,7 @@ pub async fn start_ebpf_inbound(
         stop_rx,
         status_tx,
         anchors.clone(),
+        capabilities,
     ));
     info!(
         target: "inbound::ebpf",
@@ -269,6 +278,7 @@ async fn run_controller(
     mut stop: oneshot::Receiver<()>,
     status: watch::Sender<EbpfInboundStatus>,
     anchors: Vec<std::net::SocketAddr>,
+    capabilities: EbpfCapabilityReport,
 ) -> Result<(), EbpfInboundError> {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -355,6 +365,7 @@ async fn run_controller(
         anchors,
         shared_interfaces: plane.shared_interfaces(),
         rule_set_revision: revision,
+        capabilities,
         stats,
     });
     shared_detach_result?;

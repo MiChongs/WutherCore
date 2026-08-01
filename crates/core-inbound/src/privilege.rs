@@ -35,6 +35,10 @@ pub struct PrivilegeReport {
     pub can_create_tun: bool,
     pub can_modify_routes: bool,
     pub can_iptables: bool,
+    /// Current thread can authorize privileged BPF map/program operations.
+    pub can_load_ebpf: bool,
+    /// Current thread has both BPF authority and CAP_NET_ADMIN.
+    pub can_attach_network_ebpf: bool,
     /// Android：是否检测到 `su` 可执行（不一定有 root，需调 try_request_root 验证）。
     pub android_su_present: bool,
     /// Linux capabilities 概要（如 "CAP_NET_ADMIN"）。
@@ -79,6 +83,10 @@ fn detect_unix() -> PrivilegeReport {
         ));
     }
 
+    let linux_caps = cfg!(any(target_os = "linux", target_os = "android"));
+    let has = |name: &str| capabilities.iter().any(|capability| capability == name);
+    let net_admin = has("cap_net_admin");
+    let bpf_authority = has("cap_bpf") || has("cap_sys_admin");
     PrivilegeReport {
         level: if elevated {
             PrivilegeLevel::Elevated
@@ -88,10 +96,12 @@ fn detect_unix() -> PrivilegeReport {
         platform: std::env::consts::OS,
         username,
         uid: Some(uid),
-        can_bind_low_ports: elevated || capabilities.iter().any(|c| c == "cap_net_bind_service"),
-        can_create_tun: elevated || capabilities.iter().any(|c| c == "cap_net_admin"),
-        can_modify_routes: elevated || capabilities.iter().any(|c| c == "cap_net_admin"),
-        can_iptables: elevated || capabilities.iter().any(|c| c == "cap_net_admin"),
+        can_bind_low_ports: (!linux_caps && elevated) || has("cap_net_bind_service"),
+        can_create_tun: (!linux_caps && elevated) || net_admin,
+        can_modify_routes: (!linux_caps && elevated) || net_admin,
+        can_iptables: linux_caps && net_admin,
+        can_load_ebpf: linux_caps && bpf_authority,
+        can_attach_network_ebpf: linux_caps && net_admin && bpf_authority,
         android_su_present: cfg!(target_os = "android") && su_present,
         capabilities,
         notes,
@@ -100,6 +110,16 @@ fn detect_unix() -> PrivilegeReport {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_linux_capabilities() -> Vec<String> {
+    #[cfg(feature = "with_ebpf")]
+    if let Ok(effective) = caps::read(None, caps::CapSet::Effective) {
+        let mut capabilities = effective
+            .into_iter()
+            .map(|capability| format!("{capability:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        capabilities.sort_unstable();
+        return capabilities;
+    }
+
     // /proc/self/status 中的 CapEff 是 hex 位掩码；解析常见位即可。
     let content = match std::fs::read_to_string("/proc/self/status") {
         Ok(s) => s,
@@ -124,6 +144,15 @@ fn read_linux_capabilities() -> Vec<String> {
     }
     if bits & (1 << 21) != 0 {
         caps.push("cap_sys_admin".into());
+    }
+    if bits & (1 << 38) != 0 {
+        caps.push("cap_perfmon".into());
+    }
+    if bits & (1 << 39) != 0 {
+        caps.push("cap_bpf".into());
+    }
+    if bits & (1 << 40) != 0 {
+        caps.push("cap_checkpoint_restore".into());
     }
     caps
 }
@@ -163,6 +192,8 @@ fn detect_windows() -> PrivilegeReport {
         can_create_tun: elevated,
         can_modify_routes: elevated,
         can_iptables: false,
+        can_load_ebpf: false,
+        can_attach_network_ebpf: false,
         android_su_present: false,
         capabilities: vec![],
         notes,
@@ -187,6 +218,8 @@ fn detect_other() -> PrivilegeReport {
         can_create_tun: false,
         can_modify_routes: false,
         can_iptables: false,
+        can_load_ebpf: false,
+        can_attach_network_ebpf: false,
         android_su_present: false,
         capabilities: vec![],
         notes: vec!["平台未识别，所有特权能力默认关闭".into()],
@@ -203,11 +236,11 @@ impl PrivilegeReport {
             target_os = "freebsd"
         ))]
         {
-            return detect_unix();
+            detect_unix()
         }
         #[cfg(target_os = "windows")]
         {
-            return detect_windows();
+            detect_windows()
         }
         #[cfg(not(any(
             target_os = "linux",
@@ -218,7 +251,7 @@ impl PrivilegeReport {
             target_os = "windows"
         )))]
         {
-            return detect_other();
+            detect_other()
         }
     }
 }
@@ -281,6 +314,8 @@ pub async fn ensure_best_effort_privilege() -> PrivilegeReport {
         can_bind_low = report.can_bind_low_ports,
         can_tun = report.can_create_tun,
         can_route = report.can_modify_routes,
+        can_bpf = report.can_load_ebpf,
+        can_network_bpf = report.can_attach_network_ebpf,
         "privilege detected"
     );
     report

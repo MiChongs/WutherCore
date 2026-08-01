@@ -1604,6 +1604,7 @@ dependencies = [
  "boring",
  "boring-sys",
  "bytes",
+ "caps",
  "chrono",
  "core-capture",
  "core-config",

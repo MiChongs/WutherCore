@@ -120,6 +120,9 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+    capabilities:
+      auto_raise: true
+      allow_sys_admin_fallback: true
     shared_network:
       enabled: true
       include_interface: [ap*, wlan*, rndis*, usb*, bt-pan*, br*, eth*, en*]
@@ -141,7 +144,8 @@ inbounds:
 默认关闭，避免热点大流量时为每个包写统计 Map；需要排障时可设置
 `packet_stats: true`。
 
-该入口要求 `with_ebpf` 组件, root 或等价的 BPF 与网络管理能力, cgroup v2,
+该入口要求 `with_ebpf` 组件, effective `CAP_NET_ADMIN` 加 `CAP_BPF`, 或使用
+`CAP_SYS_ADMIN` 的旧内核兼容路径, 同时要求 cgroup v2,
 以及 cgroup sock_addr。socket 分配可以使用 sk_lookup，也可以使用 TC ingress
 兼容路径。完整部署, 字段语义和诊断方法见[Aya eBPF 入站](ebpf-inbound.md)。
 

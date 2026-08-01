@@ -12,6 +12,7 @@ with_tun = ["dep:core-capture"]
 with_ebpf = [
     "dep:aya",
     "dep:aya-build",
+    "dep:caps",
     "dep:core-ruleset",
     "dep:globset",
     "dep:ipnet",
@@ -106,6 +107,7 @@ nix = { version = "0.31", features = ["user", "fs", "net", "socket", "uio", "res
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 aya = { version = "0.14.0", default-features = false, optional = true }
+caps = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 rtnetlink = { workspace = true, optional = true }
 

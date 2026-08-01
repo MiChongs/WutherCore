@@ -5502,6 +5502,9 @@ pub struct EbpfInboundOptions {
     pub mark: u32,
     #[serde(default = "default_ebpf_map_capacity")]
     pub map_capacity: u32,
+    /// Linux capability handling for the eBPF data plane.
+    #[serde(default)]
+    pub capabilities: EbpfCapabilityOptions,
     /// Optional hotspot, tethering, bridge, and router-forwarding data path.
     #[serde(
         default,
@@ -5517,6 +5520,38 @@ pub struct EbpfInboundOptions {
         alias = "dns-mode"
     )]
     pub resolver: CaptureResolver,
+}
+
+/// Capability policy used while loading and maintaining the eBPF inbound.
+///
+/// Linux capabilities are thread-local. The runtime therefore checks every
+/// privileged attach/reconcile path instead of assuming that uid 0 implies a
+/// complete capability set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EbpfCapabilityOptions {
+    /// Promote a required capability from the permitted set into the effective
+    /// set on the current worker thread before a privileged operation.
+    #[serde(default = "default_true", rename = "auto_raise", alias = "auto-raise")]
+    pub auto_raise: bool,
+    /// Accept CAP_SYS_ADMIN as the kernel-compatible BPF authority when
+    /// CAP_BPF is unavailable. Required by kernels predating CAP_BPF and some
+    /// Android vendor backports.
+    #[serde(
+        default = "default_true",
+        rename = "allow_sys_admin_fallback",
+        alias = "allow-sys-admin-fallback"
+    )]
+    pub allow_sys_admin_fallback: bool,
+}
+
+impl Default for EbpfCapabilityOptions {
+    fn default() -> Self {
+        Self {
+            auto_raise: true,
+            allow_sys_admin_fallback: true,
+        }
+    }
 }
 
 /// Forwarded-device capture for Linux routers and Android hotspot/tethering.
@@ -6529,6 +6564,9 @@ bypass_rule_set: cnip
 include_uid: [1000, 1001]
 include_uid_range: "10000:19999"
 exclude_uid: 0
+capabilities:
+  auto_raise: false
+  allow_sys_admin_fallback: false
 shared_network:
   enabled: true
   include_interface: [ap*, rndis*]
@@ -6550,6 +6588,8 @@ dns_mode: hijack
         assert_eq!(options.include_uid, [1000, 1001]);
         assert_eq!(options.include_uid_range, ["10000:19999"]);
         assert_eq!(options.exclude_uid, [0]);
+        assert!(!options.capabilities.auto_raise);
+        assert!(!options.capabilities.allow_sys_admin_fallback);
         assert!(options.shared_network.enabled);
         assert_eq!(options.shared_network.include_interface, ["ap*", "rndis*"]);
         assert_eq!(

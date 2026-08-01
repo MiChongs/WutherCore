@@ -20,6 +20,9 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+    capabilities:
+      auto_raise: true
+      allow_sys_admin_fallback: true
     shared_network:
       enabled: true
       include_interface:

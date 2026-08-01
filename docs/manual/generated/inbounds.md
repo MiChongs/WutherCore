@@ -14,7 +14,7 @@ hide:
 
 Mixed、TUN、TPROXY、REDIRECT、Panel、Shadowsocks、WireGuard、Young、gRPC、REALITY 和 XHTTP 入站。
 
-全手册当前覆盖 **825 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **828 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `Inbound`
@@ -275,42 +275,54 @@ Xray REALITY 服务端监听配置。 字段名同时接受 Xray 的 camelCase �
 
 Aya eBPF inbound. The cgroup programs select local TCP and UDP sockets by UID and destination, TC ingress selects hotspot and forwarded-device traffic. Socket assignment prefers `sk_lookup` and automatically falls back to loopback TC ingress on Android kernels that reject netns BPF links. Neither path requires iptables, nftables, TPROXY, or destination NAT.
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5471)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5472)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `tag` | `字符串` | 可选；默认 `ebpf-in` | 无 | 无 | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5473) |
-| `enabled` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5475) |
-| `redirect_address` | `字符串 列表` | 可选；默认 `vec!["127.128.0.0/9".into(), "2001:db8:2030::/64".into()]` | 无 | 无 | `EbpfInboundOptions` 的 `redirect_address` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5478) |
-| `bypass_rule_set` | `字符串 列表` | 可选；默认空 | 无 | 无 | `EbpfInboundOptions` 的 `bypass_rule_set` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5481) |
-| `include_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5484) |
-| `include_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5487) |
-| `exclude_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5490) |
-| `exclude_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5493) |
-| `cgroup_path` | `PathBuf` | 可选；默认 `PathBuf::from("/sys/fs/cgroup")` | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5495) |
-| `route_table` | `非负整数` | 可选；由 `default_ebpf_route_table()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `route_table` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5497) |
-| `rule_priority` | `非负整数` | 可选；由 `default_ebpf_rule_priority()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `rule_priority` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5499) |
-| `mark` | `非负整数` | 可选；由 `default_ebpf_mark()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `mark` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5501) |
-| `map_capacity` | `非负整数` | 可选；由 `default_ebpf_map_capacity()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `map_capacity` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5503) |
-| `shared_network` | `EbpfSharedNetworkOptions` | 可选；使用类型默认值 | `shared-network`<br>`hotspot`<br>`tethering` | 无 | Optional hotspot, tethering, bridge, and router-forwarding data path. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5512) |
-| `dns_mode` | `CaptureResolver` | 可选；默认 `hijack` | `dns-mode` | 无 | `EbpfInboundOptions` 的 `dns_mode` 参数。解析类型为 `CaptureResolver`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5518) |
+| `tag` | `字符串` | 可选；默认 `ebpf-in` | 无 | 无 | 用于显示、日志和其它配置项引用的稳定名称。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5474) |
+| `enabled` | `布尔值` | 可选；默认 `true` | 无 | 无 | 控制该配置块是否启用；关闭时保留配置但不启动对应运行时能力。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5476) |
+| `redirect_address` | `字符串 列表` | 可选；默认 `vec!["127.128.0.0/9".into(), "2001:db8:2030::/64".into()]` | 无 | 无 | `EbpfInboundOptions` 的 `redirect_address` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5479) |
+| `bypass_rule_set` | `字符串 列表` | 可选；默认空 | 无 | 无 | `EbpfInboundOptions` 的 `bypass_rule_set` 参数。解析类型为 `字符串 列表`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5482) |
+| `include_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5485) |
+| `include_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5488) |
+| `exclude_uid` | `非负整数 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5491) |
+| `exclude_uid_range` | `字符串 列表` | 可选；默认空 | 无 | 无 | 包含/排除过滤条件；与同配置块其它过滤器的组合规则见对应语义手册。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5494) |
+| `cgroup_path` | `PathBuf` | 可选；默认 `PathBuf::from("/sys/fs/cgroup")` | 无 | 无 | 文件或 URL 路径；相对路径按运行进程的工作目录解析。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5496) |
+| `route_table` | `非负整数` | 可选；由 `default_ebpf_route_table()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `route_table` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5498) |
+| `rule_priority` | `非负整数` | 可选；由 `default_ebpf_rule_priority()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `rule_priority` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5500) |
+| `mark` | `非负整数` | 可选；由 `default_ebpf_mark()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `mark` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5502) |
+| `map_capacity` | `非负整数` | 可选；由 `default_ebpf_map_capacity()` 决定 | 无 | 无 | `EbpfInboundOptions` 的 `map_capacity` 参数。解析类型为 `非负整数`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5504) |
+| `capabilities` | `EbpfCapabilityOptions` | 可选；使用类型默认值 | 无 | 无 | Linux capability handling for the eBPF data plane. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5507) |
+| `shared_network` | `EbpfSharedNetworkOptions` | 可选；使用类型默认值 | `shared-network`<br>`hotspot`<br>`tethering` | 无 | Optional hotspot, tethering, bridge, and router-forwarding data path. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5516) |
+| `dns_mode` | `CaptureResolver` | 可选；默认 `hijack` | `dns-mode` | 无 | `EbpfInboundOptions` 的 `dns_mode` 参数。解析类型为 `CaptureResolver`；组合约束由 `wuther-core check` 校验。 [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5522) |
+
+## `EbpfCapabilityOptions`
+
+Capability policy used while loading and maintaining the eBPF inbound. Linux capabilities are thread-local. The runtime therefore checks every privileged attach/reconcile path instead of assuming that uid 0 implies a complete capability set.
+
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5532)
+
+| YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
+| --- | --- | --- | --- | --- | --- |
+| `auto_raise` | `布尔值` | 可选；默认 `true` | `auto-raise` | 无 | Promote a required capability from the permitted set into the effective set on the current worker thread before a privileged operation. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5536) |
+| `allow_sys_admin_fallback` | `布尔值` | 可选；默认 `true` | `allow-sys-admin-fallback` | 无 | Accept CAP_SYS_ADMIN as the kernel-compatible BPF authority when CAP_BPF is unavailable. Required by kernels predating CAP_BPF and some Android vendor backports. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5545) |
 
 ## `EbpfSharedNetworkOptions`
 
 Forwarded-device capture for Linux routers and Android hotspot/tethering. The TC ingress program is attached only to interfaces matched by `include_interface` and not matched by `exclude_interface`. Source filters are evaluated before a packet receives the eBPF inbound mark.
 
-[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5529)
+[查看权威源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5565)
 
 | YAML / JSON 字段 | 类型 | 必填与默认 | 兼容别名 | 取值 / 形态 | 解析与用途 |
 | --- | --- | --- | --- | --- | --- |
-| `enabled` | `布尔值` | 可选；默认 `false` | 无 | 无 | Enable TC ingress capture for forwarded devices. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5532) |
-| `include_interface` | `字符串 列表` | 可选；默认 `[ "ap*", "swlan*", "wlan*", "rndis*", "usb*", "bt-pan*", "bnep*", "br*", "eth*", "en*", ] .into_iter() .map(str::to_owned) .collect()` | 无 | 无 | Interface-name glob patterns eligible for dynamic TC attachment. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5536) |
-| `exclude_interface` | `字符串 列表` | 可选；默认 `[ "lo", "tun*", "tap*", "wg*", "rpktun*", "docker*", "veth*", "rmnet*", "ccmni*", "wwan*", ] .into_iter() .map(str::to_owned) .collect()` | 无 | 无 | Interface-name glob patterns removed from the eligible set. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5540) |
-| `include_source_address` | `字符串 列表` | 可选；默认 `vec!["0.0.0.0/0".into(), "::/0".into()]` | 无 | 无 | Source CIDRs accepted from selected downstream interfaces. An empty list accepts every source address. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5546) |
-| `exclude_source_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | Source CIDRs bypassed before the include set is evaluated. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5550) |
-| `interface_refresh_interval` | `时长` | 可选；由 `default_ebpf_interface_refresh_interval()` 决定 | 无 | 无 | Polling interval used to attach newly created hotspot interfaces and detach interfaces removed by Android or Linux network management. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5557) |
-| `packet_stats` | `布尔值` | 可选；默认 `false` | 无 | 无 | Collect per-packet TC diagnostics for shared-network traffic. Disabled by default because updating a BPF counter for every forwarded packet adds measurable CPU cost on mobile hotspots. Flow-level lookup and local socket counters remain available when this is disabled. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5564) |
-| `tc_priority` | `0-65535 整数` | 可选；由 `default_ebpf_tc_priority()` 决定 | 无 | 无 | Legacy clsact filter priority. Lower values run before tethering offload. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5567) |
+| `enabled` | `布尔值` | 可选；默认 `false` | 无 | 无 | Enable TC ingress capture for forwarded devices. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5568) |
+| `include_interface` | `字符串 列表` | 可选；默认 `[ "ap*", "swlan*", "wlan*", "rndis*", "usb*", "bt-pan*", "bnep*", "br*", "eth*", "en*", ] .into_iter() .map(str::to_owned) .collect()` | 无 | 无 | Interface-name glob patterns eligible for dynamic TC attachment. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5572) |
+| `exclude_interface` | `字符串 列表` | 可选；默认 `[ "lo", "tun*", "tap*", "wg*", "rpktun*", "docker*", "veth*", "rmnet*", "ccmni*", "wwan*", ] .into_iter() .map(str::to_owned) .collect()` | 无 | 无 | Interface-name glob patterns removed from the eligible set. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5576) |
+| `include_source_address` | `字符串 列表` | 可选；默认 `vec!["0.0.0.0/0".into(), "::/0".into()]` | 无 | 无 | Source CIDRs accepted from selected downstream interfaces. An empty list accepts every source address. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5582) |
+| `exclude_source_address` | `字符串 列表` | 可选；默认 空 | 无 | 无 | Source CIDRs bypassed before the include set is evaluated. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5586) |
+| `interface_refresh_interval` | `时长` | 可选；由 `default_ebpf_interface_refresh_interval()` 决定 | 无 | 无 | Polling interval used to attach newly created hotspot interfaces and detach interfaces removed by Android or Linux network management. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5593) |
+| `packet_stats` | `布尔值` | 可选；默认 `false` | 无 | 无 | Collect per-packet TC diagnostics for shared-network traffic. Disabled by default because updating a BPF counter for every forwarded packet adds measurable CPU cost on mobile hotspots. Flow-level lookup and local socket counters remain available when this is disabled. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5600) |
+| `tc_priority` | `0-65535 整数` | 可选；由 `default_ebpf_tc_priority()` 决定 | 无 | 无 | Legacy clsact filter priority. Lower values run before tethering offload. [源码](https://github.com/MiChongs/WutherCore/blob/main/crates/core-config/src/model.rs#L5603) |
 
 ## 本分类枚举
 

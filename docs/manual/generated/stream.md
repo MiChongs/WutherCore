@@ -14,7 +14,7 @@ hide:
 
 Xray 兼容 streamSettings、sockopt、Happy Eyeballs 与 FinalMask 配置。
 
-全手册当前覆盖 **825 个字段**、**55 个枚举类型**。
+全手册当前覆盖 **828 个字段**、**55 个枚举类型**。
 行为说明和跨字段约束请同时阅读同分类下的人工手册页面。
 
 ## `NodeStreamSettings`

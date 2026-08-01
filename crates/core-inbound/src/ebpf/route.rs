@@ -1,3 +1,4 @@
+use core_config::model::EbpfCapabilityOptions;
 use futures::TryStreamExt;
 use rtnetlink::{
     Handle, RouteMessageBuilder,
@@ -7,7 +8,7 @@ use rtnetlink::{
     },
 };
 
-use super::EbpfInboundError;
+use super::{EbpfInboundError, capability};
 
 pub(super) struct PolicyRoute {
     mark: u32,
@@ -16,16 +17,19 @@ pub(super) struct PolicyRoute {
     ipv4: bool,
     ipv6: bool,
     active: bool,
+    capability_policy: EbpfCapabilityOptions,
 }
 
 impl PolicyRoute {
     pub(super) async fn install(
+        capability_policy: &EbpfCapabilityOptions,
         mark: u32,
         table: u32,
         priority: u32,
         ipv4: bool,
         ipv6: bool,
     ) -> Result<Self, EbpfInboundError> {
+        capability::ensure_current_thread(capability_policy)?;
         let mut lease = Self {
             mark,
             table,
@@ -33,6 +37,7 @@ impl PolicyRoute {
             ipv4,
             ipv6,
             active: false,
+            capability_policy: capability_policy.clone(),
         };
         lease.remove_kernel_state().await;
 
@@ -74,6 +79,14 @@ impl PolicyRoute {
     }
 
     async fn remove_kernel_state(&self) {
+        if let Err(error) = capability::ensure_current_thread(&self.capability_policy) {
+            tracing::warn!(
+                target: "inbound::ebpf",
+                %error,
+                "cannot restore eBPF policy routes because the current runtime thread lacks capabilities"
+            );
+            return;
+        }
         let Ok(handle) = netlink_handle().await else {
             return;
         };

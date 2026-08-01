@@ -19,12 +19,17 @@ PAN、网桥或路由下游接口。它解析 Ethernet、双层 VLAN、IPv4、IP
 分片信息，按源地址与目标旁路集合筛选 TCP/UDP。选中的转发包直接写入同一个
 mark，不依赖发起进程 UID。
 
-对应的 IPv4 或 IPv6 策略路由把带 mark 的包送到本机 local route。核心优先把
+对应的 IPv4 或 IPv6 策略路由把带 mark 的包送到本机 local route。Linux 优先把
 sk_lookup 挂到当前 network namespace，再把 TCP 或 UDP 包分配给
-`core-inbound` 持有的透明 socket。如果 Android 厂商内核允许加载程序却拒绝
-netns `BPF_LINK_CREATE`，核心会自动改用 loopback TC ingress，并通过
-`bpf_sk_assign` 完成同样的 socket 分配。该兼容路径不安装 iptables, nftables,
-TPROXY 或 DNAT。未带专用 mark 的真实本机服务流量不会被接管。
+`core-inbound` 持有的透明 socket。旧 Linux 内核缺少完整 sk_lookup 上下文时会
+自动改用 loopback TC ingress。
+
+Android 直接使用 loopback TC ingress 和 `bpf_sk_assign`。这是因为不少 Android
+厂商内核提供了 `BPF_PROG_TYPE_SK_LOOKUP`，却没有 Linux 5.17 增加的
+`ingress_ifindex` 上下文字段。Android 专用 eBPF 对象不会编译这个不兼容程序，
+因此不会先触发 verifier 的 `invalid bpf_context access off=64`。TC 程序只处理
+带专用 mark 的包，不会接管未标记的真实本机服务流量。两条路径都不安装
+iptables, nftables, TPROXY 或 DNAT。
 
 核心进程自身的 TGID 始终旁路，避免出站再次进入 eBPF 入站。回环、链路本地、
 RFC1918、CGNAT、ULA、组播、广播、redirect 地址和宿主接口地址也会进入内核
@@ -61,6 +66,10 @@ inbounds:
     rule_priority: 8999
     mark: 721
     map_capacity: 65536
+
+    capabilities:
+      auto_raise: true
+      allow_sys_admin_fallback: true
 
     shared_network:
       enabled: true
@@ -114,6 +123,7 @@ inbounds:
 | `rule_priority` | fwmark rule 优先级，必须排在 main rule 之前 |
 | `mark` | eBPF 写入 socket 的非零 mark |
 | `map_capacity` | 每个 UID hash map 和每个 IP LPM map 的容量 |
+| `capabilities` | eBPF 权限探测、线程级提升和旧内核兼容策略 |
 | `shared_network` | 热点、网络共享和路由转发流量接管 |
 | `dns_mode` | `hijack` 接管 TCP/UDP 53，`off` 按普通流量处理 |
 
@@ -206,13 +216,14 @@ GitHub Build Matrix 在选择该标签时会安装并缓存同一套工具。
 
 目标系统需要：
 
-- Linux 或 Android root 环境
+- Linux 或 Android 特权环境
 - cgroup v2 挂载点
 - 支持 cgroup sock_addr 的内核
 - 支持 sk_lookup，或者支持 TC ingress `bpf_sk_assign`
 - 热点共享需要 SCHED_CLS、TCX 或 clsact 支持
-- 可加载 BPF 程序和创建 BPF map 的权限
-- 修改策略路由、socket mark 与透明 socket 的权限
+- `CAP_NET_ADMIN`
+- 现代内核使用 `CAP_BPF`，旧内核或厂商兼容路径使用 `CAP_SYS_ADMIN`
+- 旧式 memlock 记账内核需要足够的 `RLIMIT_MEMLOCK`，提高硬限制时还需要 `CAP_SYS_RESOURCE`
 
 sk_lookup 需要 Linux 5.9 或更新内核。TC socket assignment 从 Linux 5.7 开始
 可用。启动时先尝试 sk_lookup，程序类型不支持或 link attach 失败时自动切换到
@@ -220,6 +231,59 @@ loopback TC。TCX 不可用时继续切换到 clsact netlink。cgroup BPF link �
 继续使用 legacy `BPF_PROG_ATTACH`。只有这些路径全部失败时入口才停止，错误会
 包含失败阶段, syscall errno, 内核版本, CapEff, CapBnd, seccomp 状态和 SELinux
 上下文。
+
+### Capability 处理
+
+eBPF 权限由 `caps` 依赖读取和操作，不再根据 uid 猜测。现代 Linux 的网络 BPF
+程序需要 `CAP_NET_ADMIN` 加 `CAP_BPF`。`CAP_PERFMON` 面向 tracing 和 perf 类型，
+本入口的 cgroup sock_addr、SCHED_CLS 与 sk_lookup 不需要该权限，因此默认不会
+扩大到 `CAP_PERFMON`。旧于 CAP_BPF 的内核以及部分 Android 厂商回移实现可以由
+`CAP_SYS_ADMIN` 提供 BPF authority。
+
+`capabilities.auto_raise: true` 会在每个执行特权操作的 Tokio 线程上，把 permitted
+集合中已有的 `CAP_NET_ADMIN`、`CAP_BPF` 或兼容的 `CAP_SYS_ADMIN` 提升到 effective
+集合。该行为不会扩大 permitted 或 bounding 集合。如果能力不在 permitted 集合，
+或者已经被 capability bounding set、seccomp 或 Android SELinux 拒绝，核心会在
+加载 Aya 对象之前失败并给出三组 capability 状态。
+
+`capabilities.allow_sys_admin_fallback: false` 可以在现代内核上强制只接受最小权限
+`CAP_BPF`。保留默认值可以兼容未实现 CAP_BPF 的旧内核和 Android vendor backport。
+
+推荐的 Linux 文件能力：
+
+```bash
+sudo setcap cap_net_admin,cap_bpf+ep ./wuther-core
+getcap ./wuther-core
+```
+
+旧内核可以使用：
+
+```bash
+sudo setcap cap_net_admin,cap_sys_admin+ep ./wuther-core
+```
+
+systemd 服务可以使用：
+
+```ini
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF
+LimitMEMLOCK=infinity
+```
+
+Android 上的 `su` 必须把对应能力保留给核心进程。只有 `uid=0` 与
+`CAP_NET_ADMIN` 仍不足以执行 `BPF_MAP_CREATE` 和 `BPF_PROG_LOAD`。可以通过以下
+信息核对实际执行上下文：
+
+```bash
+cat /proc/sys/kernel/cap_last_cap
+grep -E '^(Uid|CapEff|CapPrm|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status
+cat /proc/self/attr/current
+```
+
+默认 `cgroup_path` 不是 cgroup v2 时，核心会从 `/proc/self/mountinfo` 自动发现实际
+cgroup v2 挂载点。显式指定的自定义路径必须自身属于 cgroup v2，避免把程序错误
+挂载到 cgroup v1 hierarchy。
 
 ## 启动与清理
 
@@ -245,6 +309,7 @@ wuther-core components
 | --- | --- |
 | 打开 cgroup 失败 | `cgroup_path` 是否存在，是否为 cgroup v2 |
 | 加载或 verifier 失败 | 内核 BPF 配置、程序类型和权限 |
+| capability preflight 失败 | 检查 CAP_NET_ADMIN 与 CAP_BPF，旧内核检查 CAP_SYS_ADMIN |
 | `bpf_link_create` 失败 | 查看后续日志是否已切换为 `tc_ingress`；切换成功不影响接管 |
 | 所有 lookup 挂载方式失败 | 根据错误中的 errno、CapEff、seccomp 和 SELinux 上下文定位内核限制 |
 | 创建透明 socket 失败 | root 或网络管理能力，redirect 地址格式 |
