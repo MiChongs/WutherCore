@@ -93,7 +93,7 @@ def main() -> int:
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with Path(github_output).open("a", encoding="utf-8") as handle:
-            handle.write(f"archive={archive_path.as_posix()}\n")
+            handle.write(f"archive={relative.as_posix()}\n")
             handle.write(f"name={archive_path.name}\n")
     return 0
 
