@@ -61,7 +61,12 @@ capture:
     auto_redirect: false
     strict_route: false
     iproute2_table_index: 2024
+    # Android netd 从优先级 10000 开始。Root TUN 必须放在它之前，旁路规则会
+    # 通过 goto 10000 交还 netd，不能把 main 或 wlan0 当成固定物理表。
     iproute2_rule_index: 9100
+    # 省略时 Android 使用 netd reserved 区间内的 0x200000。
+    # 不要复用 Linux 默认的 0x2024，因为低 16 位在 Android 表示 netId。
+    auto_redirect_output_mark: "0x200000"
     route_exclude_address:
       - 127.0.0.0/8
       - ::1/128

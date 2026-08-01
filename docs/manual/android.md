@@ -219,6 +219,7 @@ capture:
     strict_route: false
     iproute2_table_index: 2024
     iproute2_rule_index: 9100
+    auto_redirect_output_mark: "0x200000"
     route_exclude_address:
       - 127.0.0.0/8
       - ::1/128
@@ -245,10 +246,12 @@ root TUN 启动不是简单打开一个文件描述符。当前实现按下面�
 2. 使用 `TUNSETIFF` 创建或绑定 `interface_name`。
 3. 记录崩溃恢复账本。
 4. 设置接口 MTU、地址和启用状态。
-5. 根据 `auto_route` 安装策略路由。
-6. 安装出站 fwmark 绕行，避免代理出站再次进入 TUN。
-7. 安装 UID、GID 和 Android 包名的内核级绕行规则。
-8. 启动 TUN dispatcher，接管设备读写。
+5. 检查私有路由表没有被 netd 或其他进程占用。
+6. 通过 rtnetlink 写入 static 和 link scope 的 TUN 路由。
+7. 在 netd 优先级之前安装 `iif lo`，UID range 和 fwmark 规则。
+8. 旁路规则使用 `goto 10000` 交还 netd，不缓存 Wi-Fi 或蜂窝表号。
+9. 安装 GID 的内核级绕行规则。
+10. 启动 TUN dispatcher，接管设备读写。
 
 如果 root TUN 成功打开，即使宿主已经注入 VpnService fd，也优先使用 root TUN。
 此时 native 自己管理接口和路由，不需要 `VpnService.protect`。
@@ -263,7 +266,8 @@ root TUN 启动不是简单打开一个文件描述符。当前实现按下面�
 | `auto_route` | 安装接管路由和出站绕行规则 |
 | `strict_route` | 安装更严格的防泄漏路由，首次部署建议关闭 |
 | `iproute2_table_index` | root TUN 私有路由表，默认回填为 2022 |
-| `iproute2_rule_index` | root TUN 规则优先级，默认回填为 9000 |
+| `iproute2_rule_index` | root TUN 规则优先级，必须小于 Android netd 的 10000，默认 9000 |
+| `auto_redirect_output_mark` | Android 默认 `0x200000`，只能使用 netd reserved 位 21 到 28 |
 | `route_address` | 只把指定目的 CIDR 导入 TUN |
 | `route_exclude_address` | 明确绕过 TUN 的静态 CIDR |
 | `route_address_set` | 使用规则集生成的动态接管集合 |
@@ -274,6 +278,17 @@ root TUN 启动不是简单打开一个文件描述符。当前实现按下面�
 
 `auto_redirect` 必须保持 `false`。Android root TUN 本身已经是完整接管路径，
 Linux `auto_redirect` 的 TCP NAT 和 UDP TUN 混合逻辑在 Android 上会被明确拒绝。
+
+Android 不使用 Linux 的 `main` 表作为物理出口。系统网络由 netd 按 netId，UID，
+绑定接口和 VPN 状态动态选择，实际表号通常随接口 ifindex 和网络切换变化。Root TUN
+只拥有 `iproute2_table_index` 指定的私有表。代理出站，排除地址和排除 UID 命中后
+会跳到 netd 的规则区继续计算，因此 Wi-Fi，蜂窝，双卡，工作资料和按应用默认网络
+切换时不需要重建一组写死的物理表规则。
+
+Linux 常用的 `0x2024` 在 Android 上不是安全的默认值，因为其低 16 位会被解释为
+netId。省略字段时核心自动使用 `0x200000`，旧配置显式写入 `0x2024` 时也会自动
+迁移为这个安全值。其他显式值包含 netId，权限，vendor 或 wakeup 位时启动会失败，
+避免生成表面成功但最终落入 netd unreachable 规则的配置。
 
 ### UID、GID、Android user 和包名
 

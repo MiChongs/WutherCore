@@ -215,7 +215,8 @@ capture:
     # ---- 路由接管 ----
     auto_route: true
     iproute2_table_index: 2024
-    iproute2_rule_index:  9100
+    iproute2_rule_index:  9100       # 必须小于 Android netd 的起始优先级 10000
+    auto_redirect_output_mark: "0x200000" # Android reserved fwmark，不占用 netId
     auto_redirect: false        # Android 当前明确不支持；仅 Linux root-managed TUN 可按专门文档启用
     strict_route: false         # 严格防泄漏会切断 LAN，移动端关
     route_address: []           # 空 = 全部走 TUN
