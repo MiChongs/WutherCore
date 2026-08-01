@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "core-api"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "core-capture"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "core-feeds"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "age",
  "age-core",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "core-fetch"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "brotli",
  "bytes",
@@ -1575,7 +1575,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-grpc"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "bytes",
  "futures",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "core-inbound"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "core-mesh"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "core-observe"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "core-outbound"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm 0.11.0",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "core-process"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "caps",
  "jni",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "core-reality"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.0",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "core-resolver"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "core-route"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "core-ruleset"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "core-runtime"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "core-smart"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "core-config",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "core-store"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ahash",
  "once_cell",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "core-young"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "base64 0.23.0",
  "blake3",
@@ -7549,7 +7549,7 @@ dependencies = [
 
 [[package]]
 name = "tests-e2e"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "base64 0.23.0",
  "core-config",
@@ -9092,7 +9092,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wuther-core"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "async-trait",
