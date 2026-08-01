@@ -5,11 +5,14 @@ use aya_ebpf::{
     EbpfContext,
     bindings::BPF_F_NO_PREALLOC,
     helpers::{bpf_map_lookup_elem, bpf_setsockopt, bpf_sk_assign, bpf_sk_release},
-    macros::{cgroup_sock_addr, classifier, map, sk_lookup},
+    macros::{cgroup_sock_addr, classifier, map},
     maps::{Array, HashMap, LpmTrie, PerCpuArray, SockMap},
-    programs::{SkLookupContext, SockAddrContext, TcContext},
+    programs::{SockAddrContext, TcContext},
 };
+#[cfg(not(feature = "android-compat"))]
+use aya_ebpf::{macros::sk_lookup, programs::SkLookupContext};
 
+#[cfg(not(feature = "android-compat"))]
 const SK_PASS: u32 = 1;
 const TC_ACT_OK: i32 = 0;
 
@@ -48,12 +51,15 @@ const STAT_BYPASS_DESTINATION: u32 = 3;
 const STAT_MARK_FAILED: u32 = 4;
 const STAT_LOOKUP_ASSIGNED: u32 = 5;
 const STAT_LOOKUP_FAILED: u32 = 6;
+#[cfg(not(feature = "android-compat"))]
 const STAT_BYPASS_INGRESS: u32 = 7;
 const STAT_SHARED_SELECTED: u32 = 8;
 const STAT_SHARED_BYPASS_SOURCE: u32 = 9;
 const STAT_SHARED_BYPASS_DESTINATION: u32 = 10;
 const STAT_SHARED_UNSUPPORTED: u32 = 11;
+#[cfg(not(feature = "android-compat"))]
 const STAT_SHARED_LOOKUP_ASSIGNED: u32 = 12;
+#[cfg(not(feature = "android-compat"))]
 const STAT_SHARED_LOOKUP_FAILED: u32 = 13;
 const STAT_COUNT: u32 = 14;
 
@@ -552,6 +558,7 @@ fn destination_bypassed(ctx: &SockAddrContext, family: u32, bank: u32) -> bool {
     }
 }
 
+#[cfg(not(feature = "android-compat"))]
 #[sk_lookup]
 pub fn assign_proxy_socket(ctx: SkLookupContext) -> u32 {
     let lookup = unsafe { &*ctx.lookup };

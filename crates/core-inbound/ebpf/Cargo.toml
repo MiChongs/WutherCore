@@ -1,5 +1,12 @@
 [workspace]
 
+[features]
+default = []
+# Android vendor kernels commonly expose BPF_PROG_TYPE_SK_LOOKUP without the
+# Linux 5.17 ingress_ifindex context extension. The Android object therefore
+# uses the mark-gated loopback TC socket assignment backend exclusively.
+android-compat = []
+
 [package]
 name = "core-inbound-ebpf"
 version = "0.3.8"

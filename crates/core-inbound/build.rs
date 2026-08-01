@@ -9,6 +9,11 @@ fn main() -> anyhow::Result<()> {
     if !matches!(target_os.as_str(), "linux" | "android") {
         anyhow::bail!("with_ebpf only supports Linux and Android targets");
     }
+    let ebpf_features: &[&str] = if target_os == "android" {
+        &["android-compat"]
+    } else {
+        &[]
+    };
 
     let manifest_dir =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
@@ -21,6 +26,7 @@ fn main() -> anyhow::Result<()> {
         [aya_build::Package {
             name: "core-inbound-ebpf",
             root_dir,
+            features: ebpf_features,
             ..Default::default()
         }],
         aya_build::Toolchain::default(),
