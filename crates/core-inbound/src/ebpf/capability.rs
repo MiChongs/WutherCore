@@ -357,8 +357,8 @@ fn prepare_memlock() -> EbpfMemlockStatus {
 
     let (soft, hard) = getrlimit(Resource::RLIMIT_MEMLOCK).unwrap_or((0, 0));
     let status = EbpfMemlockStatus {
-        soft,
-        hard,
+        soft: u64::from(soft),
+        hard: u64::from(hard),
         unlimited: soft == RLIM_INFINITY,
         adjustment,
     };
