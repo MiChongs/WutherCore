@@ -75,7 +75,7 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release tag
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.metadata.outputs.tag }}
           fetch-depth: 0
@@ -136,7 +136,7 @@ jobs:
           skip-decompress: true
 
       - name: Checkout release tag
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.tag }}
           persist-credentials: false
