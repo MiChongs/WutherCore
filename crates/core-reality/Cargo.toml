@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-aws-lc-rs = { version = "=1.17.3", default-features = false, features = ["non-fips", "unstable"] }
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["non-fips", "unstable"] }
 base64.workspace = true
 bytes.workspace = true
 hex.workspace = true
