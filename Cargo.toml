@@ -147,8 +147,8 @@ rustls-pki-types  = "1"
 webpki-roots      = "1.0"
 rustls-native-certs = "0.8.4"
 boring            = { version = "=5.1.0" }
-boring-sys        = { version = "=5.1.0" }
-tokio-boring      = { version = "=5.0.0" }
+boring-sys        = { version = "=5.2.0" }
+tokio-boring      = { version = "=5.1.0" }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 uuid              = { version = "1", features = ["v4"] }
 aes               = "0.9"
@@ -163,11 +163,11 @@ sha1              = "0.11"
 rc4               = "0.2"
 chacha20          = "0.10"
 cronet            = "0.2.0"
-shadowsocks       = { version = "=1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher", "security-replay-attack-detect"] }
+shadowsocks       = { version = "=1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher", "security-replay-attack-detect"] }
 # AnyTLS 官方目前只发布 Go 参考实现；Rust 侧固定复用已审计的协议 core
 # （命令、帧与 padding scheme 解析），连接池/状态机在 core-outbound 中按
 # sing-anytls v0.0.13 实现，避免依赖其 runtime 的语义差异。
-anytls           = { version = "=0.3.10", default-features = false, features = ["core"] }
+anytls           = { version = "=0.3.12", default-features = false, features = ["core"] }
 
 # QUIC + UDP 协议（Hysteria / TUIC）
 quinn             = { version = "0.11", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
