@@ -140,7 +140,7 @@ quinn-proto       = { workspace = true }
 h3                = { workspace = true }
 h3-quinn          = { workspace = true }
 http              = "1"
-blake2            = "0.10"
+blake2            = "0.11"
 # WireGuard NoiseIK、Cookie、重放窗口、密钥轮换均由成熟实现负责；
 # 禁止在协议适配层自行近似实现密码学状态机。
 boringtun         = { workspace = true }
