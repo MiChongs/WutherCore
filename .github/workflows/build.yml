@@ -158,7 +158,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -272,7 +272,7 @@ jobs:
           --tags "$WUTHER_BUILD_TAG_LABEL"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.archive }}
@@ -307,7 +307,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -356,7 +356,7 @@ jobs:
           echo "ndk-path=$ndk_path" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@v2.85.2
+        uses: taiki-e/install-action@v2.87.27
         with:
           tool: cargo-ndk@4.1.2
 
@@ -404,7 +404,7 @@ jobs:
           --tags "$WUTHER_BUILD_TAG_LABEL"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.archive }}
@@ -438,7 +438,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -561,7 +561,7 @@ jobs:
             --tags "$env:WUTHER_BUILD_TAG_LABEL"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.archive }}
@@ -579,7 +579,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -661,7 +661,7 @@ jobs:
           --tags "$WUTHER_BUILD_TAG_LABEL"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.archive }}
