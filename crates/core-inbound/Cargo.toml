@@ -93,7 +93,7 @@ tokio-boring   = { workspace = true, optional = true }
 quinn          = { workspace = true, optional = true }
 h3             = { workspace = true, optional = true }
 h3-quinn       = { workspace = true, optional = true }
-rcgen          = { version = "=0.14.8", features = ["pem", "x509-parser"], optional = true }
+rcgen          = { version = "=0.14.10", features = ["pem", "x509-parser"], optional = true }
 ocsp-stapler   = { version = "=0.4.9", default-features = false, optional = true }
 chrono         = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 rasn           = { version = "=0.28.13", optional = true }
